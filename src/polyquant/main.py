@@ -46,6 +46,8 @@ from polyquant.data import PolymarketClient
 from polyquant.risk import KillSwitch, PositionSizer
 from polyquant.solver import ArbitrageDetector, SCIPSolver
 from polyquant.utils import config, get_logger
+from polyquant.api.server import monitor, app
+import uvicorn
 
 logger = get_logger(__name__)
 
@@ -87,6 +89,7 @@ class PolyQuantOrchestrator:
         # Risk management
         self._kill_switch: KillSwitch | None = None
         self._position_sizer: PositionSizer | None = None
+        self._server_task: asyncio.Task | None = None
         
         # State tracking
         self._is_running = False
@@ -102,6 +105,12 @@ class PolyQuantOrchestrator:
     async def __aenter__(self) -> "PolyQuantOrchestrator":
         """Initialize all components."""
         logger.info("Starting PolyQuant 2.0...")
+
+        # Start Sidecar UI Server
+        config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
+        server = uvicorn.Server(config_uv)
+        self._server_task = asyncio.create_task(server.serve())
+        await monitor.update_status(status="STARTING")
         
         # Initialize agents
         self._discovery = DiscoveryAgent()
@@ -129,6 +138,7 @@ class PolyQuantOrchestrator:
         self._position_sizer = PositionSizer(capital=10000)
         
         self._is_running = True
+        await monitor.update_status(status="ONLINE")
         
         logger.info("PolyQuant 2.0 started successfully")
         return self
@@ -138,6 +148,13 @@ class PolyQuantOrchestrator:
         logger.info("Shutting down PolyQuant 2.0...")
         
         self._is_running = False
+        
+        if self._server_task:
+            self._server_task.cancel()
+            try:
+                await self._server_task
+            except asyncio.CancelledError:
+                pass
         
         if self._discovery:
             await self._discovery.__aexit__(*args)
@@ -175,9 +192,12 @@ class PolyQuantOrchestrator:
         logger.info("Starting pipeline run", run_number=self._pipeline_count)
         
         # Check kill switch
-        if self._kill_switch and not self._kill_switch.can_trade():
+        if (self._kill_switch and not self._kill_switch.can_trade()) or monitor.state.kill_switch_active:
             logger.warning("Pipeline blocked by kill switch")
+            await monitor.update_status(status="STOPPED (KILL SWITCH)")
             return {"status": "blocked", "reason": "kill_switch"}
+        
+        await monitor.update_status(status="RUNNING", active_solvers=1)
         
         results: dict[str, Any] = {
             "run_number": self._pipeline_count,
@@ -272,43 +292,68 @@ class PolyQuantOrchestrator:
             # ================================================================
             # PHASE 4: OPTIMIZATION
             # ================================================================
+            # ================================================================
+            # PHASE 4: OPTIMIZATION
+            # ================================================================
             logger.info("Phase 4: Optimization - Finding arbitrage...")
             
             if not self._polymarket:
                 raise RuntimeError("Polymarket client not initialized")
             
             # Get order books for all markets in validated clusters
-            # For now, use the first validated analysis
             opportunities = []
             
             for cluster in clusters:
-                # Re-run validation for this cluster
+                # ------------------------------------------------------------
+                # OPTIMIZATION 1: Early Cluster Filtering (Pre-LLM)
+                # ------------------------------------------------------------
+                # Goal: Skip clusters that clearly have no arbitrage opportunity
+                # BEFORE running the expensive Logic Architect or Solver.
+                #
+                # Heuristic:
+                # For a complete set of mutually exclusive outcomes (like a full market),
+                # the sum of prices should be exactly 1.0.
+                # - If sum(prices) < 1.0: Buying all outcomes costs < $1 (Risk-free profit!)
+                # - If sum(prices) > 1.0: Market is overcollateralized (No buy-side arb)
+                #
+                # We check this using the "Quick Check" heuristic.
+                
+                # Fetch order books first (cheap/fast via WebSocket cache or REST)
+                cluster_order_books = {}
+                try:
+                    for market in cluster.markets:
+                        obs = await self._polymarket.get_all_order_books(market)
+                        cluster_order_books.update(obs)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch order books for quick check: {e}")
+                    continue
+
+                if not cluster_order_books:
+                    continue
+
+                # Run the quick check
+                if not self._quick_arbitrage_check(cluster_order_books):
+                    logger.info(
+                        "Skipping cluster - No obvious arbitrage detected",
+                        topic=cluster.topic
+                    )
+                    continue
+
+                # ------------------------------------------------------------
+                # If passed quick check, proceed with deep analysis
+                # ------------------------------------------------------------
+                
+                # Re-run validation for this cluster (Logic Architect + Validator)
                 analysis = await self._logic_architect.analyze_cluster(cluster)
                 validated = await self._validator.validate(analysis)
                 
                 if not validated.is_valid:
                     continue
                 
-                # Get order books
-                order_books = {}
-                for market in cluster.markets:
-                    try:
-                        obs = await self._polymarket.get_all_order_books(market)
-                        order_books.update(obs)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to get order book",
-                            market_id=market.market_id,
-                            error=str(e),
-                        )
-                
-                if not order_books:
-                    continue
-                
-                # Detect arbitrage
+                # Detect arbitrage with Solver
                 opportunity = await self._arbitrage_detector.detect(
                     validated,
-                    order_books,
+                    cluster_order_books,
                     min_profit=10.0,
                 )
                 
@@ -412,6 +457,67 @@ class PolyQuantOrchestrator:
         
         logger.info("Continuous operation ended", total_runs=run_count)
     
+    def _quick_arbitrage_check(self, order_books: dict[str, Any]) -> bool:
+        """
+        Quickly check if a cluster has POTENTIAL arbitrage opportunity.
+        
+        This is a lightweight heuristic to filter out clusters before running
+        the expensive Logic Architect and Solver.
+        
+        Algorithm:
+        1. Sum the 'best ask' prices for all outcomes in a market.
+        2. If sum(asks) < 1.0 (minus a threshold), it's a Buy-Side Arbitrage!
+           - Buying 1 share of YES and 1 share of NO pays out exactly $1.
+           - If cost < $1, you make risk-free profit.
+        3. Note: This heuristic assumes we are looking at a full market (e.g. YES/NO).
+           For complex clusters, if ANY subset sums to < 1.0, there is opportunity.
+           Here we use a simplified check: aggregate deviation.
+           
+        Args:
+            order_books: Dictionary of OrderBook objects
+            
+        Returns:
+            True if worth analyzing (sum deviates from 1.0), False otherwise.
+        """
+        # Collect best prices (use ask for buying)
+        prices = []
+        for ob in order_books.values():
+            # If no ask, assume worst case (1.0) to avoid false positives
+            price = ob.best_ask if ob.best_ask is not None else 1.0
+            prices.append(price)
+            
+        if not prices:
+            return False
+            
+        total_price = sum(prices)
+        
+        # Heuristic Threshold:
+        # If total price is significantly different from expected "1.0" (or N/2),
+        # it suggests misalignment.
+        # Strict Buy-Side Arb: sum(asks) < 1.0
+        #
+        # For a simple 2-outcome market: Expected = 1.0
+        # We use a 2% buffer (0.02) as requested.
+        
+        # NOTE: This is a loose heuristic. A proper check requires knowing
+        # which outcomes are mutually exclusive. Since we don't have the 
+        # logic structure yet (that's what we're skipping!), we use a 
+        # conservative signal: is there ANY cheap liquidity?
+        
+        # If we can buy the whole market for less than $0.98, that's interesting.
+        if total_price < 0.98:
+            logger.info(
+                "Quick Check: Potential Arbitrage!",
+                total_cost=total_price,
+                threshold=0.98
+            )
+            return True
+            
+        # Also check for "Dutch Book" / Sell-side (sum(bids) > 1.0)
+        # But we mostly care about buying for now.
+        
+        return False
+    
     def stop(self) -> None:
         """Signal the orchestrator to stop."""
         logger.info("Stop requested")
@@ -423,6 +529,7 @@ class PolyQuantOrchestrator:
             "KILL SWITCH TRIGGERED - STOPPING ALL OPERATIONS",
             event=event,
         )
+        monitor.trigger_kill_switch()
         self.stop()
 
 

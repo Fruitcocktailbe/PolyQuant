@@ -138,6 +138,30 @@ class PolyQuantConfig(BaseSettings):
     )
     
     # =========================================================================
+    # Frank-Wolfe Algorithm Parameters (from research papers)
+    # =========================================================================
+    
+    initial_epsilon: float = Field(
+        default=0.1,
+        ge=0.001,
+        le=0.5,
+        description="Initial contraction parameter for Barrier Frank-Wolfe (Part 2)"
+    )
+    
+    min_profit_threshold: float = Field(
+        default=0.05,
+        ge=0.0,
+        description="Minimum profit in USD to consider trading (filter noise)"
+    )
+    
+    fw_max_iterations: int = Field(
+        default=150,
+        ge=10,
+        description="Maximum Frank-Wolfe iterations before stopping"
+    )
+
+    
+    # =========================================================================
     # Logging Configuration
     # =========================================================================
     

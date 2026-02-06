@@ -1,13 +1,40 @@
 """
-Frank-Wolfe Solver for Arbitrage-Free Market Making
+Frank-Wolfe Solver for Arbitrage-Free Market Making (PolyQuant 2.0)
 
 This module implements the specific algorithms described in the research:
-1. InitFW (Algorithm 3): For finding valid starting vertices and interior point.
-2. Barrier Frank-Wolfe (Algorithm 2): For optimizing KL divergence with adaptive contraction.
-3. Profit Guarantee (Proposition 4.1): For determining when to stop and trade.
 
-Reference: "Arbitrage-Free Combinatorial Market Making via Integer Programming" (Kroer et al., 2016)
+ALGORITHMS IMPLEMENTED:
+-----------------------
+1.  **InitFW (Algorithm 3)**: Initialization to find valid starting vertices.
+    - Queries the IP solver (SCIP) for each security to determine if it can be 0 or 1.
+    - Constructs the initial active set Z_0 and the interior point u.
+    - Identifies logically settled securities.
+
+2.  **Barrier Frank-Wolfe (Algorithm 2)**: Optimization on contracted polytopes.
+    - Uses adaptive contraction M' = (1-ε)M + εu to control gradient growth.
+    - The Lipschitz constant L_ε = O(1/ε) is bounded for any ε > 0.
+    - ε shrinks adaptively as the algorithm converges.
+
+3.  **Profit Guarantee (Proposition 4.1)**: Stopping condition.
+    - Guaranteed Profit ≥ D(μ̂||θ) - g(μ̂)
+    - Stop when: g(μ_t) ≤ (1-α) × D(μ_t||θ) (α-extraction, default α=0.9)
+
+REFERENCES:
+-----------
+- Kroer et al. 2016: "Arbitrage-Free Combinatorial Market Making via IP"
+- Krishnan et al. 2015: Theory for adaptive contraction.
+
+USAGE:
+------
+    from polyquant.solver.fw_solver import FWSolver, ArbitrageDetector
+    
+    detector = ArbitrageDetector()
+    opportunity = await detector.detect(validated_result, order_books)
+    
+    if opportunity:
+        print(f"Found opportunity with ${opportunity.expected_profit} profit")
 """
+
 
 import numpy as np
 from typing import List, Dict, Tuple, Set, Optional
@@ -29,6 +56,10 @@ class FWSolver:
         self.epsilon = 0.1  # Initial contraction parameter
         self.alpha = 0.9    # Extraction guarantee threshold
         self.min_profit = 0.05 # Minimum profit threshold
+        
+        # Optimization 2: Cache for InitFW results
+        # Key: Sorted outcome IDs. Value: (Z_0, u, settled_ids)
+        self._u_cache: Dict[str, Tuple[List[Dict[str, float]], Dict[str, float], Set[str]]] = {}
 
     def init_fw(
         self, 
@@ -51,6 +82,18 @@ class FWSolver:
             settled: Set of settled outcome IDs
         """
         logger.info("Running InitFW...")
+        
+        # 1. Check Cache
+        security_ids = sorted(outcomes)
+        cache_key = ",".join(security_ids)
+        if cache_key in self._u_cache:
+            logger.debug(f"InitFW Cache HIT for {len(outcomes)} outcomes")
+            Z_0, u, settled_ids = self._u_cache[cache_key]
+            # Must copy mutable objects to avoid side effects if modified elsewhere
+            # But here they are mostly read-only. Returning direct ref for speed.
+            return Z_0, u, settled_ids
+
+        logger.debug(f"InitFW Cache MISS for {len(outcomes)} outcomes")
         
         Z_0: List[Dict[str, float]] = []
         sigma_hat: Dict[str, int] = {} # Extended partial outcome
@@ -106,6 +149,10 @@ class FWSolver:
             u[o] /= len(Z_0)
             
         logger.info(f"InitFW complete. |Z_0|={len(Z_0)}, Settled={len(settled_ids)}")
+        
+        # 2. Save to Cache
+        self._u_cache[cache_key] = (Z_0, u, settled_ids)
+        
         return Z_0, u, settled_ids
 
     def barrier_fw(
