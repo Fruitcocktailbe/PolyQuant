@@ -1,0 +1,84 @@
+To make PolyQuant 2.0 fully functional and capable of executing the "Part 2" strategy
+  (Arbitrage-Free Combinatorial Market Making), you need a specific setup that balances
+  high-performance computing for the solver with reasoning capabilities for the agents.
+
+  Here is the specific breakdown of the setup required:
+
+
+  1. Compute Power (Local Hardware)
+  The bottleneck in this architecture is not the AI (which runs via API), but the Integer Programming
+  (IP) Solver.
+   * CPU: The SCIP solver (pyscipopt) is CPU-bound.
+       * Requirement: High single-core clock speed is critical for traversing the branch-and-bound
+         tree quickly.
+       * Recommended: AMD Ryzen 9 (7950X or 9950X) or Intel Core i9 (13900K/14900K). The InitFW step
+         involves solving multiple IPs in sequence; faster clocks mean faster initialization.
+   * RAM:
+       * Requirement: The search tree for combinatorial markets (like NCAA brackets or multi-candidate
+         elections) can grow large.
+       * Recommended: Minimum 32GB DDR5. If you plan to scale to markets with >50 outcomes, 64GB is
+         safer.
+   * GPU:
+       * Current State: Not strictly required if you stick to the APIs (DeepSeek/Gemini) configured in
+         the code.
+       * Local LLM Route: If you want to replace deepseek-reasoner with a local model (e.g.,
+         DeepSeek-R1-Distill), you need 48GB+ VRAM (e.g., 2x RTX 3090/4090) to get the reasoning
+         performance required for constraint generation.
+
+
+  2. The Algorithm Stack (Solver Engine)
+  You cannot just pip install the solver; you need the underlying C++ libraries.
+   * SCIP Optimization Suite:
+       * Your code depends on pyscipopt, which is a wrapper. You must install the SCIPOptSuite
+         binaries on your Windows machine.
+       * Action: Download the Windows installer for SCIPOptSuite 9.0+ from the official SCIP website
+         (https://scipopt.org/). Ensure the SCIP_HOME environment variable is set so Python can find
+         the C libraries.
+   * Frank-Wolfe Implementation:
+       * The fw_solver.py I created is the implementation. It uses the "Barrier" variant.
+       * Tuning: You will need to calibrate the epsilon (contraction parameter) and alpha (extraction
+         threshold) based on the specific markets you trade. The defaults (0.1 and 0.9) are from the
+         paper but may need adjustment for Polymarket's specific liquidity curves.
+
+
+  3. AI Models (The "Brains")
+  The code is architected to use specific APIs for their specific strengths. You need keys for these:
+   * Logic Architect: deepseek-reasoner (DeepSeek-R1)
+       * Role: Extracts formal logic ($A^T z \ge b$) from text.
+       * Why: Standard models (GPT-4o, Claude 3.5 Sonnet) struggle with strict mathematical
+         formalization compared to R1.
+   * Validator: gemini-2.0-flash-thinking-exp
+       * Role: Safety check. It verifies the logic architect didn't hallucinate a constraint.
+       * Why: Very low latency for a reasoning model and high safety compliance.
+   * Discovery: gpt-4o (or similar)
+       * Role: Scans the thousands of markets to find clusters (e.g., "All NFL games this week").
+
+
+  4. Data & Execution Infrastructure
+   * Polymarket Data:
+       * The PolymarketClient in the code is currently a stub (I created a mock in data.py).
+       * Requirement: You need to implement the WebSocket connection to Polymarket's CLOB (Central
+         Limit Order Book) API. The "Gamma" API is the standard here.
+       * Critical: You need Level 2 market data (full order book), not just the best bid/ask, to
+         calculate the capacity for the Frank-Wolfe trades.
+   * Execution (The "Missing Link"):
+       * The text file mentions Execution (Rust). Python is often too slow for the actual submission
+         of orders in a race condition.
+       * Recommendation: Keep the Solver/Logic in Python (as implemented). Write a small Rust or Go
+         binary that holds the ProposedTrade objects and fires them to the relayer/blockchain the
+         millisecond the solver approves.
+       * Proxy/RPC: You need a private or high-performance RPC endpoint for the Polygon PoS chain to
+         ensure your transactions land in the next block.
+
+
+  5. Summary Checklist to Go Live
+   1. [ ] Install SCIPOptSuite on Windows.
+   2. [ ] Set up Redis (locally or cloud) for caching market states.
+   3. [ ] Obtain API Keys: DeepSeek, Google AI Studio (Gemini), Polymarket (API & Proxy Wallet).
+   4. [ ] Implement the real PolymarketClient (connect to their Gamma API).
+   5. [ ] Fund a wallet on Polygon (MATIC/USDC.e) for the KillSwitch and execution testing.
+
+
+  This setup gives you the "Production System" described in Part 2: fast initialization via CPU,
+  accurate constraints via AI, and mathematically guaranteed profit extraction via the Frank-Wolfe
+  solver.

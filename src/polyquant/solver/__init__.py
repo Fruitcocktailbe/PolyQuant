@@ -3,6 +3,8 @@ Solver module exports.
 """
 
 from polyquant.solver.bregman import (
+    BarrierFrankWolfe,
+    ProjectionResult,
     bregman_project,
     compute_optimal_trades,
     detect_arbitrage,
@@ -11,17 +13,29 @@ from polyquant.solver.bregman import (
     project_simplex,
 )
 from polyquant.solver.scip_solver import (
-    ArbitrageDetector,
+    InitFWResult,
     OptimizationResult,
     SCIPSolver,
+    init_frank_wolfe,
+)
+from polyquant.solver.fw_solver import (
+    FWSolver,
+    ArbitrageDetector,
 )
 
 __all__ = [
     # SCIP Solver
     "SCIPSolver",
     "OptimizationResult",
+    "init_frank_wolfe",
+    "InitFWResult",
+    # Frank-Wolfe Solver
+    "FWSolver",
     "ArbitrageDetector",
-    # Bregman algorithms
+    # Barrier Frank-Wolfe (NEW)
+    "BarrierFrankWolfe",
+    "ProjectionResult",
+    # Bregman algorithms (Legacy)
     "kl_divergence",
     "kl_gradient",
     "project_simplex",

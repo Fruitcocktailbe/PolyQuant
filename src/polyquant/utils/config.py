@@ -57,14 +57,17 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
     
     gemini_api_key: SecretStr = Field(
+        default=SecretStr(""),
         description="Google Gemini API key for Discovery and Validator agents"
     )
     
     deepseek_api_key: SecretStr = Field(
+        default=SecretStr(""),
         description="DeepSeek API key for the Logic Architect (R1 model)"
     )
     
     alchemy_api_key: SecretStr = Field(
+        default=SecretStr(""),
         description="Alchemy API key for Polygon blockchain data"
     )
     

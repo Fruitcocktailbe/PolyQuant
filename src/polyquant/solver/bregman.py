@@ -4,65 +4,77 @@ Bregman Projection Algorithms for PolyQuant 2.0
 This module implements the mathematical core of the arbitrage detection:
 the Bregman projection using KL divergence onto constraint sets.
 
-WHAT IS BREGMAN PROJECTION?
----------------------------
-When we have a point (current market prices) and a constraint set
-(logical relationships between markets), we want to find the "closest"
-point that satisfies all constraints.
+IMPLEMENTATION BASED ON:
+------------------------
+Kroer et al. 2016: "Arbitrage-Free Combinatorial Market Making via Integer Programming"
+The key insight: Standard Frank-Wolfe fails on LMSR because gradients explode at
+price boundaries where μ_i → 0. The solution is Barrier Frank-Wolfe with adaptive
+epsilon contraction.
 
-"Closest" is measured using Bregman divergence - specifically KL divergence
-for probability distributions (which prediction market prices are).
+BARRIER FRANK-WOLFE:
+--------------------
+Instead of optimizing over the true polytope M, we optimize over a contracted
+polytope M' = (1-ε)M + εu, where u is an interior point with all coordinates
+strictly between 0 and 1.
 
-WHY KL DIVERGENCE?
-------------------
-KL divergence is the natural distance metric for probability distributions:
-- It respects the [0,1] bounds of probabilities
-- It penalizes extreme changes more than moderate ones
-- It's the information-theoretic measure of "surprise"
+The adaptive epsilon rule:
+- Start with large ε (e.g., 0.1) for fast early convergence
+- Shrink ε when gap decreases: ε_t = min(g(μ_t)/(-4*g_u), ε_{t-1}/2)
+- As ε → 0, we approach the true projection on M
 
-THE ALGORITHM:
---------------
-We use Frank-Wolfe with barrier terms:
-1. Start at current prices
-2. Compute gradient of KL divergence
-3. Add barrier terms for constraint violations
-4. Find descent direction via linear minimization
-5. Step and project back onto probability simplex
-6. Repeat until convergence
+PROFIT GUARANTEE (Proposition 4.1):
+-----------------------------------
+Guaranteed Profit ≥ D(μ̂||θ) - g(μ̂)
 
-REFERENCE:
-----------
-Based on: Bubeck, S. "Convex Optimization: Algorithms and Complexity" (2015)
-Section 3.3: Frank-Wolfe Algorithm
+Where:
+- D(μ̂||θ) = KL divergence (maximum possible arbitrage)
+- g(μ̂) = Frank-Wolfe gap (how suboptimal our solution is)
+
+α-EXTRACTION STOPPING CONDITION:
+---------------------------------
+Stop when: g(μ_t) ≤ (1-α) × D(μ_t||θ)
+With α = 0.9, we capture 90% of available arbitrage before executing.
 
 USAGE:
 ------
-    from polyquant.solver.bregman import bregman_project
+    from polyquant.solver.bregman import BarrierFrankWolfe
     
-    # Current market prices
-    current = np.array([0.6, 0.4, 0.7, 0.3])
+    bfw = BarrierFrankWolfe(
+        interior_point=u,       # From InitFW
+        extraction_alpha=0.9,   # Capture 90% of profit
+    )
     
-    # Constraint: p[0] + p[2] >= 0.9 (e.g., correlated outcomes)
-    A = np.array([[1, 0, 1, 0]])
-    b = np.array([0.9])
+    result = bfw.project(
+        current_prices=prices,
+        constraints_A=A,
+        constraints_b=b,
+    )
     
-    # Find closest valid prices
-    projected = bregman_project(current, A, b)
+    if result.should_trade:
+        print(f"Guaranteed profit: {result.guaranteed_profit}")
 """
 
-import numpy as np
+from dataclasses import dataclass
 from typing import Tuple
+
+import numpy as np
 
 from polyquant.utils import get_logger
 
 logger = get_logger(__name__)
 
 
+# =============================================================================
+# Basic Mathematical Functions
+# =============================================================================
+
+
 def kl_divergence(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-10) -> float:
     """
-    Compute KL divergence: KL(p || q) = sum_i p_i * log(p_i / q_i)
+    Compute KL divergence: KL(p || q) = Σ_i p_i × log(p_i / q_i)
     
     This measures how "different" p is from q, from p's perspective.
+    From Part 2: This is the Bregman divergence for LMSR.
     
     Properties:
     - KL(p || p) = 0
@@ -76,24 +88,21 @@ def kl_divergence(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-10) -> float
         
     Returns:
         KL divergence value (non-negative)
-        
-    Example:
-        >>> p = np.array([0.7, 0.3])
-        >>> q = np.array([0.5, 0.5])
-        >>> kl_divergence(p, q)  # About 0.082
     """
-    # Add epsilon to avoid log(0)
     p_safe = np.maximum(p, epsilon)
     q_safe = np.maximum(q, epsilon)
     
-    return np.sum(p_safe * np.log(p_safe / q_safe))
+    return float(np.sum(p_safe * np.log(p_safe / q_safe)))
 
 
 def kl_gradient(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-10) -> np.ndarray:
     """
     Compute gradient of KL(p || q) with respect to p.
     
-    The gradient is: grad_i = log(p_i / q_i) + 1
+    From Part 2: ∇R(μ) = ln(μ) + 1
+    
+    This gradient goes to -∞ as μ_i → 0, which is why we need
+    the Barrier Frank-Wolfe with contraction.
     
     Args:
         p: Target distribution
@@ -101,7 +110,7 @@ def kl_gradient(p: np.ndarray, q: np.ndarray, epsilon: float = 1e-10) -> np.ndar
         epsilon: Small value to avoid log(0)
         
     Returns:
-        Gradient vector (same shape as p)
+        Gradient vector
     """
     p_safe = np.maximum(p, epsilon)
     q_safe = np.maximum(q, epsilon)
@@ -113,7 +122,7 @@ def project_simplex(v: np.ndarray) -> np.ndarray:
     """
     Project a vector onto the probability simplex.
     
-    The probability simplex is: {p : sum(p) = 1, p >= 0}
+    The probability simplex is: {p : Σp = 1, p >= 0}
     
     Uses the efficient O(n log n) algorithm from:
     Duchi et al. "Efficient Projections onto the L1-Ball" (2008)
@@ -123,31 +132,301 @@ def project_simplex(v: np.ndarray) -> np.ndarray:
         
     Returns:
         Projected vector on the simplex
-        
-    Example:
-        >>> v = np.array([0.5, 0.8, -0.1])
-        >>> project_simplex(v)
-        array([0.35, 0.65, 0.  ])
     """
     n = len(v)
-    
-    # Sort in descending order
     u = np.sort(v)[::-1]
     
-    # Find the threshold
     cssv = np.cumsum(u) - 1
     ind = np.arange(1, n + 1)
     cond = u - cssv / ind > 0
     
     if not np.any(cond):
-        # Edge case: all negative coefficients
         return np.ones(n) / n
     
     rho = np.max(ind[cond])
     theta = cssv[rho - 1] / rho
     
-    # Project
     return np.maximum(v - theta, 0)
+
+
+# =============================================================================
+# Projection Result
+# =============================================================================
+
+
+@dataclass
+class ProjectionResult:
+    """
+    Result from Barrier Frank-Wolfe projection.
+    
+    Attributes:
+        projected: The projected price vector
+        divergence: D(μ̂||θ) - KL divergence from current to projected
+        gap: Frank-Wolfe gap (optimality measure)
+        guaranteed_profit: D(μ̂||θ) - g(μ̂) - guaranteed minimum profit
+        extraction_ratio: What fraction of arbitrage we're capturing
+        iterations: Number of iterations used
+        converged: Whether we hit convergence tolerance
+        should_trade: Whether the profit is worth executing
+    """
+    projected: np.ndarray
+    divergence: float
+    gap: float
+    guaranteed_profit: float
+    extraction_ratio: float
+    iterations: int
+    converged: bool
+    should_trade: bool
+
+
+# =============================================================================
+# Barrier Frank-Wolfe Algorithm
+# =============================================================================
+
+
+class BarrierFrankWolfe:
+    """
+    Barrier Frank-Wolfe optimizer with adaptive epsilon contraction.
+    
+    From Part 2: Standard Frank-Wolfe fails on LMSR because the gradient
+    ∇R(μ) = ln(μ) + 1 goes to -∞ as μ_i → 0.
+    
+    The solution is to optimize over a contracted polytope:
+        M' = (1-ε)M + εu
+    
+    Where u is an interior point with all coordinates in (0,1).
+    This keeps all coordinates bounded away from 0, giving a finite
+    Lipschitz constant L_ε = O(1/ε).
+    
+    The adaptive epsilon rule shrinks ε over time as we converge,
+    eventually getting arbitrarily close to the true projection.
+    """
+    
+    def __init__(
+        self,
+        interior_point: np.ndarray | None = None,
+        initial_epsilon: float = 0.1,
+        extraction_alpha: float = 0.9,
+        min_profit_threshold: float = 0.05,
+        max_iterations: int = 150,
+        convergence_tol: float = 1e-6,
+    ):
+        """
+        Initialize Barrier Frank-Wolfe.
+        
+        Args:
+            interior_point: Point u with all coords in (0,1). If None,
+                           will use uniform distribution.
+            initial_epsilon: Starting contraction parameter (default 0.1)
+            extraction_alpha: Target extraction efficiency (default 0.9 = 90%)
+            min_profit_threshold: Minimum profit to consider trading (default $0.05)
+            max_iterations: Maximum FW iterations (default 150)
+            convergence_tol: Convergence tolerance for gap
+        """
+        self.interior_point = interior_point
+        self.initial_epsilon = initial_epsilon
+        self.extraction_alpha = extraction_alpha
+        self.min_profit_threshold = min_profit_threshold
+        self.max_iterations = max_iterations
+        self.convergence_tol = convergence_tol
+        
+        logger.info(
+            "BarrierFrankWolfe initialized",
+            initial_epsilon=initial_epsilon,
+            extraction_alpha=extraction_alpha,
+            min_profit_threshold=min_profit_threshold,
+        )
+    
+    def project(
+        self,
+        current_prices: np.ndarray,
+        constraints_A: np.ndarray,
+        constraints_b: np.ndarray,
+    ) -> ProjectionResult:
+        """
+        Perform Barrier Frank-Wolfe projection onto constraint set.
+        
+        From Part 2: This implements Algorithm 2 (Barrier FW) with
+        adaptive epsilon contraction.
+        
+        Args:
+            current_prices: Current market prices θ
+            constraints_A: Constraint matrix (m x n)
+            constraints_b: Right-hand side vector (m)
+            
+        Returns:
+            ProjectionResult with projected prices and profit info
+        """
+        n = len(current_prices)
+        m = len(constraints_b) if len(constraints_b) > 0 else 0
+        
+        # Set up interior point (all coords must be in (0,1))
+        if self.interior_point is not None:
+            u = self.interior_point.copy()
+        else:
+            u = np.ones(n) / n  # Uniform distribution
+        
+        # Initialize at current prices, normalized
+        mu = current_prices.copy()
+        mu = np.maximum(mu, 1e-10)
+        mu = mu / mu.sum()
+        
+        # Adaptive epsilon (starts large, shrinks over time)
+        epsilon = self.initial_epsilon
+        
+        # Gap at interior point (for adaptive epsilon rule)
+        g_u = self._compute_gap(u, current_prices, constraints_A, constraints_b, n)
+        
+        # Track best iterate for forced interruption
+        best_profit = float('-inf')
+        best_mu = mu.copy()
+        
+        converged = False
+        iteration = 0
+        
+        logger.debug(
+            "Starting Barrier FW projection",
+            n=n,
+            m=m,
+            initial_epsilon=epsilon,
+        )
+        
+        for iteration in range(self.max_iterations):
+            # Contract toward interior point: μ' = (1-ε)μ + εu
+            mu_contracted = (1 - epsilon) * mu + epsilon * u
+            
+            # Compute gradient of KL divergence
+            grad = kl_gradient(mu_contracted, current_prices)
+            
+            # Add barrier gradient for constraint violations
+            if m > 0:
+                violations = constraints_A @ mu_contracted - constraints_b
+                for i in range(m):
+                    if violations[i] < 0:
+                        # Barrier gradient pushes toward feasibility
+                        barrier_grad = -constraints_A[i] / (abs(violations[i]) + 1e-10)
+                        grad = grad + barrier_grad
+            
+            # Frank-Wolfe direction: s = argmin_{s ∈ simplex} <grad, s>
+            s = np.zeros(n)
+            s[np.argmin(grad)] = 1.0
+            
+            # Compute gap g(μ) = <∇f(μ), μ - s>
+            gap = float(np.dot(grad, mu_contracted - s))
+            
+            # Compute divergence D(μ||θ)
+            divergence = kl_divergence(mu_contracted, current_prices)
+            
+            # Guaranteed profit = D(μ||θ) - g(μ)
+            guaranteed_profit = divergence - gap
+            
+            # Track best iterate
+            if guaranteed_profit > best_profit:
+                best_profit = guaranteed_profit
+                best_mu = mu_contracted.copy()
+            
+            # Check α-extraction stopping condition
+            # Stop when: g(μ) ≤ (1-α) × D(μ||θ)
+            if divergence > 0 and gap <= (1 - self.extraction_alpha) * divergence:
+                logger.info(
+                    "α-extraction reached",
+                    iteration=iteration,
+                    extraction_ratio=1 - gap/divergence if divergence > 0 else 1.0,
+                    guaranteed_profit=guaranteed_profit,
+                )
+                converged = True
+                break
+            
+            # Check absolute convergence
+            if gap < self.convergence_tol:
+                logger.debug("Gap convergence reached", iteration=iteration, gap=gap)
+                converged = True
+                break
+            
+            # Adaptive epsilon rule from Part 2:
+            # If g(μ_t) / (-4*g_u) < ε_{t-1}, shrink ε
+            if g_u < 0:  # g_u should be negative for valid interior point
+                ratio = gap / (-4 * g_u)
+                if ratio < epsilon:
+                    epsilon = max(min(ratio, epsilon / 2), 1e-10)
+                    logger.debug(
+                        "Epsilon adapted",
+                        iteration=iteration,
+                        new_epsilon=epsilon,
+                    )
+            
+            # Frank-Wolfe step size (diminishing: 2/(t+2))
+            step_size = 2.0 / (iteration + 2)
+            
+            # Update: μ = (1-γ)μ + γs
+            mu = (1 - step_size) * mu + step_size * s
+            mu = np.maximum(mu, 1e-10)
+            mu = mu / mu.sum()
+        
+        # Use best iterate
+        final_mu = best_mu
+        final_divergence = kl_divergence(final_mu, current_prices)
+        final_gap = self._compute_gap(final_mu, current_prices, constraints_A, constraints_b, n)
+        final_profit = final_divergence - final_gap
+        
+        # Determine if we should trade
+        should_trade = (
+            final_profit >= self.min_profit_threshold and
+            final_divergence > 0.001  # Not already arbitrage-free
+        )
+        
+        extraction_ratio = 1 - final_gap / final_divergence if final_divergence > 0 else 1.0
+        
+        logger.info(
+            "Barrier FW complete",
+            iterations=iteration + 1,
+            converged=converged,
+            divergence=final_divergence,
+            gap=final_gap,
+            guaranteed_profit=final_profit,
+            extraction_ratio=extraction_ratio,
+            should_trade=should_trade,
+        )
+        
+        return ProjectionResult(
+            projected=final_mu,
+            divergence=final_divergence,
+            gap=final_gap,
+            guaranteed_profit=final_profit,
+            extraction_ratio=extraction_ratio,
+            iterations=iteration + 1,
+            converged=converged,
+            should_trade=should_trade,
+        )
+    
+    def _compute_gap(
+        self,
+        mu: np.ndarray,
+        current: np.ndarray,
+        A: np.ndarray,
+        b: np.ndarray,
+        n: int,
+    ) -> float:
+        """Compute Frank-Wolfe gap for a given point."""
+        grad = kl_gradient(mu, current)
+        
+        m = len(b) if len(b) > 0 else 0
+        if m > 0:
+            violations = A @ mu - b
+            for i in range(m):
+                if violations[i] < 0:
+                    barrier_grad = -A[i] / (abs(violations[i]) + 1e-10)
+                    grad = grad + barrier_grad
+        
+        s = np.zeros(n)
+        s[np.argmin(grad)] = 1.0
+        
+        return float(np.dot(grad, mu - s))
+
+
+# =============================================================================
+# Legacy Functions (for backward compatibility)
+# =============================================================================
 
 
 def bregman_project(
@@ -157,20 +436,13 @@ def bregman_project(
     max_iters: int = 100,
     tol: float = 1e-6,
     barrier_strength: float = 1.0,
+    interior_point: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Bregman projection using Frank-Wolfe with barrier.
+    Bregman projection using Barrier Frank-Wolfe with adaptive epsilon.
     
-    Finds the point p that minimizes KL(p || current) subject to
-    the linear constraints A @ p >= b.
-    
-    Algorithm:
-    1. Initialize p = current
-    2. Compute gradient with barrier terms
-    3. Solve LP to find descent direction
-    4. Take Frank-Wolfe step
-    5. Project onto simplex
-    6. Repeat until convergence
+    This is a convenience wrapper around BarrierFrankWolfe for simple use cases.
+    For full control over the algorithm, use BarrierFrankWolfe directly.
     
     Args:
         current: Current prices/probabilities (reference point)
@@ -178,74 +450,20 @@ def bregman_project(
         constraints_b: Right-hand side vector (m)
         max_iters: Maximum iterations
         tol: Convergence tolerance
-        barrier_strength: Strength of barrier for constraint violations
+        barrier_strength: (Ignored - kept for backward compatibility)
+        interior_point: Optional interior point for contraction
         
     Returns:
         Projected point satisfying constraints
-        
-    Example:
-        >>> current = np.array([0.6, 0.4])
-        >>> A = np.array([[1, -1]])  # p[0] >= p[1]
-        >>> b = np.array([0.1])      # by at least 0.1
-        >>> bregman_project(current, A, b)
-        array([0.55, 0.45])  # Adjusted to satisfy constraint
     """
-    n = len(current)
-    m = len(constraints_b) if len(constraints_b) > 0 else 0
-    
-    # Initialize
-    p = current.copy()
-    p = np.maximum(p, 1e-10)  # Ensure positivity
-    p /= p.sum()  # Normalize to simplex
-    
-    logger.debug(
-        "Starting Bregman projection",
-        n=n,
-        m=m,
-        max_iters=max_iters,
+    bfw = BarrierFrankWolfe(
+        interior_point=interior_point,
+        max_iterations=max_iters,
+        convergence_tol=tol,
     )
     
-    for iteration in range(max_iters):
-        # Compute KL gradient
-        grad = kl_gradient(p, current)
-        
-        # Add barrier gradient for constraint violations
-        if m > 0:
-            violations = constraints_A @ p - constraints_b
-            
-            for i in range(m):
-                if violations[i] < 0:
-                    # Add penalty gradient
-                    barrier_grad = -barrier_strength * constraints_A[i] / (abs(violations[i]) + 1e-10)
-                    grad += barrier_grad
-        
-        # Frank-Wolfe direction: minimize grad @ s over simplex
-        # Solution: s = e_argmin(grad)
-        s = np.zeros(n)
-        s[np.argmin(grad)] = 1
-        
-        # Frank-Wolfe gap (optimality condition)
-        gap = grad @ (p - s)
-        
-        if gap < tol:
-            logger.debug(
-                "Bregman projection converged",
-                iteration=iteration,
-                gap=gap,
-            )
-            break
-        
-        # Step size (standard diminishing rule)
-        step = 2.0 / (iteration + 2)
-        
-        # Update
-        p_new = (1 - step) * p + step * s
-        p_new = np.maximum(p_new, 1e-10)
-        p_new /= p_new.sum()
-        
-        p = p_new
-    
-    return p
+    result = bfw.project(current, constraints_A, constraints_b)
+    return result.projected
 
 
 def detect_arbitrage(
@@ -253,44 +471,41 @@ def detect_arbitrage(
     constraints_A: np.ndarray,
     constraints_b: np.ndarray,
     threshold: float = 0.01,
-) -> Tuple[bool, float, np.ndarray]:
+    interior_point: np.ndarray | None = None,
+) -> Tuple[bool, float, np.ndarray, float]:
     """
-    Detect if there's an arbitrage opportunity.
+    Detect if there's an arbitrage opportunity with profit guarantee.
     
-    Arbitrage exists if the current prices violate the constraints.
-    The size of the opportunity is measured by how much we need to
-    adjust prices to satisfy constraints.
+    Returns the profit guarantee from Proposition 4.1:
+    Guaranteed Profit ≥ D(μ̂||θ) - g(μ̂)
     
     Args:
         prices: Current market prices
         constraints_A: Constraint matrix
         constraints_b: Right-hand side
-        threshold: Minimum movement to consider arbitrage
+        threshold: Minimum profit to consider arbitrage
+        interior_point: Optional interior point for Barrier FW
         
     Returns:
         Tuple of:
-        - bool: Whether arbitrage exists
-        - float: Size of arbitrage (KL distance)
+        - bool: Whether profitable arbitrage exists
+        - float: KL divergence (max possible profit)
         - ndarray: Corrected prices
-        
-    Example:
-        >>> prices = np.array([0.7, 0.5])  # Sum > 1 for binary market
-        >>> A = np.array([[1, 1]])
-        >>> b = np.array([1.0])  # Should sum to 1
-        >>> has_arb, size, corrected = detect_arbitrage(prices, A, b)
-        >>> has_arb
-        True
+        - float: Guaranteed profit
     """
-    # Project to constraint-satisfying set
-    projected = bregman_project(prices, constraints_A, constraints_b)
+    bfw = BarrierFrankWolfe(
+        interior_point=interior_point,
+        min_profit_threshold=threshold,
+    )
     
-    # Measure the distance
-    kl_distance = kl_divergence(projected, prices)
+    result = bfw.project(prices, constraints_A, constraints_b)
     
-    # Check if movement is significant
-    has_arbitrage = np.max(np.abs(projected - prices)) > threshold
-    
-    return has_arbitrage, kl_distance, projected
+    return (
+        result.should_trade,
+        result.divergence,
+        result.projected,
+        result.guaranteed_profit,
+    )
 
 
 def compute_optimal_trades(
@@ -305,8 +520,6 @@ def compute_optimal_trades(
     Given current and target prices, compute how much to buy/sell
     of each outcome to capture the arbitrage.
     
-    Uses a simple linear model: trade_size ∝ price_difference
-    
     Args:
         current_prices: Current market prices
         target_prices: Target (arbitrage-free) prices
@@ -316,18 +529,9 @@ def compute_optimal_trades(
     Returns:
         Trade sizes (positive = buy, negative = sell)
     """
-    # Price differences
     delta = target_prices - current_prices
-    
-    # Scale by order book depth
     availability = np.minimum(order_book_depths, max_position)
-    
-    # Simple linear model for trade size
-    # Positive delta = price too low = buy
-    # Negative delta = price too high = sell
-    trades = delta * availability * 10  # Scaling factor
-    
-    # Clip to max position
+    trades = delta * availability * 10
     trades = np.clip(trades, -max_position, max_position)
     
     return trades

@@ -56,6 +56,7 @@ USAGE:
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -373,156 +374,244 @@ class SCIPSolver:
             status="fallback_heuristic",
         )
     
-    def compute_bregman_projection(
-        self,
-        current_prices: np.ndarray,
-        constraints: np.ndarray,
-        rhs: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute the Bregman projection onto the constraint set.
-        
-        Uses the Barrier Frank-Wolfe algorithm to handle:
-        1. KL divergence objective
-        2. Linear constraints
-        3. Probability simplex constraints
-        
-        This is the mathematical core of the arbitrage detection.
-        
-        Args:
-            current_prices: Current market prices (n outcomes)
-            constraints: Constraint matrix A (m x n)
-            rhs: Right-hand side vector b (m)
-            
-        Returns:
-            Projected prices that satisfy constraints
-            
-        Math:
-            minimize    KL(p || q)  = sum_i p_i * log(p_i / q_i)
-            subject to  A @ p >= b
-                        sum(p) = 1
-                        p >= 0
-        """
-        # Initialize with current prices
-        p = current_prices.copy()
-        n = len(p)
-        
-        # Barrier Frank-Wolfe parameters
-        max_iters = 100
-        tol = 1e-6
-        
-        for iteration in range(max_iters):
-            # Compute KL gradient: grad = log(p/q) + 1
-            # With barrier: add penalty for constraint violations
-            grad = np.log(p / current_prices + 1e-10) + 1
-            
-            # Check constraint satisfaction
-            violations = constraints @ p - rhs
-            violated = violations < 0
-            
-            if not np.any(violated):
-                # All constraints satisfied, check convergence
-                if np.linalg.norm(grad - grad.mean()) < tol:
-                    break
-            
-            # Add barrier gradient for violated constraints
-            for i, v in enumerate(violated):
-                if v:
-                    grad -= constraints[i] / (violations[i] + 1e-10)
-            
-            # Frank-Wolfe direction: solve LP
-            # minimize grad @ s, subject to sum(s) = 1, s >= 0
-            # Solution: s = e_i where i = argmin(grad)
-            s = np.zeros(n)
-            s[np.argmin(grad)] = 1
-            
-            # Line search
-            step = 2.0 / (iteration + 2)  # Standard FW step size
-            p = (1 - step) * p + step * s
-            
-            # Ensure positivity
-            p = np.maximum(p, 1e-10)
-            p /= p.sum()  # Normalize
-        
-        return p
-
-
-class ArbitrageDetector:
-    """
-    High-level interface for detecting and quantifying arbitrage.
-    
-    Combines constraint analysis with the SCIP solver to identify
-    profitable opportunities.
-    
-    Example:
-        detector = ArbitrageDetector()
-        
-        opportunity = await detector.detect(
-            validated_result,
-            order_books,
-        )
-        
-        if opportunity and opportunity.expected_profit > 100:
-            print(f"Found opportunity: ${opportunity.expected_profit}")
-    """
-    
-    def __init__(self):
-        """Initialize the arbitrage detector."""
-        self.solver = SCIPSolver()
-        
-    async def detect(
+    def check_feasibility(
         self,
         validated: ValidatedResult,
-        order_books: dict[str, OrderBook],
-        min_profit: float = 10.0,
-    ) -> ArbitrageOpportunity | None:
+        fixed_vars: dict[str, float],
+    ) -> tuple[bool, dict[str, float]]:
         """
-        Detect and analyze an arbitrage opportunity.
+        Check if a set of constraints is feasible given fixed variables.
+        
+        Used by InitFW to determine valid outcome sets.
         
         Args:
-            validated: ValidatedResult from Phase 3
-            order_books: Current order book state
-            min_profit: Minimum profit threshold
+            validated: Constraints to respect
+            fixed_vars: Dict of variable_name -> value (0 or 1) to fix
             
         Returns:
-            ArbitrageOpportunity if found, None otherwise
+            Tuple of (is_feasible, solution_dict)
         """
-        # Run synchronous solver in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            self.solver.optimize,
+        if not SCIP_AVAILABLE:
+            return True, {}  # Fallback
+            
+        model = Model("feasibility_check")
+        model.hideOutput()
+        
+        # Collect all variables from constraints
+        all_vars = set()
+        for c in validated.validated_constraints:
+            all_vars.update(c.coefficients.keys())
+            
+        scip_vars = {}
+        for v in all_vars:
+            # Create binary variables
+            scip_vars[v] = model.addVar(vtype="B", name=v)
+            
+            # Fix variables if requested
+            if v in fixed_vars:
+                model.fixVar(scip_vars[v], fixed_vars[v])
+        
+        # Add constraints
+        for c in validated.validated_constraints:
+            expr = 0
+            for v_name, coef in c.coefficients.items():
+                if v_name in scip_vars:
+                    expr += coef * scip_vars[v_name]
+            model.addCons(expr >= c.rhs)
+            
+        model.optimize()
+        
+        status = model.getStatus()
+        if status == "optimal" or status == "feasible":
+            solution = {v: model.getVal(scip_vars[v]) for v in all_vars}
+            return True, solution
+        else:
+            return False, {}
+
+    def solve_linear_objective(
+        self,
+        validated: ValidatedResult,
+        objective_coeffs: dict[str, float],
+        sense: str = "maximize",
+    ) -> tuple[bool, dict[str, float], float]:
+        """
+        Solve a linear optimization problem over the constraint set.
+        
+        Used by Frank-Wolfe as the Linear Minimization Oracle (LMO).
+        
+        Args:
+            validated: Constraints
+            objective_coeffs: coefficients for the objective function
+            sense: "maximize" or "minimize"
+            
+        Returns:
+            Tuple of (success, solution_vector, objective_value)
+        """
+        if not SCIP_AVAILABLE:
+            return False, {}, 0.0
+            
+        model = Model("lmo")
+        model.hideOutput()
+        
+        all_vars = set()
+        for c in validated.validated_constraints:
+            all_vars.update(c.coefficients.keys())
+        all_vars.update(objective_coeffs.keys())
+        
+        scip_vars = {}
+        for v in all_vars:
+            scip_vars[v] = model.addVar(vtype="B", name=v)
+            
+        for c in validated.validated_constraints:
+            expr = 0
+            for v_name, coef in c.coefficients.items():
+                if v_name in scip_vars:
+                    expr += coef * scip_vars[v_name]
+            model.addCons(expr >= c.rhs)
+            
+        # Set objective
+        obj_expr = 0
+        for v, coef in objective_coeffs.items():
+            if v in scip_vars:
+                obj_expr += coef * scip_vars[v]
+        
+        model.setObjective(obj_expr, sense=sense)
+        model.optimize()
+        
+        status = model.getStatus()
+        if status == "optimal" or status == "feasible":
+            solution = {v: model.getVal(scip_vars[v]) for v in all_vars}
+            return True, solution, model.getObjVal()
+        else:
+            return False, {}, 0.0
+
+
+# =============================================================================
+# InitFW - Algorithm 3 from Kroer et al.
+# =============================================================================
+
+
+@dataclass
+class InitFWResult:
+    """
+    Result from InitFW algorithm (Algorithm 3).
+    
+    Attributes:
+        vertices: List of extreme points Z₀
+        interior_point: Interior point u (average of vertices)
+        logically_settled: Dict mapping security -> forced value (0 or 1)
+        n_securities: Number of non-settled securities
+        success: Whether initialization succeeded
+    """
+    vertices: list[np.ndarray]
+    interior_point: np.ndarray
+    logically_settled: dict[str, float]
+    n_securities: int
+    success: bool
+
+
+def init_frank_wolfe(
+    solver: SCIPSolver,
+    validated: "ValidatedResult",
+    security_ids: list[str],
+) -> InitFWResult:
+    """
+    Initialize Frank-Wolfe by finding extreme points and interior point.
+    
+    From Part 2: Algorithm 3 (InitFW)
+    
+    The algorithm:
+    1. For each security i, probe if x_i = 0 is feasible
+    2. Probe if x_i = 1 is feasible
+    3. If only one value feasible → security is logically settled
+    4. If both feasible → collect vertices with x_i = 0 and x_i = 1
+    5. Compute interior point u as average of all vertices
+    
+    This gives us:
+    - Vertex set Z₀ for Frank-Wolfe
+    - Interior point u for Barrier Frank-Wolfe
+    - Knowledge of which securities are already determined
+    
+    Args:
+        solver: SCIPSolver instance for feasibility checks
+        validated: Validated constraints
+        security_ids: List of security IDs to check
+        
+    Returns:
+        InitFWResult with vertices, interior point, and settled securities
+    """
+    n = len(security_ids)
+    vertices: list[np.ndarray] = []
+    logically_settled: dict[str, float] = {}
+    
+    logger.info(
+        "Running InitFW (Algorithm 3)",
+        n_securities=n,
+    )
+    
+    for i, sec_id in enumerate(security_ids):
+        # Check if x_i = 0 is feasible
+        feasible_0, sol_0 = solver.check_feasibility(
+            validated, 
+            {sec_id: 0.0}
+        )
+        
+        # Check if x_i = 1 is feasible
+        feasible_1, sol_1 = solver.check_feasibility(
             validated,
-            order_books,
-            config.orderbook_depth_cap * 10000,  # Convert to dollars
+            {sec_id: 1.0}
         )
         
-        if not result.success:
-            logger.debug("No arbitrage found", status=result.status)
-            return None
-        
-        if float(result.expected_profit) < min_profit:
-            logger.debug(
-                "Profit below threshold",
-                profit=float(result.expected_profit),
-                threshold=min_profit,
-            )
-            return None
-        
-        # Build the opportunity object
-        opportunity = ArbitrageOpportunity(
-            markets=list(set(t.market_id for t in result.trades if t.market_id)),
-            trades=result.trades,
-            expected_profit=result.expected_profit,
-            confidence=min(c.confidence for c in validated.validated_constraints)
-            if validated.validated_constraints
-            else 0.5,
+        if feasible_0 and not feasible_1:
+            # Security must be 0 (logically settled to NO)
+            logically_settled[sec_id] = 0.0
+            logger.debug(f"Security {sec_id} logically settled to 0")
+        elif feasible_1 and not feasible_0:
+            # Security must be 1 (logically settled to YES)
+            logically_settled[sec_id] = 1.0
+            logger.debug(f"Security {sec_id} logically settled to 1")
+        elif feasible_0 and feasible_1:
+            # Both are feasible - add vertices
+            vertex_0 = _dict_to_array(sol_0, security_ids)
+            vertex_1 = _dict_to_array(sol_1, security_ids)
+            vertices.append(vertex_0)
+            vertices.append(vertex_1)
+        else:
+            # Neither is feasible - constraint system is infeasible
+            logger.warning(f"Security {sec_id} infeasible in both states!")
+    
+    if not vertices:
+        # No vertices found - either all settled or infeasible
+        return InitFWResult(
+            vertices=[],
+            interior_point=np.ones(n) / 2,  # Default to middle
+            logically_settled=logically_settled,
+            n_securities=n - len(logically_settled),
+            success=False,
         )
-        
-        logger.info(
-            "Arbitrage opportunity detected",
-            profit=float(opportunity.expected_profit),
-            trade_count=len(opportunity.trades),
-        )
-        
-        return opportunity
+    
+    # Compute interior point as average of all vertices
+    interior_point = np.mean(vertices, axis=0)
+    
+    # Ensure interior point is strictly interior (all coords in (0.05, 0.95))
+    interior_point = np.clip(interior_point, 0.05, 0.95)
+    
+    logger.info(
+        "InitFW complete",
+        n_vertices=len(vertices),
+        n_settled=len(logically_settled),
+        n_active=n - len(logically_settled),
+    )
+    
+    return InitFWResult(
+        vertices=vertices,
+        interior_point=interior_point,
+        logically_settled=logically_settled,
+        n_securities=n - len(logically_settled),
+        success=True,
+    )
+
+
+def _dict_to_array(d: dict[str, float], keys: list[str]) -> np.ndarray:
+    """Convert a dict to array in the order of keys."""
+    return np.array([d.get(k, 0.0) for k in keys])

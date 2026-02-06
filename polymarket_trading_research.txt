@@ -1,0 +1,94 @@
+# Research Report: Profitable Trading on Polymarket
+
+## Executive Summary
+Trading on Polymarket to "make it profitable" is not about gambling on outcomes; it is about structural arbitrage. The market consists of thousands of interconnected probabilities (e.g., "Trump win PA" vs. "GOP win PA" vs. "GOP win Presidency"). 
+
+Most naive traders and simple bots look for:
+1. Sum > 1 or < 1: Simple arbitrage within a single market.
+2. Prices lagging news: Speed-based trading.
+
+However, the $40 million+ opportunity described in the research papers comes from Combinatorial Arbitrage: exploiting logical inconsistencies across multiple distinct but related markets suitable for prediction markets.
+
+## The Mathematical Foundation
+Polymarket uses a CPMM (Constant Product Market Maker) and LMSR (Logarithmic Market Scoring Rule) structure. 
+
+### Why Simple Math Fails
+If you just add up prices (P(A) + P(B)), you miss the dependencies.
+- Example: 
+  - Market 1: "Trump wins PA" ($0.60)
+  - Market 2: "Trump wins Presidency" ($0.55)
+  - Logic: It is highly unlikely Trump wins PA but loses the Presidency.
+  - Math: The joint probability space is constrained. A valid price vector must lie inside the Marginal Polytope (the convex hull of all valid outcomes).
+
+### The Solution: Frank-Wolfe & Integer Programming
+To find the "true" price and maximum profit, you must solve a constrained convex optimization problem.
+
+1. Marginal Polytope: The geometric shape defining all valid probability combinations.
+2. Bregman Projection: Finding the closest point in that valid shape to the current market prices (minimizing the "distance" or divergence).
+3. Frank-Wolfe Algorithm: An iterative method to solve this projection without listing every possible outcome (which is 2^N and impossible to compute directly).
+4. Integer Programming (IP): Used as an "oracle" inside Frank-Wolfe to find the best direction to move at each step.
+
+---
+
+## Step-by-Step Implementation Guide
+
+### Phase 1: Infrastructure & Data
+Goal: Get data faster than the block time (~2s).
+
+1. Node Provider: Do not use public RPCs. You need a dedicated Polygon node (e.g., Alchemy, Infura, or self-hosted) to see pending transactions and new blocks immediately.
+2. Market Data Ingestion:
+   - CLOB API: Connect to Polymarket's Central Limit Order Book WebSocket to get real-time bids/asks.
+   - Gamma API: Fetch market metadata (question, outcomes, IDs).
+3. Database: Store historical ticks to backtest your parameters.
+
+### Phase 2: Dependency Mapping (The "Brain")
+Goal: Know which markets affect each other.
+
+1. Ingest Markets: Download all active markets.
+2. Identify Relations:
+   - Manual Rules: e.g., "Candidate X in State Y" implies "Candidate X in National".
+   - LLM Helper: Use a model (like DeepSeek or GPT-4) to parse market questions and output logical constraints (JSON format: {"A_implies_B": true, "Mutually_Exclusive": [...]}).
+3. Graph Construction: Build a dependency graph where nodes are markets and edges are constraints.
+
+### Phase 3: The Optimization Engine (The "Math")
+Goal: Calculate the "Arbitrage-Free" price vector mu*.
+
+1. Tools: Python + Gurobi (Commercial IP solver, fast) or SCIP (Open source, slower).
+2. InitFW (Initialization):
+   - Use the IP solver to find a set of valid starting outcomes (vertices of the polytope).
+   - Compute an "interior point" u (a valid probability distribution where no probability is exactly 0 or 1).
+3. Barrier Frank-Wolfe Algorithm:
+   - Loop:
+     1. Calculate gradient of the cost function (LMSR).
+     2. Use IP solver to find the best "correction" vertex.
+     3. Update your target price vector towards this correction.
+     4. Adaptive Contraction: Shrink the search space slightly to prevent division-by-zero errors (LMSR fails at 0/1 probabilities).
+   - Stop Condition: When Guaranteed Profit > Cost of Execution.
+
+### Phase 4: Execution (The "Hands")
+Goal: Buy/Sell the specific outcomes to lock in profit.
+
+1. VWAP Check: Calculate the Volume-Weighted Average Price.
+   - Don't just check the top bid.
+   - Check: "If I buy $1000 worth, what is my average price?"
+2. Profitability Threshold:
+   - Calculate Projected Revenue - (Entry Cost + Gas Fees + Slippage).
+   - Rule of Thumb: Only execute if ROI > 5-10% or absolute profit > $5 (due to gas/risk).
+3. Atomic/Batch Transactions:
+   - You must execute ALL legs of the trade. If you buy "Yes" on Market A but fail to sell "No" on Market B, you are exposed to risk.
+   - Use Flashbots or transaction bundles to ensure all trades land in the same block or revert together.
+
+---
+
+## Resources & References
+- Paper: "Unravelling the Probabilistic Forest: Arbitrage in Prediction Markets" (arXiv:2508.03474)
+- Paper: "Arbitrage-Free Combinatorial Market Making via Integer Programming" (Kroer et al., 2016)
+- Tools:
+  - Gurobi Optimizer (https://www.gurobi.com/) - The gold standard for IP.
+  - Polymarket API Docs (https://docs.polymarket.com/).
+  - DeepSeek / LLMs (https://deepseek.com/) - For parsing market text to find logic.
+
+## Final Warning
+This is competitive PvP. The $40M profit cited was taken by sophisticated quantitative funds. You are competing against bots running on AWS closer to the exchange, using C++ or Rust for execution speed, and paying for premium Gurobi licenses.
+- Start Small: Look for niche markets with fewer eyes on them.
+- Focus on Logic: Simple "Sum of probabilities != 1" bots are everywhere. The real money is in complex logic (e.g., "If Player X scores > 2 goals, Team Y likely wins").
