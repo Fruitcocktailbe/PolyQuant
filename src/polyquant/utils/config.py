@@ -15,7 +15,7 @@ USAGE:
 ------
     from polyquant.utils.config import config
     
-    print(config.openai_api_key)
+    print(config.gemini_api_key)
     print(config.extraction_alpha)
 """
 
@@ -34,7 +34,7 @@ class PolyQuantConfig(BaseSettings):
     a complete list of available configuration options.
     
     Attributes:
-        openai_api_key: API key for OpenAI (GPT-4o, o1-preview)
+        gemini_api_key: API key for Google Gemini (Discovery, Validator)
         deepseek_api_key: API key for DeepSeek (Logic Architect)
         alchemy_api_key: API key for Alchemy (blockchain data)
         extraction_alpha: Target arbitrage extraction efficiency (0-1)
@@ -56,8 +56,8 @@ class PolyQuantConfig(BaseSettings):
     # API Keys (stored as SecretStr for security - won't be printed in logs)
     # =========================================================================
     
-    openai_api_key: SecretStr = Field(
-        description="OpenAI API key for GPT-4o and o1-preview models"
+    gemini_api_key: SecretStr = Field(
+        description="Google Gemini API key for Discovery and Validator agents"
     )
     
     deepseek_api_key: SecretStr = Field(

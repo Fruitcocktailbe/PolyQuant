@@ -16,7 +16,8 @@ PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage oppo
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
 │  Discovery  │ -> │  Reasoning  │ -> │ Verification│ -> │Optimization │ -> │  Execution  │
 │   Agent     │    │  (Logic     │    │  (Validator)│    │   (SCIP)    │    │  (Rust HFT) │
-│  (GPT-4o)   │    │  Architect) │    │             │    │             │    │             │
+│(Gemini 2.0) │    │  Architect) │    │(Gemini     │    │             │    │             │
+│             │    │             │    │ Thinking)   │    │             │    │             │
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
@@ -27,9 +28,9 @@ polyquant/
 ├── src/
 │   ├── agents/              # AI Agent implementations
 │   │   ├── __init__.py
-│   │   ├── discovery.py     # Phase 1: Market scanner (GPT-4o)
+│   │   ├── discovery.py     # Phase 1: Market scanner (Gemini 2.0 Flash)
 │   │   ├── logic_architect.py # Phase 2: Dependency detection (DeepSeek-R1)
-│   │   └── validator.py     # Phase 3: Constraint verification (o1-preview)
+│   │   └── validator.py     # Phase 3: Constraint verification (Gemini Thinking)
 │   ├── solver/              # Optimization engine
 │   │   ├── __init__.py
 │   │   ├── bregman.py       # Bregman projection algorithm
@@ -94,7 +95,7 @@ cargo build --release
 cp .env.example .env
 
 # Edit .env with your API keys
-# - OPENAI_API_KEY
+# - GEMINI_API_KEY
 # - DEEPSEEK_API_KEY
 # - ALCHEMY_API_KEY
 ```

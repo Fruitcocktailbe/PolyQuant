@@ -1,54 +1,46 @@
 """
 Discovery Agent for PolyQuant 2.0 - Phase 1
 
-The Discovery Agent is the first phase in the PolyQuant pipeline. Its job is
-to continuously scan Polymarket for new markets and identify potential
-cross-market dependencies that might indicate arbitrage opportunities.
+The Discovery Agent is the first phase of the pipeline. Its job is to scan
+Polymarket for all active markets and cluster them by topic to identify
+potential logical dependencies.
 
 RESPONSIBILITIES:
 -----------------
-1. Monitor Polymarket for newly created markets
-2. Scan news feeds and Twitter for relevant events
-3. Identify markets that might be logically related
-4. Pass promising market pairs to the Logic Architect (Phase 2)
+1. Fetch all active markets from Polymarket
+2. Cluster markets by topic (e.g., "2024 Election", "Fed Rate Decision")
+3. Identify potential logical dependencies between markets in each cluster
+4. Pass clusters to the Logic Architect for deeper analysis
 
-HOW IT WORKS:
--------------
-1. Fetch active markets from Polymarket API
-2. For each market, use GPT-4o to analyze:
-   - What real-world event does this market represent?
-   - What other markets might be logically connected?
-   - Are there any news events that could affect multiple markets?
-3. Group markets into clusters that share logical connections
-4. Send clusters to Logic Architect for formal dependency analysis
-
-DESIGN DECISIONS:
------------------
-- Uses GPT-4o for its strong reasoning and multimodal capabilities
-- Caches results to avoid re-analyzing unchanged markets
-- Runs as an async loop for continuous monitoring
-- Implements rate limiting to stay within API limits
+WHY GEMINI 2.0 FLASH?
+---------------------
+Gemini 2.0 Flash was chosen for this phase because:
+1. Extremely fast for clustering and categorization tasks
+2. Cost-effective with a generous free tier
+3. Excellent at understanding market questions and grouping by topic
+4. Strong JSON mode for structured output
 
 USAGE:
 ------
-    agent = DiscoveryAgent()
+    discovery = DiscoveryAgent()
     
-    # Run a single scan
-    clusters = await agent.scan_markets()
-    
-    # Or run continuously
-    async for cluster in agent.monitor():
-        print(f"Found {len(cluster.markets)} related markets")
+    async with discovery:
+        clusters = await discovery.scan_markets()
+        
+        for cluster in clusters:
+            print(f"Cluster: {cluster.topic}")
+            for market in cluster.markets:
+                print(f"  - {market.question}")
 """
 
-import asyncio
-from datetime import datetime, timedelta
-from typing import AsyncIterator
+import json
+from datetime import datetime
+from typing import Any
 
-from openai import AsyncOpenAI
+import google.generativeai as genai
 from pydantic import BaseModel, Field
 
-from polyquant.data import Market, PolymarketClient, get_polymarket_client
+from polyquant.data import Market, PolymarketClient
 from polyquant.utils import config, get_logger
 
 logger = get_logger(__name__)
@@ -56,97 +48,103 @@ logger = get_logger(__name__)
 
 class MarketCluster(BaseModel):
     """
-    A group of markets that may have logical dependencies.
-    
-    The Discovery Agent groups markets that share common topics or events,
-    allowing the Logic Architect to analyze them for formal dependencies.
+    A cluster of related markets that may have logical dependencies.
     
     Attributes:
-        cluster_id: Unique identifier for tracking
-        markets: List of markets in this cluster
-        topic: Common topic or theme (e.g., "2024 US Election")
-        keywords: Extracted keywords for categorization
-        confidence: How confident the agent is these are related (0-1)
-        created_at: When this cluster was identified
+        cluster_id: Unique identifier for this cluster
+        topic: Human-readable topic description
+        markets: List of Market objects in this cluster
+        potential_dependencies: Initial guesses at dependencies (for Logic Architect)
+        created_at: When this cluster was created
     """
     cluster_id: str = Field(default_factory=lambda: str(datetime.utcnow().timestamp()))
+    topic: str
     markets: list[Market] = Field(default_factory=list)
-    topic: str = Field(default="Unknown")
-    keywords: list[str] = Field(default_factory=list)
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    potential_dependencies: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class DiscoveryAgent:
     """
-    Phase 1: Market Discovery and Initial Clustering
+    Phase 1: Market Discovery and Clustering
     
-    The Discovery Agent scans Polymarket for new opportunities and clusters
-    related markets together for deeper analysis.
+    The Discovery Agent uses Gemini 2.0 Flash to scan Polymarket
+    and identify clusters of related markets for dependency analysis.
     
     Architecture:
-    - Uses GPT-4o for semantic understanding of market topics
-    - Async HTTP for efficient API calls
-    - In-memory cache for processed markets (TODO: Redis for persistence)
+    - Fetches markets via PolymarketClient
+    - Uses Gemini for intelligent clustering
+    - Maintains a cache of processed markets to avoid duplicate work
     
     Example:
-        agent = DiscoveryAgent()
+        discovery = DiscoveryAgent()
         
-        async with agent:
-            # Single scan
-            clusters = await agent.scan_markets()
-            for cluster in clusters:
-                print(f"Topic: {cluster.topic}, Markets: {len(cluster.markets)}")
+        async with discovery:
+            # Scan for new market clusters
+            clusters = await discovery.scan_markets(limit=100)
             
-            # Continuous monitoring
-            async for cluster in agent.monitor(interval_seconds=60):
-                await process_cluster(cluster)
+            for cluster in clusters:
+                print(f"Found cluster: {cluster.topic}")
+                print(f"  Markets: {len(cluster.markets)}")
     """
     
-    # System prompt for GPT-4o - explains the task and expected output
-    CLUSTERING_PROMPT = """You are a market analysis agent for Polymarket prediction markets.
+    # System prompt for Gemini's clustering task
+    CLUSTERING_PROMPT = """You are an expert at analyzing prediction markets and identifying logical relationships.
 
-Your task is to analyze market questions and identify logical groupings.
+Given a list of prediction markets, your task is to:
+1. Group them into clusters by topic (e.g., "US Elections", "Sports", "Crypto")
+2. For each cluster, identify potential logical dependencies between markets
 
-For each market question, determine:
-1. The core topic/event (e.g., "2024 US Presidential Election")
-2. Key entities involved (e.g., "Trump", "Biden", "Pennsylvania")
-3. Potential logical dependencies with other markets
+A logical dependency exists when the outcome of one market constrains or implies something about another.
+Examples:
+- "Will Trump win?" and "Will a Republican win?" - if Trump wins, Republican wins
+- "Will BTC hit 100K?" and "Will BTC hit 50K?" - if 100K, then 50K must also happen
 
-OUTPUT FORMAT (JSON):
+Return your analysis as JSON with this structure:
 {
-    "topic": "Main topic or event",
-    "keywords": ["keyword1", "keyword2", ...],
-    "related_market_indices": [0, 2, 5],  // indices of related markets from input
-    "reasoning": "Brief explanation of why these are related"
+    "clusters": [
+        {
+            "topic": "Topic description",
+            "market_ids": ["id1", "id2"],
+            "potential_dependencies": [
+                "If market X outcome A happens, then market Y must have outcome B"
+            ]
+        }
+    ]
 }
 
-Focus on finding markets where:
-- One outcome logically implies something about another market
-- Events share common underlying factors
-- Resolution of one market provides information about another"""
+Focus on clusters where there are likely logical constraints between markets."""
 
     def __init__(self):
-        """Initialize the Discovery Agent with API clients."""
-        self._openai: AsyncOpenAI | None = None
+        """Initialize the Discovery Agent."""
         self._polymarket: PolymarketClient | None = None
-        self._processed_markets: set[str] = set()  # Cache of already-analyzed market IDs
-        self._last_scan: datetime | None = None
+        self._genai_model = None
+        self._processed_markets: set[str] = set()
         
         logger.info("DiscoveryAgent initialized")
     
     async def __aenter__(self) -> "DiscoveryAgent":
-        """Async context manager - initialize API clients."""
-        self._openai = AsyncOpenAI(api_key=config.openai_api_key.get_secret_value())
+        """Async context manager - initialize clients."""
+        # Initialize Polymarket client
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
+        
+        # Configure Gemini
+        genai.configure(api_key=config.gemini_api_key.get_secret_value())
+        self._genai_model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash",
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
+            ),
+        )
+        
         return self
     
     async def __aexit__(self, *args) -> None:
-        """Async context manager - cleanup clients."""
+        """Async context manager - cleanup."""
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
-        # OpenAI client doesn't need explicit cleanup
     
     async def scan_markets(
         self,
@@ -155,33 +153,29 @@ Focus on finding markets where:
         skip_processed: bool = True,
     ) -> list[MarketCluster]:
         """
-        Perform a single scan of Polymarket and cluster related markets.
+        Scan Polymarket for markets and cluster them by topic.
         
-        This is the main method for batch processing. For continuous
-        monitoring, use the monitor() async generator instead.
-        
-        Algorithm:
-        1. Fetch active markets from Polymarket
-        2. Filter out already-processed markets (if skip_processed=True)
-        3. Use GPT-4o to analyze and cluster markets by topic
-        4. Return list of MarketCluster objects
+        This is the main entry point for the Discovery Agent. It:
+        1. Fetches active markets from Polymarket
+        2. Filters by liquidity and processed status
+        3. Uses Gemini to cluster by topic
+        4. Returns clusters for the Logic Architect
         
         Args:
-            limit: Maximum markets to fetch from API
-            min_liquidity: Minimum liquidity threshold in USD
-            skip_processed: Whether to skip previously analyzed markets
+            limit: Maximum number of markets to fetch
+            min_liquidity: Minimum liquidity threshold in dollars
+            skip_processed: Skip markets we've already analyzed
             
         Returns:
-            List of MarketCluster objects with related markets grouped
+            List of MarketCluster objects
         """
         if not self._polymarket:
-            raise RuntimeError("Agent not initialized. Use 'async with agent:' context.")
+            raise RuntimeError("DiscoveryAgent not initialized. Use 'async with discovery:'")
         
         logger.info(
-            "Starting market scan",
+            "Scanning markets",
             limit=limit,
             min_liquidity=min_liquidity,
-            skip_processed=skip_processed,
         )
         
         # Step 1: Fetch markets from Polymarket
@@ -190,200 +184,143 @@ Focus on finding markets where:
             min_liquidity=min_liquidity,
         )
         
-        logger.info("Fetched markets", count=len(markets))
+        if not markets:
+            logger.info("No markets found matching criteria")
+            return []
         
         # Step 2: Filter out already-processed markets
         if skip_processed:
-            new_markets = [
+            markets = [
                 m for m in markets
                 if m.market_id not in self._processed_markets
             ]
-            logger.info(
-                "Filtered to new markets",
-                total=len(markets),
-                new=len(new_markets),
-            )
-            markets = new_markets
+            
+            if not markets:
+                logger.info("All markets already processed")
+                return []
         
-        if not markets:
-            logger.info("No new markets to analyze")
-            return []
+        logger.info(f"Found {len(markets)} markets to analyze")
         
-        # Step 3: Cluster markets using GPT-4o
+        # Step 3: Use Gemini to cluster markets
         clusters = await self._cluster_markets(markets)
         
         # Step 4: Mark markets as processed
         for market in markets:
             self._processed_markets.add(market.market_id)
         
-        self._last_scan = datetime.utcnow()
-        
         logger.info(
-            "Scan complete",
-            markets_analyzed=len(markets),
+            "Market scan complete",
             clusters_found=len(clusters),
+            markets_processed=len(markets),
         )
         
         return clusters
     
-    async def monitor(
-        self,
-        interval_seconds: int = 60,
-        max_iterations: int | None = None,
-    ) -> AsyncIterator[MarketCluster]:
+    async def _cluster_markets(self, markets: list[Market]) -> list[MarketCluster]:
         """
-        Continuously monitor Polymarket for new opportunities.
+        Use Gemini to cluster markets by topic.
+        """
+        if not self._genai_model:
+            raise RuntimeError("Gemini not initialized")
         
-        This is an async generator that yields MarketCluster objects as
-        they are discovered. Use this for production deployment.
+        # Format markets for the prompt
+        market_descriptions = "\n".join([
+            f"ID: {m.market_id}\nQuestion: {m.question}\nDescription: {m.description[:200] if m.description else 'N/A'}\n"
+            for m in markets
+        ])
+        
+        # Create market lookup for quick access
+        market_lookup = {m.market_id: m for m in markets}
+        
+        logger.debug("Calling Gemini for market clustering")
+        
+        try:
+            response = self._genai_model.generate_content(
+                f"{self.CLUSTERING_PROMPT}\n\nMarkets to analyze:\n{market_descriptions}"
+            )
+            
+            # Parse response
+            response_text = response.text
+            result = json.loads(response_text)
+            
+        except Exception as e:
+            logger.error(f"Gemini clustering failed: {e}")
+            # Fallback: return all markets as a single cluster
+            return [
+                MarketCluster(
+                    topic="Uncategorized",
+                    markets=markets,
+                    potential_dependencies=[],
+                )
+            ]
+        
+        # Convert response to MarketCluster objects
+        clusters = []
+        for cluster_data in result.get("clusters", []):
+            cluster_markets = [
+                market_lookup[mid]
+                for mid in cluster_data.get("market_ids", [])
+                if mid in market_lookup
+            ]
+            
+            if cluster_markets:  # Only include non-empty clusters
+                clusters.append(
+                    MarketCluster(
+                        topic=cluster_data.get("topic", "Unknown"),
+                        markets=cluster_markets,
+                        potential_dependencies=cluster_data.get("potential_dependencies", []),
+                    )
+                )
+        
+        return clusters
+    
+    async def continuous_scan(
+        self,
+        interval_seconds: int = 300,
+        callback: Any | None = None,
+    ) -> None:
+        """
+        Continuously scan for new markets.
+        
+        This runs indefinitely, scanning at the specified interval.
+        New clusters are passed to the callback function.
         
         Args:
             interval_seconds: Seconds between scans
-            max_iterations: Stop after this many scans (None = infinite)
-            
-        Yields:
-            MarketCluster objects as they are discovered
-            
-        Example:
-            async for cluster in agent.monitor(interval_seconds=30):
-                await send_to_logic_architect(cluster)
+            callback: Async function to call with new clusters
         """
-        iteration = 0
+        import asyncio
         
         logger.info(
-            "Starting continuous monitoring",
+            "Starting continuous market scan",
             interval=interval_seconds,
-            max_iterations=max_iterations,
         )
         
-        while max_iterations is None or iteration < max_iterations:
+        while True:
             try:
                 clusters = await self.scan_markets()
                 
-                for cluster in clusters:
-                    yield cluster
+                if clusters and callback:
+                    await callback(clusters)
                     
             except Exception as e:
-                logger.error(
-                    "Error during scan",
-                    error=str(e),
-                    iteration=iteration,
-                )
-                # Continue monitoring despite errors
+                logger.error(f"Scan failed: {e}")
             
-            iteration += 1
-            
-            # Wait before next scan
-            logger.debug("Waiting before next scan", seconds=interval_seconds)
             await asyncio.sleep(interval_seconds)
-    
-    async def _cluster_markets(self, markets: list[Market]) -> list[MarketCluster]:
-        """
-        Use GPT-4o to cluster markets by topic and potential dependencies.
-        
-        This is the core AI component of the Discovery Agent. It analyzes
-        market questions to find logical groupings.
-        
-        Args:
-            markets: List of markets to analyze
-            
-        Returns:
-            List of MarketCluster objects
-        """
-        if not self._openai or not markets:
-            return []
-        
-        # Prepare market data for the prompt
-        market_descriptions = "\n".join(
-            f"{i}. [{m.market_id}] {m.question}"
-            for i, m in enumerate(markets)
-        )
-        
-        logger.debug("Calling GPT-4o for clustering", market_count=len(markets))
-        
-        try:
-            response = await self._openai.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": self.CLUSTERING_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"Analyze these markets and group related ones:\n\n{market_descriptions}",
-                    },
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3,  # Lower temperature for more consistent output
-                max_tokens=2000,
-            )
-            
-            # Parse the response
-            import json
-            content = response.choices[0].message.content or "{}"
-            result = json.loads(content)
-            
-            # Handle both single cluster and multiple clusters in response
-            if "clusters" in result:
-                cluster_datas = result["clusters"]
-            else:
-                cluster_datas = [result]
-            
-            clusters = []
-            for cluster_data in cluster_datas:
-                # Get the markets in this cluster
-                indices = cluster_data.get("related_market_indices", [])
-                cluster_markets = [
-                    markets[i] for i in indices
-                    if 0 <= i < len(markets)
-                ]
-                
-                if cluster_markets:
-                    cluster = MarketCluster(
-                        markets=cluster_markets,
-                        topic=cluster_data.get("topic", "Unknown"),
-                        keywords=cluster_data.get("keywords", []),
-                        confidence=cluster_data.get("confidence", 0.5),
-                    )
-                    clusters.append(cluster)
-            
-            logger.debug("Clustering complete", clusters_found=len(clusters))
-            return clusters
-            
-        except Exception as e:
-            logger.error("GPT-4o clustering failed", error=str(e))
-            
-            # Fallback: return each market as its own cluster
-            return [
-                MarketCluster(markets=[m], topic=m.question[:50])
-                for m in markets
-            ]
-    
-    def reset_cache(self) -> None:
-        """Clear the processed markets cache to re-analyze all markets."""
-        self._processed_markets.clear()
-        logger.info("Market cache cleared")
 
 
-# Convenience function for quick scans
+# Convenience function for simple usage
 async def discover_markets(
     limit: int = 100,
     min_liquidity: float = 1000.0,
 ) -> list[MarketCluster]:
     """
-    Convenience function to perform a single market scan.
+    Convenience function to discover and cluster markets.
     
-    Creates and manages the agent lifecycle automatically.
-    
-    Args:
-        limit: Maximum markets to fetch
-        min_liquidity: Minimum liquidity in USD
-        
-    Returns:
-        List of MarketCluster objects
-        
     Example:
-        clusters = await discover_markets(limit=50)
+        clusters = await discover_markets()
         for cluster in clusters:
-            print(f"Found: {cluster.topic}")
+            print(cluster.topic)
     """
-    async with DiscoveryAgent() as agent:
-        return await agent.scan_markets(limit=limit, min_liquidity=min_liquidity)
+    async with DiscoveryAgent() as discovery:
+        return await discovery.scan_markets(limit=limit, min_liquidity=min_liquidity)

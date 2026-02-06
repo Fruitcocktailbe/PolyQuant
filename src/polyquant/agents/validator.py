@@ -13,13 +13,13 @@ RESPONSIBILITIES:
 4. Flag any inconsistencies or potential issues
 5. Output validated constraints for the optimizer
 
-WHY o1-preview?
----------------
-OpenAI's o1-preview was chosen for validation because:
-1. Designed specifically for verification and catching edge cases
-2. Strong at formal logical reasoning
-3. Excels at finding inconsistencies and contradictions
-4. Better at catching subtle errors than general-purpose LLMs
+WHY GEMINI 2.0 FLASH THINKING?
+------------------------------
+Gemini 2.0 Flash Thinking was chosen for validation because:
+1. Strong reasoning capabilities similar to o1
+2. Cost-effective compared to OpenAI's reasoning models
+3. Good at catching edge cases and logical inconsistencies
+4. Native JSON output support
 
 VALIDATION PROCESS:
 -------------------
@@ -47,7 +47,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from openai import AsyncOpenAI
+import google.generativeai as genai
 from pydantic import BaseModel, Field
 
 from polyquant.agents.logic_architect import AnalysisResult, LogicalConstraint
@@ -116,11 +116,11 @@ class ValidatorAgent:
     """
     Phase 3: Constraint Validation and Edge Case Detection
     
-    The Validator Agent uses OpenAI's o1-preview to verify the logical
-    constraints from the Logic Architect are correct and complete.
+    The Validator Agent uses Gemini 2.0 Flash Thinking to verify the
+    logical constraints from the Logic Architect are correct and complete.
     
     Architecture:
-    - Uses o1-preview for rigorous logical verification
+    - Uses Gemini Flash Thinking for rigorous logical verification
     - Multi-pass validation for different aspects
     - Confidence calibration based on validation results
     
@@ -137,7 +137,7 @@ class ValidatorAgent:
                     print(f"[{issue.severity}] {issue.description}")
     """
     
-    # Validation system prompt for o1-preview
+    # Validation system prompt for Gemini
     VALIDATION_PROMPT = """You are a rigorous logical validator for prediction market arbitrage constraints.
 
 Your task is to verify that logical constraints between markets are:
@@ -173,7 +173,7 @@ OUTPUT FORMAT (JSON):
         }
     ],
     "adjusted_confidences": {
-        "constraint_id": 0.7  // adjusted confidence
+        "constraint_id": 0.7
     },
     "validation_notes": "General observations about the constraints"
 }
@@ -182,18 +182,24 @@ Be thorough and conservative. Flag anything that could cause issues."""
 
     def __init__(self):
         """Initialize the Validator Agent."""
-        self._openai: AsyncOpenAI | None = None
+        self._genai_model = None
         
         logger.info("ValidatorAgent initialized")
     
     async def __aenter__(self) -> "ValidatorAgent":
-        """Async context manager - initialize OpenAI client."""
-        self._openai = AsyncOpenAI(api_key=config.openai_api_key.get_secret_value())
+        """Async context manager - initialize Gemini client."""
+        genai.configure(api_key=config.gemini_api_key.get_secret_value())
+        self._genai_model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash-thinking-exp",
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1,  # Low temperature for precise validation
+            ),
+        )
         return self
     
     async def __aexit__(self, *args) -> None:
         """Async context manager - cleanup."""
-        # OpenAI client doesn't need explicit cleanup
         pass
     
     async def validate(self, analysis: AnalysisResult) -> ValidatedResult:
@@ -214,7 +220,7 @@ Be thorough and conservative. Flag anything that could cause issues."""
         Returns:
             ValidatedResult with validation status and any issues
         """
-        if not self._openai:
+        if not self._genai_model:
             raise RuntimeError("Validator not initialized. Use 'async with validator:'")
         
         logger.info(
@@ -228,8 +234,8 @@ Be thorough and conservative. Flag anything that could cause issues."""
         analysis_text = self._format_analysis(analysis)
         
         try:
-            # Call o1-preview for validation
-            response = await self._call_o1(analysis_text)
+            # Call Gemini for validation
+            response = await self._call_gemini(analysis_text)
             result = self._parse_response(response, analysis)
             
         except Exception as e:
@@ -319,30 +325,20 @@ Be thorough and conservative. Flag anything that could cause issues."""
         
         return "\n".join(sections)
     
-    async def _call_o1(self, analysis_text: str) -> dict[str, Any]:
+    async def _call_gemini(self, analysis_text: str) -> dict[str, Any]:
         """
-        Call OpenAI's o1-preview model for validation.
+        Call Gemini Flash Thinking for validation.
         """
-        if not self._openai:
-            raise RuntimeError("OpenAI client not initialized")
+        if not self._genai_model:
+            raise RuntimeError("Gemini client not initialized")
         
-        logger.debug("Calling o1-preview for validation")
+        logger.debug("Calling Gemini Flash Thinking for validation")
         
-        # Note: o1-preview doesn't support system messages the same way
-        # We include the instructions in the user message
-        response = await self._openai.chat.completions.create(
-            model="o1-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"{self.VALIDATION_PROMPT}\n\n---\n\nANALYSIS TO VALIDATE:\n\n{analysis_text}",
-                },
-            ],
-            # o1-preview has specific parameter requirements
-            # temperature and max_tokens may not be supported
+        response = self._genai_model.generate_content(
+            f"{self.VALIDATION_PROMPT}\n\n---\n\nANALYSIS TO VALIDATE:\n\n{analysis_text}"
         )
         
-        content = response.choices[0].message.content or "{}"
+        content = response.text
         
         # Parse JSON from response
         if "```json" in content:
@@ -358,7 +354,7 @@ Be thorough and conservative. Flag anything that could cause issues."""
         original: AnalysisResult,
     ) -> ValidatedResult:
         """
-        Parse the o1-preview response into a ValidatedResult.
+        Parse the Gemini response into a ValidatedResult.
         """
         issues = []
         for issue_data in response.get("issues", []):
@@ -385,7 +381,6 @@ Be thorough and conservative. Flag anything that could cause issues."""
         
         validated_dependencies = [
             dep for dep in original.dependencies
-            # Keep all deps for now - could filter if deps had IDs
         ]
         
         validated_constraints = [
