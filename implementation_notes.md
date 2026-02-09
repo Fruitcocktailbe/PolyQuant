@@ -26,7 +26,7 @@ POLYGON_RPC_URL="<your-alchemy-url>"        # e.g., https://polygon-mainnet.g.al
 ```
 
 ## 2. Environment Setup
-### SCIP Solver
+### SCIP Solver 
 The optimization engine uses SCIP. You cannot just install the python package; you need the system libraries.
 1.  **Download SCIPOptSuite** for Windows: [https://scipopt.org/index.php#download](https://scipopt.org/index.php#download)
 2.  Install it.
