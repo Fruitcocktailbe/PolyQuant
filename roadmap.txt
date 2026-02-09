@@ -1,0 +1,31 @@
+# Functional Roadmap: From Simulation to Production
+
+Based on the research provided in `Research polymarket.txt`, this roadmap outlines the technical requirements to make PolyQuant functional for live arbitrage extraction.
+
+## Phase 1: Authentication & L2 Connection
+Polymarket requires EIP-712 signing to interact with the CLOB (Central Limit Order Book).
+- **L1 Key Support**: Integrate `eth_account` to handle wallet private keys.
+- **L2 Credential Derivation**: Signature logic to derive `API_KEY`, `API_SECRET`, and `API_PASSPHRASE`.
+- **Proxy Wallet Management**: Setup logic for the proxy wallet required for trade execution.
+
+## Phase 2: Real-time Data Pipeline
+Arbitrage is high-speed. REST polling is insufficient.
+- **WebSocket Activation**: Enable `PolymarketWSClient` for Level 2 order book updates.
+- **VWAP Calculation**: Implement dynamic Volume-Weighted Average Price calculations to account for market depth.
+- **Latency Monitoring**: Measure and log "Detection to Submission" time.
+
+## Phase 3: Barrier Frank-Wolfe Solver
+Polymarket's LMSR liquidity model requires specialized optimization.
+- **InitFW Implementation**: An IP-based initialization step to find valid starting vertices and an interior point.
+- **Adaptive Contraction**: Prevent gradient explosion near price boundaries ($0 or $1).
+- **Extraction Alpha**: Implement the 90% extraction stopping condition to balance speed and profit.
+
+## Phase 4: Atomic Execution & Safety
+Execution is non-atomic and sequential.
+- **Sequence Executor**: Fire trades across multiple markets with fill verification.
+- **Auto-Unwind Logic**: Automatically selling legs if an arbitrage sequence breaks.
+- **KillSwitch Hardening**: Integrating the hardware killswitch directly into the execution loop.
+
+## Phase 5: Logic Formalization
+- **Hardened AI Prompts**: Ensure `LogicArchitect` produces valid mathematical constraints for the SCIP solver.
+- **Constraint Caching**: Store logical dependencies in Redis to reduce LLM latency and cost.
