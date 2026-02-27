@@ -4,6 +4,8 @@ export interface SystemState {
     active_solvers: number;
     global_latency_ms: number;
     kill_switch_active: boolean;
+    active_positions: any[];
+    markets: any[];
     logs: string[];
 }
 
@@ -22,6 +24,8 @@ class ApiService {
         active_solvers: 0,
         global_latency_ms: 0,
         kill_switch_active: false,
+        active_positions: [],
+        markets: [],
         logs: [],
     };
 

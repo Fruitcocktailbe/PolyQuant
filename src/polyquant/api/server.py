@@ -37,6 +37,7 @@ class SystemState(BaseModel):
     global_latency_ms: float = 0.0
     kill_switch_active: bool = False
     active_positions: List[Dict[str, Any]] = []
+    markets: List[Dict[str, Any]] = []
     logs: List[str] = []
 
 class Monitor:

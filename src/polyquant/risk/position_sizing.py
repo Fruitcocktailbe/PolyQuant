@@ -176,6 +176,23 @@ class PositionSizer:
         odds = max(0.01, odds)
         order_book_depth = max(0, order_book_depth)
         
+        # Price band validation - reject trades at extreme prices
+        # Price = 1 / odds for fair odds approximation
+        implied_price = 1.0 / odds if odds > 0 else 0.5
+        if implied_price < 0.02 or implied_price > 0.98:
+            logger.warning(
+                "Price band rejection",
+                implied_price=implied_price,
+                reason="Extreme price suggests resolution or broken market",
+            )
+            return PositionSize(
+                recommended_size=0,
+                kelly_size=0,
+                limited_by="price_band",
+                probability=probability,
+                expected_value=0,
+            )
+        
         # Calculate expected value
         ev = probability * odds - (1 - probability)
         

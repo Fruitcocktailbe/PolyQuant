@@ -1,0 +1,592 @@
+Phase 1 (Weeks 1-2): Critical bug fixes
+
+Real order execution implementation
+WebSocket real-time price feed
+Frank-Wolfe epsilon adaptation fix
+Stopping condition corrections
+Settled securities handling
+Phase 2 (Week 3): Architecture cleanup
+
+Remove Legacy orchestrator
+Focus on MapMaker + Navigator modes
+Improve LLM agent prompts and validation
+Phase 3 (Week 4): Performance optimizations
+
+Vectorize computations (10-50x speedup)
+Warm-start SCIP solver
+Add comprehensive caching
+Phase 4 (Week 5): Risk management
+
+VWAP slippage validation
+Latency tracking
+Position-level risk limits
+Phase 5 (Week 6): Testing and validation
+
+Unit and integration tests
+Backtesting framework
+Production readiness validation
+The plan includes specific file references, code examples, verification steps, and success metrics. It follows your preferences: balanced approach (bugs + optimizations), keeps LLM agents with improvements, removes Legacy mode, and uses a phased timeline starting conservative.
+
+Claude’s Plan
+PolyQuant Comprehensive Refactoring Plan
+Executive Summary
+This plan addresses critical bugs, missing implementations, and performance optimizations in the PolyQuant arbitrage trading system. Based on the research document and codebase analysis, we'll follow a phased approach: start conservatively with critical fixes, then accelerate to optimizations once validated.
+
+Architecture Decision: Remove Legacy orchestrator, focus on MapMaker (offline constraint generation) + Navigator (real-time trading) modes.
+
+LLM Strategy: Keep and improve Logic Architect and Validator agents with better prompts, validation, and error handling.
+
+Phase 1: Critical Bug Fixes & Missing Implementations (Weeks 1-2)
+Goal: Get the system working end-to-end with live execution capability.
+
+1.1 Fix Duplicate Class Definition in Orchestrator
+Problem: src/polyquant/legacy_orchestrator.py:55-115 defines PolyQuantOrchestrator class twice.
+
+Action:
+
+Merge the two class definitions
+Consolidate _correlation_agent and _microstructure_agent initialization
+This will be removed in Phase 2, but fix for stability now
+Files:
+
+src/polyquant/legacy_orchestrator.py
+1.2 Implement Real Order Execution
+Problem: src/polyquant/execution/executor.py:173-184 always returns None - real execution stubbed.
+
+Action:
+
+Implement _submit_order() with actual Polymarket CLOB API calls
+Add transaction signing using polygon_private_key from config
+Implement proper error handling for:
+Network timeouts
+Insufficient balance
+Order rejection
+Partial fills
+Required Components:
+
+Use py_clob_client library (add to dependencies)
+Sign orders with private key
+Submit to CLOB endpoint: https://clob.polymarket.com/
+Parse response for order ID and fill status
+Files:
+
+src/polyquant/execution/executor.py
+pyproject.toml - add py-clob-client dependency
+Reference: Research doc Part IV (execution under non-atomic constraints)
+
+1.3 Implement WebSocket Real-Time Price Feed
+Problem: System uses REST API polling (~100-200ms latency). No real-time updates.
+
+Action:
+
+Complete WebSocket client in PolymarketClient
+Connect to wss://ws-subscriptions-clob.polymarket.com
+Subscribe to order book updates for active markets
+Feed updates into PriceCache
+Add reconnection logic with exponential backoff
+Implementation:
+
+
+async def connect_websocket(self):
+    """Establish WebSocket connection for real-time updates."""
+    async with websockets.connect(self.ws_url) as ws:
+        # Subscribe to markets
+        await ws.send(json.dumps({
+            "type": "subscribe",
+            "channel": "book",
+            "markets": self.active_market_ids
+        }))
+
+        async for message in ws:
+            data = json.loads(message)
+            self._handle_book_update(data)
+Files:
+
+src/polyquant/data/polymarket_client.py
+src/polyquant/data/price_cache.py
+Latency Target: <10ms from price update to cache
+
+1.4 Fix Frank-Wolfe Adaptive Epsilon Rule
+Problem: src/polyquant/solver/fw_solver.py:275-276 has incorrect epsilon adaptation logic.
+
+Current (WRONG):
+
+
+if t > 5 and fw_gap < epsilon:
+    epsilon = max(epsilon / 2, 1e-4)
+Research Requirement (Part II of research doc):
+
+
+If g(μ_t) / (-4g_u) < ε_{t-1}:
+    ε_t = min{g(μ_t) / (-4g_u), ε_{t-1} / 2}
+Else:
+    ε_t = ε_{t-1}
+Action:
+
+Add g_u computation in init_fw() - gap at interior point
+Store self.g_u for use in epsilon adaptation
+Implement ratio-based adaptation logic
+Add boundary checks: verify μ_i ≥ ε for all i
+Files:
+
+src/polyquant/solver/fw_solver.py lines 62-77, 268-276
+Critical: This affects convergence guarantees. Without correct adaptation, solver may diverge.
+
+1.5 Fix Stopping Condition - Return Best Iterate
+Problem: src/polyquant/solver/fw_solver.py:260 returns current mu instead of best_mu.
+
+Action:
+
+Always return best_mu (tracked in lines 199-254)
+Add immediate return when kl < min_profit (arbitrage-free)
+Ensure best iterate tracking across all code paths
+Fix:
+
+
+# Condition 1: Arbitrage too small
+if kl < self.min_profit:
+    logger.info(f"Arbitrage-free at iter {t}: D(μ||θ)={kl:.5f}")
+    return best_mu, best_profit_guarantee, kl
+
+# Condition 2: Alpha-extraction achieved
+if guaranteed_profit > 0 and fw_gap <= (1 - self.alpha) * kl:
+    logger.info(f"Alpha-extraction met at iter {t}")
+    return best_mu, best_profit_guarantee, kl  # Not current mu
+Files:
+
+src/polyquant/solver/fw_solver.py lines 256-265
+1.6 Handle Settled Securities in Optimization
+Problem: InitFW returns settled_ids but they're never used. Solver optimizes over all outcomes including settled ones.
+
+Action:
+
+In find_opportunity(), extract settled securities from InitFW output
+Lock settled securities to 0 or 1 (from Z_0 vertices)
+Only optimize over unsettled outcomes in barrier_fw()
+Restore settled values in final target_prices
+Files:
+
+src/polyquant/solver/fw_solver.py lines 290-319
+Impact: Reduces dimensionality as games settle, speeds up convergence.
+
+1.7 Implement ExecutionGuard Constraint Checking
+Problem: src/polyquant/navigator.py:91-124 ExecutionGuard.check_trade() always returns True, "passed".
+
+Action:
+
+Load constraint matrix from pre-computed manifest
+For each trade, validate against constraints:
+Check sum of probabilities = 1 for partitions
+Check logical implications (if A then B)
+Check mutual exclusions
+Return False if trade violates any constraint
+Optimize for O(1) lookup using pre-indexed constraints
+Files:
+
+src/polyquant/navigator.py lines 91-124
+src/polyquant/utils/constraint_store.py
+1.8 Fix Synchronous Gemini Calls in Async Context
+Problem: src/polyquant/agents/discovery.py:376-396 blocks event loop with synchronous generate_content().
+
+Action:
+
+
+# Use asyncio.to_thread for blocking calls
+response = await asyncio.to_thread(
+    self._genai_model.generate_content,
+    prompt
+)
+Files:
+
+src/polyquant/agents/discovery.py
+src/polyquant/agents/logic_architect.py
+src/polyquant/agents/validator.py
+1.9 Fix Config Duplicate Field
+Problem: src/polyquant/utils/config.py has polygon_private_key defined twice (lines 64 & 74).
+
+Action: Remove one definition, keep the SecretStr version.
+
+Phase 2: Architecture Refactoring (Week 3)
+Goal: Remove Legacy orchestrator, consolidate to MapMaker + Navigator modes.
+
+2.1 Remove Legacy Orchestrator
+Action:
+
+Delete PolyQuantOrchestrator class from legacy_orchestrator.py
+Update main.py to default to MapMaker mode
+Move useful logic (if any) to MapMaker/Navigator
+Files to Delete/Modify:
+
+src/polyquant/legacy_orchestrator.py - remove ~710 lines
+src/polyquant/main.py - update entry point
+2.2 Improve MapMaker - Offline Constraint Generation
+Current: src/polyquant/map_maker.py works but has inefficiencies.
+
+Enhancements:
+
+Cache LLM results: Hash market cluster → constraint matrix mapping
+Batch Redis operations: Replace N is_market_processed() calls with single batch check
+Progress tracking: Add manifest versioning, track completion percentage
+Incremental updates: Only re-analyze changed markets
+Files:
+
+src/polyquant/map_maker.py
+src/polyquant/utils/cache.py
+2.3 Enhance Navigator - Real-Time Trading Engine
+Current: src/polyquant/navigator.py has incomplete implementations.
+
+Enhancements:
+
+Implement _detect_opportunities(): Use ArbitrageDetector with cached constraints
+Fix _fetch_order_books(): Batch fetch or use WebSocket-fed cache
+Complete WebSocket integration: Connect to price feed in _setup_websocket()
+Add latency tracking: Measure decision-to-submission time, feed to KillSwitch
+Files:
+
+src/polyquant/navigator.py
+2.4 Improve LLM Agent Prompts & Validation
+Logic Architect Improvements:
+
+Better prompt structure:
+
+prompt = f"""
+Analyze market dependencies. Return JSON only, no explanation.
+
+Markets:
+{json.dumps(market_descriptions, indent=2)}
+
+Required output format:
+{{
+  "dependencies": [
+    {{
+      "type": "MUTUALLY_EXCLUSIVE" | "SUBSET" | "IMPLIES",
+      "markets": ["id1", "id2"],
+      "confidence": 0.0-1.0,
+      "reasoning": "brief explanation"
+    }}
+  ]
+}}
+
+Validation rules:
+- IMPLIES: If market A resolves YES, B must resolve YES
+- MUTUALLY_EXCLUSIVE: Only one can resolve YES
+- SUBSET: All outcomes of A exist in B
+
+Include confidence score based on description clarity.
+"""
+Add constraint validation:
+
+Check constraint matrix is valid (no contradictions)
+Verify dependencies against current prices (if A implies B, price(A) ≤ price(B))
+Flag low-confidence constraints for manual review
+Add fallback logic:
+
+If LLM fails, use heuristic constraint detection
+For NegRisk markets: automatic partition constraints
+For standard markets: check price sums
+Validator Improvements:
+
+Add quantitative checks:
+
+Verify constraint matrix rank (not singular)
+Check feasibility with sample outcomes
+Test edge cases (all YES, all NO, etc.)
+Cross-reference with market data:
+
+Fetch current prices, verify logical consistency
+Flag markets with extreme prices (<0.02, >0.98) as risky
+Files:
+
+src/polyquant/agents/logic_architect.py
+src/polyquant/agents/validator.py
+Phase 3: Performance Optimizations (Week 4)
+Goal: Reduce latency to <50ms total (discovery to execution).
+
+3.1 Vectorize Frank-Wolfe Computations
+Current: Dict loops in gradient/KL computation (~1000 operations per iteration).
+
+Action:
+
+Convert to numpy arrays at start of barrier_fw()
+Vectorized gradient: grad = np.log(mu / theta) + 1
+Vectorized KL: kl = np.sum(mu * np.log(mu / theta))
+Convert back to dict at end
+Expected Speedup: 10-50x for 100+ outcomes
+
+Files:
+
+src/polyquant/solver/fw_solver.py lines 204-250
+3.2 Warm-Start SCIP Solver
+Action:
+
+Pass previous solution to SCIP as starting point
+Store last_solution in SCIPSolver instance
+Use SCIP's partial solution API
+Expected Speedup: 2-5x for repeated solves
+
+Files:
+
+src/polyquant/solver/scip_solver.py
+3.3 Batch Order Book Fetches
+Current: navigator.py:365-389 fetches one order book at a time.
+
+Action:
+
+Check if Polymarket API supports batch requests
+If yes: batch fetch all needed order books in one call
+If no: use parallel asyncio.gather() for concurrent requests
+Files:
+
+src/polyquant/navigator.py
+src/polyquant/data/polymarket_client.py
+3.4 Optimize Discovery Agent Batching
+Action:
+
+Batch Redis cache checks: cache.are_markets_processed([ids])
+Increase pagination limit from 100 to 500
+Add parallel clustering for independent market groups
+Files:
+
+src/polyquant/agents/discovery.py
+src/polyquant/utils/cache.py
+3.5 Add Result Caching Throughout Pipeline
+Action:
+
+Cache Logic Architect results by market cluster hash
+Cache Validator results by constraint matrix hash
+Cache solver results for unchanged order books
+Use Redis with TTL (5 minutes for fast-moving markets)
+Implementation Pattern:
+
+
+cache_key = f"logic_architect:{cluster_hash}"
+if cached := await cache.get(cache_key):
+    return cached
+
+result = await self._analyze_cluster(cluster)
+await cache.set(cache_key, result, ttl=300)
+return result
+Files: All agent files, add caching decorators
+
+Phase 4: Risk Management & Execution Enhancements (Week 5)
+4.1 Implement VWAP-Based Slippage Validation
+Action:
+
+Calculate VWAP from order book before execution
+Reject trades if slippage > config.vwap_slippage_limit (0.05)
+Add VWAP calculation to OrderBook model
+Files:
+
+src/polyquant/execution/executor.py
+src/polyquant/data/market_models.py
+Reference: Research doc Part IV (VWAP analysis)
+
+4.2 Wire Latency Tracking to Kill Switch
+Action:
+
+In Navigator, measure time from price update to order submission
+Call kill_switch.record_latency() after each trade
+Trigger kill switch if latency > 30ms threshold
+Files:
+
+src/polyquant/navigator.py
+src/polyquant/risk/kill_switch.py
+4.3 Add Position-Level Risk Tracking
+Current: Kill switch tracks total P&L only.
+
+Action:
+
+Track exposure per market in KillSwitch
+Add per-market exposure limits (% of capital)
+Prevent concentration risk (max 10% in single market)
+Files:
+
+src/polyquant/risk/kill_switch.py
+4.4 Implement Correlation-Aware Position Sizing
+Action:
+
+Complete CorrelationAgent implementation
+Build correlation matrix from historical price data
+Adjust position sizes accounting for correlation
+Use portfolio VaR instead of per-trade sizing
+Files:
+
+src/polyquant/agents/correlation.py
+src/polyquant/risk/position_sizing.py
+Phase 5: Testing & Validation (Week 6)
+5.1 Unit Tests
+Coverage Targets:
+
+Solvers: 90% (critical math must be correct)
+Agents: 80%
+Execution: 95% (money at risk)
+Risk management: 95%
+Key Test Cases:
+
+Frank-Wolfe convergence on known problems
+Epsilon adaptation correctness
+Constraint validation edge cases
+Order execution failure scenarios
+Kill switch trigger conditions
+Files:
+
+Create tests/test_solvers.py
+Create tests/test_execution.py
+Create tests/test_agents.py
+5.2 Integration Tests
+Scenarios:
+
+End-to-end MapMaker flow: Discovery → Logic → Validation → Constraint manifest
+End-to-end Navigator flow: Load manifest → Detect opportunity → Execute → Verify profit
+Kill switch triggers: Simulate drawdown, verify trading halts
+WebSocket reconnection: Simulate disconnect, verify recovery
+Files:
+
+Create tests/test_integration.py
+5.3 Backtesting Framework
+Action:
+
+Load historical Polymarket data (from Alchemy Polygon API)
+Replay price updates through Navigator
+Track hypothetical P&L
+Compare with research paper results ($40M extracted benchmark)
+Metrics:
+
+Opportunities detected per day
+Execution success rate
+Average profit per trade
+Sharpe ratio
+Files:
+
+Create scripts/backtest.py
+Critical Files Reference
+Must Modify (Phase 1):
+src/polyquant/execution/executor.py - Implement real execution
+src/polyquant/solver/fw_solver.py - Fix epsilon adaptation, stopping condition, settled securities
+src/polyquant/data/polymarket_client.py - Add WebSocket
+src/polyquant/navigator.py - Complete ExecutionGuard
+src/polyquant/agents/discovery.py - Fix async/sync mismatch
+Must Delete (Phase 2):
+src/polyquant/legacy_orchestrator.py - Remove entirely
+Enhance (Phases 2-4):
+src/polyquant/map_maker.py - Add caching, batching
+src/polyquant/agents/logic_architect.py - Better prompts
+src/polyquant/agents/validator.py - Quantitative validation
+src/polyquant/risk/kill_switch.py - Position-level risk
+Dependencies to Add
+Update pyproject.toml:
+
+
+[tool.poetry.dependencies]
+py-clob-client = "^0.15.0"  # Polymarket CLOB API client
+websockets = "^12.0"         # WebSocket support
+numpy = "^1.26.0"            # Vectorization
+eth-account = "^0.10.0"      # Transaction signing
+Configuration Updates
+Update .env.example and src/polyquant/utils/config.py:
+
+
+# Execution
+POLYMARKET_API_KEY: str
+POLYMARKET_API_SECRET: SecretStr
+POLYGON_PRIVATE_KEY: SecretStr  # Remove duplicate
+
+# WebSocket
+WEBSOCKET_RECONNECT_DELAY: int = 5
+WEBSOCKET_MAX_RETRIES: int = 10
+
+# Solver
+FW_MAX_ITERATIONS: int = 150
+FW_ALPHA_EXTRACTION: float = 0.9
+FW_MIN_PROFIT: float = 0.05
+FW_EPSILON_INITIAL: float = 0.1
+
+# Risk
+MAX_POSITION_PER_MARKET: float = 0.10  # 10% of capital
+Verification Plan
+Phase 1 Verification (Critical Fixes):
+Executor: Submit test order to Polymarket testnet, verify confirmation
+WebSocket: Connect, subscribe to market, log 100 price updates, verify <10ms latency
+Frank-Wolfe: Run on NCAA tournament example from research, verify convergence matches paper
+ExecutionGuard: Test 10 valid trades (should pass), 10 invalid trades (should fail)
+Phase 2 Verification (Architecture):
+MapMaker: Generate constraint manifest for 10 markets, verify completeness
+Navigator: Load manifest, run for 1 hour paper trading, measure latency (<50ms target)
+No Legacy: Ensure main.py runs without importing legacy_orchestrator.py
+Phase 3 Verification (Performance):
+Vectorization: Benchmark gradient computation (expect 10-50x speedup)
+Caching: Measure cache hit rate (target >60% for stable markets)
+Latency: End-to-end timing from price update to order submission (<50ms)
+Phase 4 Verification (Risk):
+VWAP: Simulate 100 trades, verify slippage rejection logic
+Kill Switch: Trigger each condition (drawdown, latency, errors), verify halt
+Position Sizing: Test with correlated markets, verify reduced sizing
+Phase 5 Verification (Testing):
+Unit Tests: Run pytest tests/ - all pass
+Integration Tests: All end-to-end flows complete successfully
+Backtest: Run on 30 days historical data, achieve >50% opportunity capture rate
+Success Metrics
+Phase 1 (Working System):
+
+✓ Real orders execute on Polymarket
+✓ WebSocket connected with <10ms latency
+✓ Frank-Wolfe converges correctly (matches research)
+✓ No critical bugs blocking execution
+Phase 2 (Clean Architecture):
+
+✓ Legacy orchestrator removed
+✓ MapMaker generates valid manifests
+✓ Navigator trades live with manifests
+✓ Latency <50ms end-to-end
+Phase 3 (Performance):
+
+✓ Gradient computation 10x+ faster
+✓ Cache hit rate >60%
+✓ Solver iterations <150 for convergence
+Phase 4 (Risk Management):
+
+✓ No trades violate slippage limits
+✓ Kill switch prevents >15% drawdown
+✓ Position sizing respects correlation
+Phase 5 (Production Ready):
+
+✓ Test coverage >85%
+✓ Backtest shows profitable strategy
+✓ Can run continuously for 24+ hours without crashes
+Risk Mitigation
+Execution Risk:
+
+Start with small position sizes (<$100 per trade)
+Paper trade for 1 week before live trading
+Test on low-liquidity markets first
+Mathematical Risk:
+
+Validate Frank-Wolfe convergence against research paper examples
+Cross-check solver results with simple cases
+Add assertion checks for gradient bounds
+LLM Risk:
+
+Track LLM confidence scores
+Manual review of low-confidence constraints
+Fallback to heuristic detection if LLM fails
+Operational Risk:
+
+Deploy kill switch before live trading
+Set conservative drawdown limits (10% initially)
+Monitor latency continuously
+Timeline Summary
+Phase	Duration	Key Deliverable
+Phase 1	2 weeks	Working execution pipeline
+Phase 2	1 week	Clean architecture (MapMaker + Navigator)
+Phase 3	1 week	<50ms latency achieved
+Phase 4	1 week	Risk management complete
+Phase 5	1 week	Testing & validation done
+Total	6 weeks	Production-ready system
+Next Steps After Approval
+Create feature branch: git checkout -b refactor/comprehensive-improvements
+Start with Phase 1.2 (Executor implementation) - highest impact
+Work through phases sequentially
+Test each phase before moving to next
+Deploy to testnet after Phase 2
+Deploy to mainnet after Phase 5
+This plan balances correctness, performance, and maintainability while preserving the core research-backed algorithms.

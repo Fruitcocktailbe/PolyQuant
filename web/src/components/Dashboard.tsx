@@ -2,52 +2,63 @@ import { useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { api, SystemState } from '../services/api';
 import { LogTerminal } from './LogTerminal';
 import { KillSwitch } from './KillSwitch';
+import { MarketList } from './MarketList';
 import { Activity, Cpu, DollarSign, Wifi, Layers } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 // Memoized stat card to prevent re-renders
-const StatCard = memo<{ icon: React.ReactNode; label: string; value: string | number; color?: string }>(
-    ({ icon, label, value, color = 'text-white' }) => (
-        <div className="panel flex flex-col justify-center">
-            <span className="text-xs text-gray-500 uppercase flex items-center gap-2">
-                {icon} {label}
+const StatCard = memo<{ icon: React.ReactNode; label: string; value: string | number; color?: string; subValue?: string }>(
+    ({ icon, label, value, color = 'text-white', subValue }) => (
+        <div className="bg-charcoal/50 border border-white/5 backdrop-blur-sm p-4 flex flex-col justify-between hover:border-neon-cyan/30 transition-colors group">
+            <div className="flex justify-between items-start mb-2">
+                <span className="text-[10px] uppercase tracking-[0.2em] text-gray-500 font-bold flex items-center gap-2 group-hover:text-neon-cyan transition-colors">
+                    {icon} {label}
+                </span>
+                {subValue && <span className="text-[10px] text-neon-green font-mono">{subValue}</span>}
+            </div>
+            <span className={`text-2xl font-mono tracking-tight font-medium ${color} drop-shadow-[0_0_10px_rgba(0,0,0,0.5)]`}>
+                {value}
             </span>
-            <span className={`text-2xl font-mono ${color}`}>{value}</span>
         </div>
     )
 );
 StatCard.displayName = 'StatCard';
 
-// Memoized header to prevent re-renders from parent state changes
+// Memoized header
 const Header = memo<{ status: string; latency: number; nlv: number }>(({ status, latency, nlv }) => {
     const statusColor = useMemo(() => {
-        if (status.includes('RUNNING')) return 'text-[#00FF94]';
-        if (status.includes('STOPPED')) return 'text-[#FF2A6D]';
+        if (status.includes('RUNNING')) return 'text-neon-green drop-shadow-[0_0_8px_rgba(0,255,148,0.5)]';
+        if (status.includes('STOPPED')) return 'text-neon-red drop-shadow-[0_0_8px_rgba(255,0,85,0.5)]';
         return 'text-gray-500';
     }, [status]);
 
-    const latencyColor = latency < 50 ? 'text-[#00FF94]' : 'text-[#FFD600]';
+    const latencyColor = latency < 50 ? 'text-neon-green' : 'text-neon-purple';
 
     return (
-        <header className="h-16 border-b border-[#2D3339] flex items-center justify-between px-6 bg-[#15191E]">
-            <div className="flex items-center gap-4">
-                <div className="w-3 h-3 rounded-full bg-[#00F0FF] animate-pulse shadow-[0_0_10px_#00F0FF]" />
-                <h1 className="text-xl font-bold tracking-widest font-header">
-                    POLYQUANT <span className="text-[#00F0FF] text-xs align-top">2.0</span>
-                </h1>
-                <div className={`ml-8 font-mono font-bold tracking-wide ${statusColor}`}>
+        <header className="h-14 border-b border-white/10 bg-black/40 backdrop-blur-md flex items-center justify-between px-6 z-10">
+            <div className="flex items-center gap-6">
+                <div className="flex items-center gap-3">
+                    <div className="w-2 h-2 rounded-none bg-neon-cyan animate-pulse shadow-neon-cyan" />
+                    <h1 className="text-lg font-bold tracking-[0.2em] text-white">
+                        POLYQUANT <span className="text-neon-cyan text-[10px] align-top opacity-80">v2.0</span>
+                    </h1>
+                </div>
+
+                <div className="h-4 w-[1px] bg-white/10" />
+
+                <div className={`font-mono text-xs font-bold tracking-wider ${statusColor}`}>
                     [{status}]
                 </div>
             </div>
 
-            <div className="flex items-center gap-8 text-sm font-mono">
-                <div className="flex items-center gap-2 text-gray-400">
-                    <Wifi className="w-4 h-4" />
+            <div className="flex items-center gap-6 text-xs font-mono">
+                <div className="flex items-center gap-2 text-gray-400 group">
+                    <Wifi className="w-3 h-3 group-hover:text-white transition-colors" />
                     <span className={latencyColor}>{latency}ms</span>
                 </div>
-                <div className="flex items-center gap-2 bg-black/30 px-3 py-1 rounded border border-gray-800">
-                    <DollarSign className="w-4 h-4 text-[#00FF94]" />
-                    <span className="text-white font-bold">${nlv.toLocaleString()}</span>
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-neon-green/10 border border-neon-green/20">
+                    <DollarSign className="w-3 h-3 text-neon-green" />
+                    <span className="text-white font-bold tracking-wide">${nlv.toLocaleString()}</span>
                 </div>
             </div>
         </header>
@@ -55,30 +66,48 @@ const Header = memo<{ status: string; latency: number; nlv: number }>(({ status,
 });
 Header.displayName = 'Header';
 
-// Memoized chart to prevent re-renders when other state changes
+// Memoized chart
 const EquityChart = memo<{ data: { time: number; value: number }[] }>(({ data }) => (
-    <div className="panel flex-1 flex flex-col min-h-0">
-        <div className="flex justify-between items-center mb-4">
-            <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
-                <Activity className="w-4 h-4 text-[#00F0FF]" /> Equity Curve
-            </h3>
+    <div className="bg-charcoal/50 border border-white/5 backdrop-blur-sm flex-1 flex flex-col min-h-0 relative overflow-hidden group">
+        <div className="absolute top-0 right-0 p-4 opacity-50 pointer-events-none">
+            <Activity className="w-32 h-32 text-white/5" />
         </div>
-        <div className="flex-1 w-full min-h-0">
+
+        <div className="p-4 border-b border-white/5 flex justify-between items-center bg-black/20">
+            <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                <Activity className="w-3 h-3 text-neon-purple" /> Equity Curve
+            </h3>
+            <div className="flex gap-2">
+                <span className="text-[10px] text-gray-600 font-mono">LIVE FEED</span>
+                <div className="w-1.5 h-1.5 bg-neon-green rounded-full animate-ping" />
+            </div>
+        </div>
+
+        <div className="flex-1 w-full min-h-0 p-2">
             <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={data}>
                     <XAxis dataKey="time" hide />
                     <YAxis domain={['auto', 'auto']} hide />
                     <Tooltip
-                        contentStyle={{ backgroundColor: '#15191E', border: '1px solid #2D3339' }}
-                        itemStyle={{ color: '#00FF94' }}
+                        contentStyle={{
+                            backgroundColor: 'rgba(5, 5, 5, 0.95)',
+                            border: '1px solid rgba(255, 255, 255, 0.1)',
+                            boxShadow: '0 0 20px rgba(0,0,0,0.5)',
+                            fontSize: '12px',
+                            fontFamily: 'monospace'
+                        }}
+                        itemStyle={{ color: '#00ff94' }}
+                        labelStyle={{ display: 'none' }}
+                        formatter={(value: number) => [`$${value.toFixed(2)}`, 'Equity']}
                     />
                     <Line
-                        type="monotone"
+                        type="stepAfter"
                         dataKey="value"
-                        stroke="#00FF94"
+                        stroke="#00ff94"
                         strokeWidth={2}
                         dot={false}
                         isAnimationActive={false}
+                        strokeDasharray="0"
                     />
                 </LineChart>
             </ResponsiveContainer>
@@ -94,12 +123,14 @@ const INITIAL_STATE: SystemState = {
     active_solvers: 0,
     global_latency_ms: 0,
     kill_switch_active: false,
+    markets: [],
     logs: [],
 };
 
 export const Dashboard: React.FC = () => {
     const [state, setState] = useState<SystemState>(INITIAL_STATE);
     const [equityHistory, setEquityHistory] = useState<{ time: number; value: number }[]>([]);
+    const [showRawData, setShowRawData] = useState(false);
 
     // Stable callback for state updates
     const handleStateUpdate = useCallback((newState: SystemState) => {
@@ -124,51 +155,73 @@ export const Dashboard: React.FC = () => {
     }, [handleStateUpdate]);
 
     return (
-        <div className="h-screen w-screen flex flex-col bg-[#0B0E11] text-[#E6E6E6] overflow-hidden">
+        <div className="h-screen w-screen flex flex-col bg-obsidian text-gray-300 font-sans selection:bg-neon-cyan/30 selection:text-neon-cyan overflow-hidden bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-charcoal via-obsidian to-obsidian">
             <Header
                 status={state.status}
                 latency={state.global_latency_ms}
                 nlv={state.net_liquidation_value}
             />
 
-            <main className="flex-1 p-4 grid grid-cols-12 grid-rows-12 gap-4 overflow-hidden">
+            <main className="flex-1 p-3 grid grid-cols-12 grid-rows-12 gap-3 overflow-hidden">
                 {/* Left Col: Logs & Activity */}
-                <div className="col-span-4 row-span-12 flex flex-col gap-4">
-                    <div className="grid grid-cols-2 gap-4 h-24">
+                <div className="col-span-3 row-span-12 flex flex-col gap-3">
+                    <div className="grid grid-cols-1 gap-3 h-auto">
                         <StatCard
                             icon={<Cpu className="w-3 h-3" />}
                             label="Active Solvers"
                             value={state.active_solvers}
-                            color="text-[#00F0FF]"
+                            color="text-neon-cyan"
+                            subValue="+2.5%"
                         />
                         <StatCard
                             icon={<Layers className="w-3 h-3" />}
                             label="Mkts Scanned"
                             value={450}
+                            color="text-white"
                         />
                     </div>
-                    <div className="flex-1 min-h-0">
+                    <div className="flex-1 min-h-0 bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col">
                         <LogTerminal logs={state.logs} />
                     </div>
                 </div>
 
                 {/* Center Col: Equity & Risk */}
-                <div className="col-span-5 row-span-12 flex flex-col gap-4">
+                <div className="col-span-6 row-span-12 flex flex-col gap-3">
                     <EquityChart data={equityHistory} />
-                    <div className="h-1/3">
+                    <div className="h-48">
                         <KillSwitch active={state.kill_switch_active} />
                     </div>
                 </div>
 
                 {/* Right Col: Positions */}
-                <div className="col-span-3 row-span-12 panel flex flex-col">
-                    <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-800 pb-2">
-                        Active Positions
-                    </h3>
-                    <div className="flex-1 overflow-y-auto">
-                        <div className="text-xs text-gray-500 text-center mt-10">
-                            Waiting for opportunities...
+                <div className="col-span-3 row-span-12 bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col relative overflow-hidden">
+                    <div className="p-4 border-b border-white/5 bg-black/20 flex justify-between items-center">
+                        <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em]">
+                            Active Positions
+                        </h3>
+                        <div className="px-2 py-0.5 bg-neon-cyan/10 text-neon-cyan text-[10px] font-mono border border-neon-cyan/20">
+                            LIVE
                         </div>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto custom-scrollbar flex flex-col min-h-0">
+                        <MarketList markets={state.markets} />
+                    </div>
+
+                    <div className="border-t border-white/5 p-2 bg-black/20">
+                        <button
+                            onClick={() => setShowRawData(!showRawData)}
+                            className="text-[10px] text-gray-500 hover:text-neon-cyan transition-colors flex items-center gap-1 uppercase tracking-tighter"
+                        >
+                            <Layers className="w-3 h-3" />
+                            {showRawData ? 'Hide Raw State' : 'Show Raw State'}
+                        </button>
+
+                        {showRawData && (
+                            <pre className="mt-2 text-[8px] font-mono text-neon-green/70 bg-black/50 p-2 rounded overflow-auto max-h-40 custom-scrollbar">
+                                {JSON.stringify(state, null, 2)}
+                            </pre>
+                        )}
                     </div>
                 </div>
             </main>

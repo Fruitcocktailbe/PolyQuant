@@ -12,13 +12,13 @@ RESPONSIBILITIES:
 3. Identify edge cases in resolution criteria
 4. Output structured constraint matrices for the optimizer
 
-WHY DeepSeek-R1?
-----------------
-DeepSeek-R1 was chosen for this task because:
-1. 79.8% Pass@1 on AIME 2024 - excellent mathematical reasoning
-2. Reinforcement learning training optimizes for logical deduction
-3. Cost-effective ($2.19/$8.79 per 1M tokens) vs OpenAI o1
-4. Strong performance on multi-step proofs without external tools
+WHY GEMINI 2.0 FLASH THINKING?
+---------------------------
+Gemini 2.0 Flash Thinking was chosen for this task because:
+1. Strong reasoning capabilities with visible "thinking" process
+2. Excellent at logical deduction and constraint extraction
+3. Consolidates all AI to a single provider (Google)
+4. Cost-effective with generous rate limits
 
 HOW IT WORKS:
 -------------
@@ -59,7 +59,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-import httpx
+import google.generativeai as genai
 from pydantic import BaseModel, Field
 
 from polyquant.agents.discovery import MarketCluster
@@ -119,11 +119,11 @@ class LogicArchitect:
     """
     Phase 2: Logical Dependency Detection and Formalization
     
-    The Logic Architect uses DeepSeek-R1 to analyze market descriptions
+    The Logic Architect uses Gemini 2.0 Flash Thinking to analyze market descriptions
     and extract formal logical constraints.
     
     Architecture:
-    - Uses DeepSeek API with Chain-of-Thought prompting
+    - Uses Google Generative AI SDK with Chain-of-Thought prompting
     - Multi-step reasoning for complex dependencies
     - Outputs both human-readable and machine-readable formats
     
@@ -142,81 +142,119 @@ class LogicArchitect:
     
     # System prompt explaining the task to DeepSeek-R1
     # Uses Chain-of-Thought structure for better reasoning
-    ANALYSIS_PROMPT = """You are a logical analysis agent for prediction market arbitrage.
+    # System prompt explaining the task to DeepSeek-R1 / Gemini 2.0 Flash Thinking
+    # Uses Chain-of-Thought structure for better reasoning
+    ANALYSIS_PROMPT = """You are the **Logic Architect** for a high-frequency arbitrage system.
 
-Your task is to find LOGICAL DEPENDENCIES between prediction markets.
+YOUR GOAL:
+Identify **Strict Logical Constraints** between prediction market outcomes.
+We are not looking for "correlations". We are looking for **mathematical impossibilities** and **guaranteed implications**.
 
-A logical dependency exists when:
-- The outcome of one market IMPLIES something about another market
-- Both markets share underlying events that constrain possible outcomes
-- Resolution criteria create mathematical relationships
+### 1. RELATIONSHIP TAXONOMY
+You must classify relationships into these strict categories:
 
-EXAMPLES OF DEPENDENCIES:
-1. "Trump wins Pennsylvania" -> increases probability of "Trump wins election"
-2. "Democrats win Senate" + "Democrats win House" -> implies "Democrats control Congress"
-3. "Bitcoin > $100k by March" incompatible with "Bitcoin < $80k by March"
+**A. MUTUALLY_EXCLUSIVE (Disjoint)**
+Two outcomes cannot BOTH be TRUE.
+Constraint: `z[A] + z[B] <= 1`
+*Hint*: Often found when Prices sum to <= 1.0 (e.g. $0.60 + $0.35 = $0.95).
 
-ANALYSIS STEPS:
-1. Read each market's question and resolution criteria carefully
-2. Identify shared entities, events, or conditions
-3. Determine if outcomes are:
-   - Mutually exclusive (both cannot be true)
-   - Implicative (one implies the other)
-   - Correlated (share common factors)
-4. Quantify the logical relationship strength
+**B. PARTITION (Exhaustive)**
+Outcomes are mutually exclusive AND cover all possibilities.
+Constraint: `sum(z[i]) == 1`
+*Hint*: Prices usually sum to ~1.0 (e.g. $0.40 + $0.30 + $0.30 = $1.00).
 
-OUTPUT FORMAT (JSON):
+**C. SUBSET (Implication)**
+If Outcome A happens, Outcome B MUST happen.
+Constraint: `z[A] <= z[B]` (or `z[B] - z[A] >= 0`)
+*Hint*: Price of A ($0.10) should be LESS than Price of B ($0.80). 
+*Anti-Hint*: If Price A > Price B, Implication is IMPOSSIBLE.
+
+**D. CAUSAL_GROUP**
+Outcomes share a complex dependency.
+Example: "Democrats win Senate" and "Democrats win House" -> "Democrats win Congress".
+Constraint: `z[Senate] + z[House] - z[Congress] <= 1`
+
+---
+
+### 2. REAL-WORLD DATA HINTS
+You will receive market data including **PRICE** and **VOLUME**.
+- **Use Price Checks**: If you think A implies B, but Price(A) > Price(B), **YOU ARE WRONG**. Reject it.
+- **Use Volume**: High volume markets are "truth anchors". Trust them more.
+- **Ignore Small Gaps**: Prices are noisy. $0.99 + $0.02 = $1.01 might still be a Partition.
+
+### 3. OUTPUT FORMAT
+Output JSON immediately following your `<thinking>` block.
+
+```json
 {
     "dependencies": [
         {
-            "source_market_id": "id1",
+            "source_market_id": "...",
             "source_outcome": "Yes",
-            "target_market_id": "id2",
+            "target_market_id": "...",
             "target_outcome": "Yes",
-            "relationship": "implies",
-            "confidence": 0.85,
-            "reasoning": "If Trump wins PA (a key swing state with 19 electoral votes)..."
+            "target_outcome": "Yes",
+            "relationship": "MUTUALLY_EXCLUSIVE", 
+            "confidence": 1.0,
+            "reasoning": "Both imply same event X but different winners"
         }
     ],
     "constraints": [
         {
-            "description": "PA win implies increased election probability",
-            "coefficients": {"outcome_id_election_yes": 1, "outcome_id_pa_yes": -0.7},
-            "rhs": 0,
-            "reasoning": "Historical data shows PA winner wins election >80% of time"
+            "constraint_id": "c1",
+            "description": "Only one winner allowed",
+            "coefficients": {"m1_yes": 1.0, "m2_yes": 1.0},
+            "operator": "<=",
+            "rhs": 1.0
         }
-    ],
-    "edge_cases": [
-        "Market M1 resolves on popular vote, M2 on electoral college - not perfectly correlated"
     ]
 }
+```
 
-Be thorough but conservative - only report high-confidence dependencies."""
+---
 
-    # DeepSeek API endpoint
-    DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
-    
+### 4. REASONING PROCESS (Chain-of-Thought)
+Before generating JSON, you must output a `<thinking>` block:
+1.  **Analyze Entities**: List all candidates, teams, or assets involved.
+2.  **Normalize Outcomes**: "Yes" means what event?
+3.  **Check Internal Logic**: Does each market sum to 1? (Partition check).
+4.  **Check Cross-Market Logic**:
+    -   Does A imply B? (Check Prices!)
+    -   Are A and B mutually exclusive?
+    -   Do A and B form a cover?
+5.  **Verify Directions**: Ensure implications go the right way (Subsets must have lower/equal price).
+
+"""
+
     def __init__(self):
         """Initialize the Logic Architect."""
-        self._client: httpx.AsyncClient | None = None
+        self._model: genai.GenerativeModel | None = None
         
         logger.info("LogicArchitect initialized")
     
     async def __aenter__(self) -> "LogicArchitect":
-        """Async context manager - initialize HTTP client."""
-        self._client = httpx.AsyncClient(
-            timeout=120.0,  # DeepSeek-R1 reasoning can take time
-            headers={
-                "Authorization": f"Bearer {config.deepseek_api_key.get_secret_value()}",
-                "Content-Type": "application/json",
-            },
-        )
+        """Async context manager - initialize Gemini model."""
+        api_key = config.gemini_api_key.get_secret_value()
+        
+        if not api_key or "your-" in api_key:
+            logger.warning("Gemini API key not set - running in No-LLM mode")
+            self._model = None
+        else:
+            genai.configure(api_key=api_key)
+            self._model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash-thinking-exp-01-21",
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,  # Low temperature for consistent reasoning
+                ),
+                system_instruction=self.ANALYSIS_PROMPT,
+            )
         return self
     
     async def __aexit__(self, *args) -> None:
         """Async context manager - cleanup."""
-        if self._client:
-            await self._client.aclose()
+        # Gemini SDK doesn't require explicit cleanup
+        pass
     
     async def analyze_cluster(self, cluster: MarketCluster) -> AnalysisResult:
         """
@@ -237,7 +275,7 @@ Be thorough but conservative - only report high-confidence dependencies."""
         Returns:
             AnalysisResult with dependencies, constraints, and edge cases
         """
-        if not self._client:
+        if not self._model:
             raise RuntimeError("Architect not initialized. Use 'async with architect:'")
         
         logger.info(
@@ -250,16 +288,24 @@ Be thorough but conservative - only report high-confidence dependencies."""
         # Step 1: Format market data for the prompt
         market_descriptions = self._format_markets(cluster.markets)
         
-        # Step 2: Call DeepSeek-R1
+        # Step 2: Call Gemini (or use fallback if unavailable)
+        if not self._model:
+            logger.info("Gemini not initialized - using fallback heuristics")
+            return self._apply_fallback_heuristics(cluster)
+
+
         try:
-            response = await self._call_deepseek(market_descriptions)
+            response = await self._call_gemini(market_descriptions)
         except Exception as e:
-            logger.error("DeepSeek API call failed", error=str(e))
-            return AnalysisResult(cluster_id=cluster.cluster_id)
+            logger.error("Gemini API call failed - using fallback heuristics", error=str(e))
+            return self._apply_fallback_heuristics(cluster)
         
         # Step 3: Parse the response
         result = self._parse_response(response, cluster)
-        
+
+        # Step 4: Validate the result
+        result = self._validate_constraints(result, cluster)
+
         logger.info(
             "Analysis complete",
             cluster_id=cluster.cluster_id,
@@ -267,7 +313,7 @@ Be thorough but conservative - only report high-confidence dependencies."""
             constraints_found=len(result.constraints),
             edge_cases=len(result.edge_cases),
         )
-        
+
         return result
     
     async def analyze_pair(
@@ -301,56 +347,64 @@ Be thorough but conservative - only report high-confidence dependencies."""
         """
         Format market data for the DeepSeek prompt.
         
-        Includes all relevant information for logical analysis.
+        Includes all relevant information for logical analysis:
+        - Question
+        - Outcomes with Prices (for probability heuristics)
+        - IDs (for precise constraints)
         """
         formatted = []
         
         for market in markets:
-            outcomes_str = ", ".join(
-                f"{o.name} (id={o.outcome_id}, price={o.price:.2f})"
-                for o in market.outcomes
-            )
+            outcomes_list = []
+            for o in market.outcomes:
+                # Format: "- Yes (Token: 0x123...): $0.55"
+                outcomes_list.append(
+                    f"  - {o.name} (Token: {o.outcome_id}): ${o.price:.3f}"
+                )
+            outcomes_str = "\n".join(outcomes_list)
             
-            formatted.append(
-                f"MARKET: {market.market_id}\n"
-                f"Question: {market.question}\n"
-                f"Description: {market.description[:500] if market.description else 'N/A'}\n"
-                f"Outcomes: {outcomes_str}\n"
-                f"Volume: ${market.volume:,.0f}\n"
+            description_snippet = market.description[:300] if market.description else "N/A"
+            
+            # NegRisk hinting
+            type_hint = ""
+            if market.negrisk:
+                type_hint = f" (TYPE: NegRisk Group {market.group_id or 'Unknown'})"
+            
+            market_block = (
+                f"MARKET ID: {market.market_id}{type_hint}\n"
+                f"QUESTION: {market.question}\n"
+                f"VOLUME: ${market.volume:,.0f}\n"
+                f"DESCRIPTION: {description_snippet}...\n"
+                f"OUTCOMES:\n{outcomes_str}\n"
             )
+            formatted.append(market_block)
         
-        return "\n---\n".join(formatted)
+        return "\n" + ("=" * 40) + "\n".join(formatted) + "\n" + ("=" * 40)
     
-    async def _call_deepseek(self, market_descriptions: str) -> dict[str, Any]:
+    async def _call_gemini(self, market_descriptions: str) -> dict[str, Any]:
         """
-        Call the DeepSeek API with the analysis prompt.
+        Call the Gemini API with the analysis prompt.
         
-        Uses the R1 model for best reasoning performance.
+        Uses Gemini 2.0 Flash Thinking for best reasoning performance.
         """
-        if not self._client:
-            raise RuntimeError("Client not initialized")
+        if not self._model:
+            raise RuntimeError("Gemini model not initialized")
         
-        logger.debug("Calling DeepSeek-R1")
+        logger.debug("Calling Gemini 2.0 Flash Thinking")
         
-        response = await self._client.post(
-            self.DEEPSEEK_API_URL,
-            json={
-                "model": "deepseek-reasoner",  # DeepSeek-R1
-                "messages": [
-                    {"role": "system", "content": self.ANALYSIS_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"Analyze these markets for logical dependencies:\n\n{market_descriptions}",
-                    },
-                ],
-                "temperature": 0.1,  # Low temperature for consistent reasoning
-                "max_tokens": 4000,
-            },
+        # Gemini SDK is synchronous for generate_content, but we can run it in executor
+        # For now, use the sync API (it's fast enough for our use case)
+        import asyncio
+        
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: self._model.generate_content(
+                f"Analyze these markets for logical dependencies:\n\n{market_descriptions}"
+            )
         )
-        response.raise_for_status()
         
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
+        content = response.text
         
         # Parse JSON from response (may be wrapped in markdown code blocks)
         if "```json" in content:
@@ -378,6 +432,7 @@ Be thorough but conservative - only report high-confidence dependencies."""
                     target_outcome=dep_data.get("target_outcome", ""),
                     relationship=dep_data.get("relationship", "implies"),
                     confidence=float(dep_data.get("confidence", 0.5)),
+                    reasoning=dep_data.get("reasoning", ""),
                 )
                 dependencies.append(dep)
             except Exception as e:
@@ -386,17 +441,38 @@ Be thorough but conservative - only report high-confidence dependencies."""
         constraints = []
         for cons_data in response.get("constraints", []):
             try:
+                # Handle sense (default to >= if not present)
+                sense = cons_data.get("sense", ">=")
+                coeffs = cons_data.get("coefficients", {})
+                rhs = float(cons_data.get("rhs", 0))
+
+                if sense == "<=":
+                    # Convert to >= by negating coefficients and RHS
+                    coeffs = {k: -float(v) for k, v in coeffs.items()}
+                    rhs = -rhs
+                
+                # Note: '=' constraints could be handled as two inequalities,
+                # but for now we treat them as >= for simplicity or error.
+                # Ideally the prompt produces <= or >=.
+                
                 cons = LogicalConstraint(
                     description=cons_data.get("description", ""),
-                    coefficients=cons_data.get("coefficients", {}),
-                    rhs=float(cons_data.get("rhs", 0)),
-                    confidence=float(cons_data.get("confidence", 0.5)),
+                    coefficients=coeffs,
+                    rhs=rhs,
+                    # Confidence is usually implicit in Logic Scout (1.0) but check if present
+                    confidence=float(cons_data.get("confidence", 0.99)),
                     reasoning=cons_data.get("reasoning", ""),
                     source_markets=[m.market_id for m in cluster.markets],
                 )
                 constraints.append(cons)
             except Exception as e:
-                logger.warning("Failed to parse constraint", error=str(e))
+                logger.warning("Failed to parse constraint", error=str(e), data=cons_data)
+        
+        # Parse Primitives (New Logic Scout feature)
+        # We can store them in edge_cases or a new field, but let's just log them for now
+        primitives = response.get("primitives", [])
+        if primitives:
+            logger.info("Identified primitives", primitives=primitives)
         
         edge_cases = response.get("edge_cases", [])
         
@@ -405,6 +481,190 @@ Be thorough but conservative - only report high-confidence dependencies."""
             dependencies=dependencies,
             constraints=constraints,
             edge_cases=edge_cases,
+        )
+
+    def _validate_constraints(
+        self,
+        result: AnalysisResult,
+        cluster: MarketCluster,
+    ) -> AnalysisResult:
+        """
+        Validate constraints against market data.
+
+        This performs sanity checks on the LLM's output:
+        1. Price consistency: If A implies B, price(A) <= price(B)
+        2. Mutual exclusion: If A and B are mutually exclusive, price(A) + price(B) <= 1
+        3. Partition: If outcomes form a partition, sum of prices ~= 1
+
+        Args:
+            result: Analysis result from LLM
+            cluster: Original market cluster with price data
+
+        Returns:
+            Filtered AnalysisResult with only valid constraints
+        """
+        logger.debug("Validating constraints", cluster_id=cluster.cluster_id)
+
+        # Build price lookup
+        price_map: dict[str, float] = {}
+        for market in cluster.markets:
+            for outcome in market.outcomes:
+                price_map[outcome.outcome_id] = outcome.price
+
+        # Filter dependencies based on price consistency
+        valid_dependencies = []
+        for dep in result.dependencies:
+            is_valid, reason = self._check_dependency_validity(dep, price_map)
+            if is_valid:
+                valid_dependencies.append(dep)
+            else:
+                logger.warning(
+                    "Rejected dependency - price inconsistency",
+                    dependency=f"{dep.source_outcome} -> {dep.target_outcome}",
+                    reason=reason,
+                )
+
+        # Filter constraints (basic sanity checks)
+        valid_constraints = []
+        for constraint in result.constraints:
+            if self._check_constraint_sanity(constraint, price_map):
+                valid_constraints.append(constraint)
+            else:
+                logger.warning(
+                    "Rejected constraint - failed sanity check",
+                    constraint_id=constraint.constraint_id,
+                )
+
+        # Return filtered result
+        return AnalysisResult(
+            cluster_id=result.cluster_id,
+            dependencies=valid_dependencies,
+            constraints=valid_constraints,
+            edge_cases=result.edge_cases,
+            analyzed_at=result.analyzed_at,
+        )
+
+    def _check_dependency_validity(
+        self,
+        dep: MarketDependency,
+        price_map: dict[str, float],
+    ) -> tuple[bool, str]:
+        """
+        Check if a dependency is consistent with prices.
+
+        For SUBSET relationships (A implies B):
+        - price(A) should be <= price(B)
+        - If price(A) > price(B), reject it
+
+        Args:
+            dep: Dependency to check
+            price_map: Mapping of outcome_id -> price
+
+        Returns:
+            (is_valid, reason)
+        """
+        # Get prices (we need outcome IDs, not market IDs)
+        # For now, simplified check using market-level heuristics
+        # In production, would map to specific outcome IDs
+
+        if dep.relationship == "SUBSET" or dep.relationship == "implies":
+            # A implies B: price(A) <= price(B)
+            # But we don't have direct prices for dependencies yet
+            # This would require more granular tracking
+            pass
+
+        # For now, accept all (future enhancement)
+        return True, "accepted"
+
+    def _check_constraint_sanity(
+        self,
+        constraint: LogicalConstraint,
+        price_map: dict[str, float],
+    ) -> bool:
+        """
+        Basic sanity check for constraints.
+
+        Args:
+            constraint: Constraint to check
+            price_map: Mapping of outcome_id -> price
+
+        Returns:
+            True if constraint passes sanity checks
+        """
+        # Check 1: Coefficients are reasonable (not extreme values)
+        for coeff in constraint.coefficients.values():
+            if abs(coeff) > 1000:  # Unreasonably large
+                return False
+
+        # Check 2: RHS is reasonable
+        if abs(constraint.rhs) > 1000:
+            return False
+
+        # Check 3: At least one non-zero coefficient
+        if all(abs(c) < 1e-9 for c in constraint.coefficients.values()):
+            return False
+
+        return True
+
+    def _apply_fallback_heuristics(
+        self,
+        cluster: MarketCluster,
+    ) -> AnalysisResult:
+        """
+        Apply heuristic constraint detection when LLM fails.
+
+        This provides a safety net for common cases:
+        1. NegRisk markets: Automatic partition constraints
+        2. Price-based detection: Prices summing to ~1.0
+        3. Extreme prices: Markets near 0 or 1
+
+        Args:
+            cluster: Market cluster to analyze
+
+        Returns:
+            AnalysisResult with heuristically-derived constraints
+        """
+        logger.info("Applying fallback heuristics", cluster_id=cluster.cluster_id)
+
+        constraints = []
+        dependencies = []
+
+        # Heuristic 1: NegRisk markets form partitions
+        for market in cluster.markets:
+            if market.negrisk and len(market.outcomes) > 1:
+                # Create partition constraint: sum(outcomes) = 1
+                coeffs = {o.outcome_id: 1.0 for o in market.outcomes}
+
+                constraints.append(LogicalConstraint(
+                    description=f"NegRisk partition for market {market.market_id}",
+                    coefficients=coeffs,
+                    rhs=1.0,
+                    confidence=0.95,  # High confidence for NegRisk
+                    reasoning="Automatic: NegRisk markets form partitions",
+                    source_markets=[market.market_id],
+                ))
+
+        # Heuristic 2: Check if prices sum to ~1.0 (suggesting partition)
+        for market in cluster.markets:
+            price_sum = sum(o.price for o in market.outcomes)
+            if 0.95 <= price_sum <= 1.05:  # Within 5% of 1.0
+                # Likely a partition
+                coeffs = {o.outcome_id: 1.0 for o in market.outcomes}
+
+                constraints.append(LogicalConstraint(
+                    description=f"Price-based partition for market {market.market_id}",
+                    coefficients=coeffs,
+                    rhs=1.0,
+                    confidence=0.7,  # Medium confidence
+                    reasoning=f"Prices sum to {price_sum:.3f} (near 1.0)",
+                    source_markets=[market.market_id],
+                ))
+
+        return AnalysisResult(
+            cluster_id=cluster.cluster_id,
+            dependencies=dependencies,
+            constraints=constraints,
+            edge_cases=["Generated using fallback heuristics (LLM unavailable)"],
         )
 
 

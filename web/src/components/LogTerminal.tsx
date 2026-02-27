@@ -38,23 +38,23 @@ export const LogTerminal = memo<LogTerminalProps>(({ logs }) => {
     const visibleLogs = useMemo(() => logs.slice(-50), [logs]);
 
     return (
-        <div className="panel h-full flex flex-col font-mono text-sm bg-black border-gray-800">
-            <div className="flex items-center gap-2 mb-2 text-gray-500 border-b border-gray-800 pb-2">
-                <Terminal className="w-4 h-4" />
-                <span className="uppercase text-xs tracking-wider">System Logs</span>
+        <div className="h-full flex flex-col font-mono text-xs bg-black/40 text-gray-300 relative">
+            <div className="flex items-center gap-2 p-3 border-b border-white/5 bg-black/20">
+                <Terminal className="w-3 h-3 text-neon-cyan" />
+                <span className="uppercase text-[10px] tracking-[0.2em] font-bold text-gray-500">System Logs</span>
                 {logs.length > 50 && (
-                    <span className="text-xs text-gray-600 ml-auto">
-                        Showing last 50 of {logs.length}
+                    <span className="text-[10px] text-gray-700 ml-auto">
+                        LIVE | TAILING
                     </span>
                 )}
             </div>
 
             <div
                 ref={containerRef}
-                className="flex-1 overflow-y-auto space-y-1 scrollbar-thin scrollbar-thumb-gray-800 p-2"
+                className="flex-1 overflow-y-auto space-y-0.5 p-2 font-mono scrollbar-hide"
             >
                 {visibleLogs.length === 0 && (
-                    <div className="text-gray-600 italic">No logs received yet...</div>
+                    <div className="text-gray-700 italic text-[10px] p-2">Waiting for pipeline events...</div>
                 )}
                 {visibleLogs.map((log, i) => (
                     <LogLine

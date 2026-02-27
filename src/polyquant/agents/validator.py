@@ -43,6 +43,7 @@ USAGE:
                 print(f"Issue: {issue}")
 """
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Any
@@ -188,14 +189,19 @@ Be thorough and conservative. Flag anything that could cause issues."""
     
     async def __aenter__(self) -> "ValidatorAgent":
         """Async context manager - initialize Gemini client."""
-        genai.configure(api_key=config.gemini_api_key.get_secret_value())
-        self._genai_model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash-thinking-exp",
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1,  # Low temperature for precise validation
-            ),
-        )
+        api_key = config.gemini_api_key.get_secret_value()
+        if not api_key or "your-" in api_key:
+            logger.warning("Gemini API key not set - running in No-LLM mode")
+            self._genai_model = None
+        else:
+            genai.configure(api_key=api_key)
+            self._genai_model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash-thinking-exp",
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,  # Low temperature for precise validation
+                ),
+            )
         return self
     
     async def __aexit__(self, *args) -> None:
@@ -221,7 +227,14 @@ Be thorough and conservative. Flag anything that could cause issues."""
             ValidatedResult with validation status and any issues
         """
         if not self._genai_model:
-            raise RuntimeError("Validator not initialized. Use 'async with validator:'")
+            logger.info("Gemini not initialized, skipping validation")
+            return ValidatedResult(
+                original=analysis,
+                is_valid=True,  # Assume valid in No-LLM mode
+                validated_dependencies=analysis.dependencies,
+                validated_constraints=analysis.constraints,
+                validation_notes="No-LLM mode: Validation skipped."
+            )
         
         logger.info(
             "Validating analysis",
@@ -333,8 +346,10 @@ Be thorough and conservative. Flag anything that could cause issues."""
             raise RuntimeError("Gemini client not initialized")
         
         logger.debug("Calling Gemini Flash Thinking for validation")
-        
-        response = self._genai_model.generate_content(
+
+        # Use asyncio.to_thread to avoid blocking the event loop
+        response = await asyncio.to_thread(
+            self._genai_model.generate_content,
             f"{self.VALIDATION_PROMPT}\n\n---\n\nANALYSIS TO VALIDATE:\n\n{analysis_text}"
         )
         

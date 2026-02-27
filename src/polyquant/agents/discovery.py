@@ -33,6 +33,7 @@ USAGE:
                 print(f"  - {market.question}")
 """
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Any
@@ -42,6 +43,7 @@ from pydantic import BaseModel, Field
 
 from polyquant.data import Market, PolymarketClient
 from polyquant.utils import config, get_logger
+from polyquant.utils.cache import cache
 
 logger = get_logger(__name__)
 
@@ -89,31 +91,51 @@ class DiscoveryAgent:
     """
     
     # System prompt for Gemini's clustering task
-    CLUSTERING_PROMPT = """You are an expert at analyzing prediction markets and identifying logical relationships.
+    # System prompt for Gemini's clustering task
+    # OPTIMIZED for "Event Clustering" to find conflicting/correlated markets
+    CLUSTERING_PROMPT = """You are an expert at analyzing prediction markets and identifying "Event Clusters".
 
-Given a list of prediction markets, your task is to:
-1. Group them into clusters by topic (e.g., "US Elections", "Sports", "Crypto")
-2. For each cluster, identify potential logical dependencies between markets
+YOUR GOAL:
+Group markets that are about the **SAME underlying real-world event**, even if they are phrased differently.
+We want to find markets that might CONFLICT or CORRELATE with each other.
 
-A logical dependency exists when the outcome of one market constrains or implies something about another.
-Examples:
-- "Will Trump win?" and "Will a Republican win?" - if Trump wins, Republican wins
-- "Will BTC hit 100K?" and "Will BTC hit 50K?" - if 100K, then 50K must also happen
+### 1. WHAT IS AN EVENT CLUSTER?
+An event cluster is a set of markets whose outcomes depend on the same future reality.
+- **Good Cluster (Same Event)**: "Will Trump win 2024?" + "Will a Republican win 2024?" + "Winner of 2024 US Election"
+- **Good Cluster (Dependent Events)**: "Will BTC hit 100k?" + "Will ETH hit 10k?" (Crypto Market Cycle)
+- **Bad Cluster (Just a Topic)**: "Will Trump win?" + "Will Biden have ice cream?" (Same person, unrelated events)
 
-Return your analysis as JSON with this structure:
+### 2. INPUT DATA
+You will be given a list of markets. Each has:
+- `ID`: Unique identifier
+- `Question`: The main question
+- `Volume/Liquidity`: Use this to prioritize! High volume markets are the "anchors" of a cluster.
+
+### 3. YOUR TASK
+1. Scan the list for related markets.
+2. Group them into clusters.
+3. For each cluster, identify **Potential Logical Dependencies**.
+   - *Example*: "If Market A resolves YES, Market B MUST resolve NO" (Mutually Exclusive)
+   - *Example*: "If Market A resolves YES, Market B MUST resolve YES" (Subset/Implication)
+
+### 4. OUTPUT JSON
+Return a JSON object with this EXACT structure:
 {
     "clusters": [
         {
-            "topic": "Topic description",
-            "market_ids": ["id1", "id2"],
+            "topic": "Short accurate description of the event (e.g. 'US Election 2024')",
+            "market_ids": ["id1", "id2", "id3"],
             "potential_dependencies": [
-                "If market X outcome A happens, then market Y must have outcome B"
-            ]
+                "Market id1 (Trump Win) implies Market id2 (GOP Win)",
+                "Market id1 and Market id3 are mutually exclusive"
+            ],
+            "confidence": 0.9  // How sure are you these are related? (0.0 to 1.0)
         }
     ]
 }
 
-Focus on clusters where there are likely logical constraints between markets."""
+*CRITICAL*: Do not include markets in a cluster if they are only loosely related by topic but have no logical connection. We want ARBITRAGE opportunities, not just categories.
+"""
 
     def __init__(self):
         """Initialize the Discovery Agent."""
@@ -130,14 +152,22 @@ Focus on clusters where there are likely logical constraints between markets."""
         await self._polymarket.__aenter__()
         
         # Configure Gemini
-        genai.configure(api_key=config.gemini_api_key.get_secret_value())
-        self._genai_model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.3,
-            ),
-        )
+        api_key = config.gemini_api_key.get_secret_value()
+        if not api_key or "your-" in api_key:
+            logger.warning("Gemini API key not set - running in No-LLM mode")
+            self._genai_model = None
+        else:
+            genai.configure(api_key=api_key)
+            self._genai_model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash",
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.3,
+                ),
+            )
+        
+        # Connect to Redis
+        await cache.connect()
         
         return self
     
@@ -146,11 +176,33 @@ Focus on clusters where there are likely logical constraints between markets."""
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
     
+    def _is_zombie_market(self, market: Market) -> bool:
+        """
+        Detect "zombie" markets that shouldn't be traded.
+        
+        A zombie market has:
+        - Extreme prices (< 0.02 or > 0.98) suggesting resolution
+        - All outcomes near 0 or 1 (already resolved)
+        
+        Args:
+            market: Market to check
+            
+        Returns:
+            True if zombie (should be filtered), False if valid
+        """
+        for outcome in market.outcomes:
+            # Extreme prices suggest resolution or broken market
+            if outcome.price < 0.02 or outcome.price > 0.98:
+                return True
+        return False
+
+    
     async def scan_markets(
         self,
         limit: int = 100,
         min_liquidity: float = 1000.0,
         skip_processed: bool = True,
+        start_offset: int = 0,
     ) -> list[MarketCluster]:
         """
         Scan Polymarket for markets and cluster them by topic.
@@ -165,6 +217,7 @@ Focus on clusters where there are likely logical constraints between markets."""
             limit: Maximum number of markets to fetch
             min_liquidity: Minimum liquidity threshold in dollars
             skip_processed: Skip markets we've already analyzed
+            start_offset: offset to start scanning from
             
         Returns:
             List of MarketCluster objects
@@ -175,43 +228,125 @@ Focus on clusters where there are likely logical constraints between markets."""
         logger.info(
             "Scanning markets",
             limit=limit,
+            offset=start_offset,
             min_liquidity=min_liquidity,
         )
         
-        # Step 1: Fetch markets from Polymarket
-        markets = await self._polymarket.get_active_markets(
-            limit=limit,
-            min_liquidity=min_liquidity,
-        )
+        all_markets: list[Market] = []
+        offset = start_offset
+        batch_size = 100  # API usually limits per request
         
-        if not markets:
+        # Step 1: Fetch markets from Polymarket (with pagination)
+        while len(all_markets) < limit:
+            # Calculate how many more to fetch
+            remaining = limit - len(all_markets)
+            fetch_limit = min(batch_size, remaining)
+            
+            batch = await self._polymarket.get_active_markets(
+                limit=fetch_limit,
+                offset=offset,
+                min_liquidity=min_liquidity,
+            )
+            
+            if not batch:
+                break
+            
+            # Filter out zombie markets (extreme prices = resolution artifacts)
+            valid_markets = [m for m in batch if not self._is_zombie_market(m)]
+            zombie_count = len(batch) - len(valid_markets)
+            if zombie_count > 0:
+                logger.debug("Filtered zombie markets", count=zombie_count)
+                
+            all_markets.extend(valid_markets)
+            offset += len(batch)
+            
+            # Optimization: If we got fewer than requested, we likely hit the end
+            if len(batch) < fetch_limit:
+                break
+        
+        if not all_markets:
             logger.info("No markets found matching criteria")
             return []
         
-        # Step 2: Filter out already-processed markets
+        # Step 2: Filter out already-processed markets (checking Redis)
+        markets_to_process = []
+        
         if skip_processed:
-            markets = [
-                m for m in markets
-                if m.market_id not in self._processed_markets
-            ]
+            for m in all_markets:
+                # Check local cache first
+                if m.market_id in self._processed_markets:
+                    continue
+                    
+                # Check Redis cache
+                if await cache.is_market_processed(m.market_id):
+                    self._processed_markets.add(m.market_id) # Update local cache
+                    continue
+                    
+                markets_to_process.append(m)
+        else:
+            markets_to_process = all_markets
             
-            if not markets:
-                logger.info("All markets already processed")
-                return []
+        if not markets_to_process:
+            logger.info("All scanned markets already processed")
+            return []
         
-        logger.info(f"Found {len(markets)} markets to analyze")
+        logger.info(f"Found {len(markets_to_process)} new markets to analyze")
         
-        # Step 3: Use Gemini to cluster markets
-        clusters = await self._cluster_markets(markets)
+        # Step 3: Optimization - Group NegRisk markets automatically
+        negrisk_groups: dict[str, list[Market]] = {}
+        other_markets: list[Market] = []
         
-        # Step 4: Mark markets as processed
-        for market in markets:
+        negrisk_count: int = 0
+        for m in markets_to_process:
+            if m.negrisk and m.group_id:
+                if m.group_id not in negrisk_groups:
+                    negrisk_groups[m.group_id] = []
+                negrisk_groups[m.group_id].append(m)
+                negrisk_count += 1
+            else:
+                other_markets.append(m)
+        
+        logger.info(
+            "NegRisk Grouping Debug", 
+            total_markets=len(markets_to_process), 
+            negrisk_found=negrisk_count,
+            groups_formed=len(negrisk_groups)
+        )
+                
+        clusters: list[MarketCluster] = []
+        
+        # Process NegRisk groups (High Priority)
+        for group_id, group_markets in negrisk_groups.items():
+            total_price = 0.0
+            for m in group_markets:
+                 if m.outcomes:
+                     total_price += m.outcomes[0].price
+            
+            cluster_id = f"negrisk_{group_id}"
+            clusters.append(
+                MarketCluster(
+                    cluster_id=cluster_id,
+                    topic=f"NegRisk Group {group_id} (Sum: {total_price:.2f})",
+                    markets=group_markets,
+                    potential_dependencies=[],
+                )
+            )
+            
+        # Step 4: Cluster remaining markets using Gemini
+        if other_markets:
+            logger.info(f"Clustering {len(other_markets)} remaining markets with Gemini...")
+            generated_clusters = await self._cluster_markets(other_markets)
+            clusters.extend(generated_clusters)
+        
+        # Step 5: Mark markets as processed in Redis
+        for market in markets_to_process:
             self._processed_markets.add(market.market_id)
+            await cache.mark_market_processed(market.market_id)
         
         logger.info(
             "Market scan complete",
             clusters_found=len(clusters),
-            markets_processed=len(markets),
+            markets_processed=len(markets_to_process),
         )
         
         return clusters
@@ -221,7 +356,14 @@ Focus on clusters where there are likely logical constraints between markets."""
         Use Gemini to cluster markets by topic.
         """
         if not self._genai_model:
-            raise RuntimeError("Gemini not initialized")
+            logger.info("Gemini not initialized, skipping clustering")
+            return [
+                MarketCluster(
+                    topic="Uncategorized (No AI)",
+                    markets=markets,
+                    potential_dependencies=[],
+                )
+            ]
         
         # Format markets for the prompt
         market_descriptions = "\n".join([
@@ -233,9 +375,11 @@ Focus on clusters where there are likely logical constraints between markets."""
         market_lookup = {m.market_id: m for m in markets}
         
         logger.debug("Calling Gemini for market clustering")
-        
+
         try:
-            response = self._genai_model.generate_content(
+            # Use asyncio.to_thread to avoid blocking the event loop
+            response = await asyncio.to_thread(
+                self._genai_model.generate_content,
                 f"{self.CLUSTERING_PROMPT}\n\nMarkets to analyze:\n{market_descriptions}"
             )
             

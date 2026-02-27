@@ -58,31 +58,45 @@ class PolyQuantConfig(BaseSettings):
     
     gemini_api_key: SecretStr = Field(
         default=SecretStr(""),
-        description="Google Gemini API key for Discovery and Validator agents"
+        description="Google Gemini API Key",
     )
-    
-    deepseek_api_key: SecretStr = Field(
-        default=SecretStr(""),
-        description="DeepSeek API key for the Logic Architect (R1 model)"
-    )
-    
+
     alchemy_api_key: SecretStr = Field(
         default=SecretStr(""),
         description="Alchemy API key for Polygon blockchain data"
+    )
+
+    polygon_private_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Polygon wallet private key for EIP-712 signing (0x...)"
     )
     
     # =========================================================================
     # Polymarket Connection Settings
     # =========================================================================
     
-    polymarket_clob_url: str = Field(
-        default="https://clob.polymarket.com",
-        description="Polymarket CLOB REST API endpoint"
+    # API 1: Gamma API - Market discovery and metadata
+    polymarket_gamma_url: str = Field(
+        default="https://gamma-api.polymarket.com",
+        description="Polymarket Gamma API for market discovery and metadata"
     )
     
+    # API 2: CLOB API - Prices, order books, and trading
+    polymarket_clob_url: str = Field(
+        default="https://clob.polymarket.com",
+        description="Polymarket CLOB API for prices, orderbooks, and trading"
+    )
+    
+    # API 3: Data API - Positions, activity, and history
+    polymarket_data_url: str = Field(
+        default="https://data-api.polymarket.com",
+        description="Polymarket Data API for positions, activity, and history"
+    )
+    
+    # API 4: WebSocket - Real-time updates
     polymarket_ws_url: str = Field(
-        default="wss://ws-subscriptions-clob.polymarket.com/ws",
-        description="Polymarket WebSocket endpoint for real-time data"
+        default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        description="Polymarket WebSocket for real-time price and order updates"
     )
     
     # =========================================================================
