@@ -138,3 +138,28 @@ async def kill_switch_http():
     """Alternative HTTP endpoint for the kill switch."""
     monitor.trigger_kill_switch()
     return {"status": "triggered"}
+
+# -----------------------------------------------------------------------------
+# Database Endpoints (TradeStore)
+# -----------------------------------------------------------------------------
+
+_trade_store = None
+
+def set_trade_store(store: Any):
+    """Inject the TradeStore instance into the API server."""
+    global _trade_store
+    _trade_store = store
+
+@app.get("/api/trades")
+async def get_recent_trades():
+    """Return recent executed trades from the ACID database."""
+    if _trade_store:
+        return await _trade_store.get_recent_trades(limit=50)
+    return []
+
+@app.get("/api/trade-summary")
+async def get_trade_summary():
+    """Return aggregated trading statistics."""
+    if _trade_store:
+        return await _trade_store.get_trade_summary()
+    return {"total_trades": 0, "total_notional": 0.0}

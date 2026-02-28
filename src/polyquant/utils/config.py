@@ -70,6 +70,16 @@ class PolyQuantConfig(BaseSettings):
         default=SecretStr(""),
         description="Polygon wallet private key for EIP-712 signing (0x...)"
     )
+
+    base_private_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Base wallet private key for EIP-712 signing on Limitless (0x...)"
+    )
+    
+    limitless_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Limitless API Key (lmts_...)"
+    )
     
     # =========================================================================
     # Polymarket Connection Settings
@@ -98,6 +108,25 @@ class PolyQuantConfig(BaseSettings):
         default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
         description="Polymarket WebSocket for real-time price and order updates"
     )
+
+    # =========================================================================
+    # Limitless Connection Settings
+    # =========================================================================
+
+    limitless_api_url: str = Field(
+        default="https://api.limitless.exchange",
+        description="Limitless REST API base URL"
+    )
+
+    limitless_ws_url: str = Field(
+        default="wss://stream.limitless.exchange",
+        description="Limitless WebSocket for real-time orderbooks"
+    )
+
+    base_rpc_url: str = Field(
+        default="https://mainnet.base.org",
+        description="Base RPC URL for fetching Limitless USDC balances"
+    )
     
     # =========================================================================
     # Redis Cache Configuration
@@ -111,6 +140,31 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
     # Trading Parameters
     # =========================================================================
+    
+    polymarket_taker_fee_pct: float = Field(
+        default=0.00,
+        description="Polymarket Taker Fee as a percentage (e.g. 0.001 is 10bps)"
+    )
+
+    limitless_taker_fee_pct: float = Field(
+        default=0.00,
+        description="Limitless Taker Fee as a percentage"
+    )
+
+    polygon_gas_per_tx: float = Field(
+        default=0.01,
+        description="Estimated Polygon gas cost per execution in USD/USDC"
+    )
+
+    base_gas_per_tx: float = Field(
+        default=0.01,
+        description="Estimated Base gas cost per execution in USD/USDC"
+    )
+
+    max_in_flight_capital: float = Field(
+        default=500.0,
+        description="Maximum total value of pending (unsettled) order capital across all exchanges."
+    )
     
     extraction_alpha: float = Field(
         default=0.9,

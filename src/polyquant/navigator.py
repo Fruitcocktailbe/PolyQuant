@@ -29,17 +29,22 @@ USAGE:
 """
 
 import asyncio
+import json
+import time
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
-from polyquant.data import PolymarketClient, OrderBook
+from polyquant.data import OrderBook
 from polyquant.data.constraint_store import ConstraintStore, ConstraintManifest
 from polyquant.data.price_cache import PriceCache
 from polyquant.risk import KillSwitch, PositionSizer
 from polyquant.solver import ArbitrageDetector, SCIPSolver
 from polyquant.agents import MicrostructureAgent
-from polyquant.api.server import monitor, app
+from polyquant.data.polymarket_client import PolymarketClient
+from polyquant.data.limitless_client import LimitlessClient
+from polyquant.data.trade_store import TradeStore
+from polyquant.api.server import monitor, app, set_trade_store
 from polyquant.utils import config, get_logger
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
 import uvicorn
@@ -339,6 +344,10 @@ class Navigator:
         self._kill_switch: KillSwitch | None = None
         self._position_sizer: PositionSizer | None = None
         self._microstructure_agent: MicrostructureAgent | None = None
+        self._trade_store: TradeStore | None = None
+        self._limitless: LimitlessClient | None = None
+        self._balance_refresh_task: asyncio.Task | None = None
+        self._trade_executor: TradeExecutor | None = None
 
         # Arbitrage improvement modules
         self._bayesian_updater = None   # BayesianUpdater (phantom arb prevention)
@@ -376,6 +385,21 @@ class Navigator:
         # Initialize Polymarket client
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
+
+        # Initialize Limitless client
+        self._limitless = LimitlessClient()
+
+        # Initialize TradeStore for persistent execution logs
+        self._trade_store = TradeStore()
+        set_trade_store(self._trade_store)
+        
+        # Initialize TradeExecutor with dual-chain clients
+        from polyquant.execution.executor import TradeExecutor
+        self._trade_executor = TradeExecutor(
+            client=self._polymarket,
+            limitless_client=self._limitless,
+            trade_store=self._trade_store
+        )
         
         # Load constraint store
         self._store = ConstraintStore()
@@ -425,24 +449,63 @@ class Navigator:
             # This will be registered when we subscribe to specific tokens
             self._ws_update_callback = on_ws_update
             
+        # Start balance refresh task (Rule 1 & 7)
+        self._balance_refresh_task = asyncio.create_task(self._refresh_balance_loop())
+
         logger.info(
             "Navigator started",
             manifests_loaded=len(manifests),
         )
         return self
+
+    async def _refresh_balance_loop(self) -> None:
+        """Background loop to keep internal balances fresh (Rule 1)."""
+        while self._is_running:
+            try:
+                # 1. Fetch Poly balance (USDC on Polygon)
+                if self._polymarket:
+                    poly_bal = await self._polymarket.get_usdc_balance()
+                    if self._trade_executor:
+                        self._trade_executor.poly_balance = Decimal(str(poly_bal))
+                
+                # 2. Fetch Base balance (USDC on Base)
+                if self._limitless:
+                    base_bal = await self._limitless.get_usdc_balance()
+                    if self._trade_executor:
+                        self._trade_executor.base_balance = Decimal(str(base_bal))
+                
+                logger.debug(
+                    "Balance refreshed", 
+                    poly=self._trade_executor.poly_balance if self._trade_executor else 0,
+                    base=self._trade_executor.base_balance if self._trade_executor else 0
+                )
+            except Exception as e:
+                logger.error("Failed to refresh balances", error=str(e))
+            
+            await asyncio.sleep(60) # Refresh every minute
     
     async def __aexit__(self, *args: Any) -> None:
         """Cleanup all components."""
         logger.info("Shutting down Navigator...")
         
         self._is_running = False
-        
+
+        if self._balance_refresh_task:
+            self._balance_refresh_task.cancel()
+            try:
+                await self._balance_refresh_task
+            except asyncio.CancelledError:
+                pass
+
         if self._server_task:
             self._server_task.cancel()
             try:
                 await self._server_task
             except asyncio.CancelledError:
                 pass
+
+        if self._trade_store:
+            await self._trade_store.close()
         
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
@@ -531,13 +594,15 @@ class Navigator:
 
             # Check connection health
             if self._polymarket and hasattr(self._polymarket, 'ws_client'):
-                ws_client = self._polymarket.ws_client
-                if not ws_client.is_connection_healthy(max_age_seconds=30.0):
+                # HFT LATENCY SHIELD: We cannot trade on stale data.
+                # If the websocket has not received a price update across any market
+                # within 1.0 second, we consider the internal orderbook state toxic.
+                if not ws_client.is_connection_healthy(max_age_seconds=1.0):
                     connection_age = ws_client.get_connection_age()
                     logger.warning(
                         "Trading blocked: Stale WebSocket connection",
                         connection_age_seconds=connection_age,
-                        reason="No price updates received for >30 seconds"
+                        reason="No price updates received for >1.0 seconds"
                     )
                     # Feed to kill switch as potential issue
                     if self._kill_switch:

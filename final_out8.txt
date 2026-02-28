@@ -1,0 +1,136 @@
+﻿
+============================================================
+  Rule 3: Decimal/Fixed-point for currency
+============================================================
+2026-02-28T15:40:57.893423Z [debug    ] Consider installing rusty-rlp to improve pyrlp performance with a rust basedbackend. Not currently functional for Python 3.11 [rlp.codec]
+  [PASS]  Outcome.price is Decimal
+  [PASS]  OrderLevel.price is Decimal
+  [PASS]  OrderLevel.size is Decimal
+  [PASS]  ProposedTrade.size is Decimal
+  [PASS]  ProposedTrade.limit_price is Decimal
+  [PASS]  ProposedTrade.notional_value is Decimal
+  [PASS]  notional_value correct
+  [PASS]  Fill.filled_size is Decimal
+  [PASS]  Fill.filled_price is Decimal
+  [PASS]  Fill.notional is Decimal
+  [PASS]  ExecutionResult.total_filled is Decimal
+python : D:\GithubLocal
+\PolyQuant\tests\verify
+_safety_rules.py:69: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+At line:1 char:1
++ python tests/verify_s
+afety_rules.py > 
+final_out.txt 2>&1 ; 
+Get-Conten ...
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (D:\GithubLoca   
+ l\...(datetime.UTC    
+).:String) [], Rem    
+oteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+  fill_time=datetime.ut
+cnow(), 
+order_id="test",
+  [PASS]  ArbitrageOpportunity.expected_profit is Decimal
+
+============================================================
+  Rule 1: Balance check blocks insufficient funds
+============================================================
+2026-02-28T15:40:58.063840Z [info     ] TradeExecutor initialized      [polyquant.execution.executor] paper_mode=True
+2026-02-28T15:40:58.068635Z [info     ] Starting atomic execution with batching [polyquant.execution.executor] group_sizes=[1] priority_groups=1 trade_count=1
+2026-02-28T15:40:58.068822Z [debug    ] Executing priority group 0     [polyquant.execution.executor] priority=0 trades_in_group=1
+2026-02-28T15:40:58.068961Z [warning  ] Batch execution failed, unwinding [polyquant.execution.executor] failed_count=1 fills_to_unwind=0 group_idx=0
+  [PASS]  $100 trade blocked on $10 balance
+  [FAIL]  Reason mentions 'balance' - Group 0 failed: o1
+2026-02-28T15:40:58.069155Z [info     ] Starting atomic execution with batching [polyquant.execution.executor] group_sizes=[1] priority_groups=1 trade_count=1
+2026-02-28T15:40:58.069291Z [debug    ] Executing priority group 0     [polyquant.execution.executor] priority=0 trades_in_group=1
+2026-02-28T15:40:58.069419Z [debug    ] Single trade filled            [polyquant.execution.executor] leg=0 outcome_id=o1 price=Decimal('1.0') size=Decimal('5')
+2026-02-28T15:40:58.069564Z [debug    ] Priority group 0 complete      [polyquant.execution.executor] fills=1 total_fills_so_far=1
+2026-02-28T15:40:58.069687Z [info     ] Atomic execution complete      [polyquant.execution.executor] fills=1 total_notional=Decimal('5.0')
+  [PASS]  $5 trade succeeds on $10 balance
+  [FAIL]  Poly balance decremented - remaining=10
+
+============================================================
+  Rule 2 & 4: ACID TradeStore + UI visibility
+============================================================
+2026-02-28T15:40:58.199542Z [info     ] TradeStore initialized         [polyquant.data.trade_store] db_path=.test_trades.db
+  [PASS]  TradeStore DB created
+D:\GithubLocal\PolyQuan
+t\tests\verify_safety_r
+ules.py:157: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+  fill_time=datetime.ut
+cnow(),
+D:\GithubLocal\PolyQuan
+t\tests\verify_safety_r
+ules.py:164: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+  fill_time=datetime.ut
+cnow(),
+2026-02-28T15:40:58.200688Z [info     ] Fills recorded atomically      [polyquant.data.trade_store] count=2
+  [PASS]  Fills persisted (2 rows)
+  [PASS]  Filled size correct
+  [PASS]  Summary total_trades = 2
+  [PASS]  Summary total_notional > 0
+2026-02-28T15:40:58.285061Z [info     ] TradeStore closed              [polyquant.data.trade_store]
+
+============================================================
+  Rule 4: API endpoints exist in server.py
+============================================================
+  [PASS]  /api/trades endpoint exists
+  [PASS]  /api/trade-summary endpoint exists
+  [PASS]  set_trade_store exported
+
+============================================================
+  Integration: Navigator wiring
+============================================================
+  [PASS]  Navigator receives TradeStore
+  [PASS]  Navigator calls set_trade_store
+  [FAIL]  Navigator fetches poly balance
+  [PASS]  Navigator passes trade_store to executor
+  [PASS]  _refresh_balance_loop method exists
+  [PASS]  __aexit__ cancels balance refresh
+  [PASS]  __aexit__ closes TradeStore
+
+============================================================
+  SUMMARY
+============================================================
+
+  Total: 31  |  Passed: 28  |  Failed: 3
+
+  3 CHECK(S) FAILED - Review needed

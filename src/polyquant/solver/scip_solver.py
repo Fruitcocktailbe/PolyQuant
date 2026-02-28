@@ -314,50 +314,84 @@ class SCIPSolver:
         # Extract solution
         if model.getStatus() == "optimal" or model.getStatus() == "feasible":
             trades = []
-            total_profit = Decimal("0")
             
             for outcome_id in outcomes:
-                buy_size = model.getVal(x_buy[outcome_id])
-                sell_size = model.getVal(x_sell[outcome_id])
+                buy_size = Decimal(str(model.getVal(x_buy[outcome_id])))
+                sell_size = Decimal(str(model.getVal(x_sell[outcome_id])))
                 
-                if buy_size > 0.01:  # Minimum size threshold
+                if buy_size > Decimal("0.01"):  # Minimum size threshold
                     ob = order_books[outcome_id]
                     # Priority: lower depth = lower priority number = execute first
-                    depth = ob.total_ask_depth() if ob.asks else 1.0
-                    priority = int(10000 / max(depth, 1))  # Illiquid first
+                    depth = ob.total_ask_depth() if ob.asks else Decimal("1.0")
+                    priority = int(10000 / max(float(depth), 1.0))  # Illiquid first
                     trades.append(
                         ProposedTrade(
                             market_id=extract_market_id(outcome_id),
                             outcome_id=outcome_id,
                             side=OrderSide.BUY,
                             size=buy_size,
-                            limit_price=ob.best_ask or 0.5,
+                            limit_price=ob.best_ask or Decimal("0.5"),
                             priority=priority,
                         )
                     )
                 
-                if sell_size > 0.01:
+                if sell_size > Decimal("0.01"):
                     ob = order_books[outcome_id]
-                    depth = ob.total_bid_depth() if ob.bids else 1.0
-                    priority = int(10000 / max(depth, 1))
+                    depth = ob.total_bid_depth() if ob.bids else Decimal("1.0")
+                    priority = int(10000 / max(float(depth), 1.0))
                     trades.append(
                         ProposedTrade(
                             market_id=extract_market_id(outcome_id),
                             outcome_id=outcome_id,
                             side=OrderSide.SELL,
                             size=sell_size,
-                            limit_price=ob.best_bid or 0.5,
+                            limit_price=ob.best_bid or Decimal("0.5"),
                             priority=priority,
                         )
                     )
             
-            obj_val = model.getObjVal()
+            obj_val = Decimal(str(model.getObjVal()))
+            slippage_loss = Decimal("0")
             
+            for t in trades:
+                ob = order_books[t.outcome_id]
+                if t.side == OrderSide.BUY:
+                    vwap = ob.get_vwap(OrderSide.BUY, t.size)
+                    if vwap is not None:
+                        slippage = (vwap - (ob.best_ask or Decimal("1"))) * t.size
+                        slippage_loss += slippage
+                        t.limit_price = vwap
+                    else:
+                        obj_val = Decimal("-1") # Liquidity failure
+                        break
+                else:
+                    vwap = ob.get_vwap(OrderSide.SELL, t.size)
+                    if vwap is not None:
+                        slippage = ((ob.best_bid or Decimal("0")) - vwap) * t.size
+                        slippage_loss += slippage
+                        t.limit_price = vwap
+                    else:
+                        obj_val = Decimal("-1")
+                        break
+
+            from polyquant.utils import config
+            total_gas = Decimal(str(config.polygon_gas_per_tx)) * len(trades)
+            total_fees = sum((t.size * t.limit_price * Decimal(str(config.polymarket_taker_fee_pct))) for t in trades)
+            final_profit = obj_val - slippage_loss - total_gas - total_fees
+            
+            if final_profit <= Decimal("0"):
+                return OptimizationResult(
+                    success=False,
+                    status="unprofitable_after_fees",
+                    expected_profit=Decimal("0"),
+                    objective_value=float(final_profit)
+                )
+
             return OptimizationResult(
                 success=True,
                 trades=trades,
-                expected_profit=Decimal(str(round(obj_val, 2))),
-                objective_value=obj_val,
+                expected_profit=Decimal(str(round(final_profit, 2))),
+                objective_value=float(final_profit),
                 extraction_ratio=self.extraction_alpha,
                 status=model.getStatus(),
             )

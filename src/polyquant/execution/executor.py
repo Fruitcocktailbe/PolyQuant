@@ -24,8 +24,9 @@ USAGE:
 """
 
 import asyncio
+from decimal import Decimal
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import groupby
 from typing import Any
 
@@ -40,14 +41,14 @@ logger = get_logger(__name__)
 class Fill:
     """A single filled order."""
     trade: ProposedTrade
-    filled_size: float
-    filled_price: float
-    fill_time: datetime = field(default_factory=datetime.utcnow)
+    filled_size: Decimal
+    filled_price: Decimal
+    fill_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     order_id: str = ""
     fill_quality: float = 0.0  # (filled_price - midpoint) / spread
     
     @property
-    def notional(self) -> float:
+    def notional(self) -> Decimal:
         return self.filled_size * self.filled_price
 
 
@@ -57,8 +58,8 @@ class ExecutionResult:
     success: bool
     fills: list[Fill] = field(default_factory=list)
     reason: str = ""
-    total_filled: float = 0.0
-    total_failed: float = 0.0
+    total_filled: Decimal = Decimal("0")
+    total_failed: Decimal = Decimal("0")
     
     @property
     def trade_count(self) -> int:
@@ -76,15 +77,23 @@ class TradeExecutor:
     4. Use IOC to prevent hanging orders
     """
     
-    def __init__(self, client: Any = None):
+    def __init__(self, client: Any = None, limitless_client: Any = None, trade_store: Any = None):
         """
         Initialize executor.
         
         Args:
             client: PolymarketClient for order submission (None for paper mode)
+            limitless_client: LimitlessClient for Base execution (None for paper mode)
+            trade_store: TradeStore for persistent storage
         """
         self._client = client
+        self._limitless_client = limitless_client
+        self._trade_store = trade_store
         self._paper_mode = client is None
+
+        # Dual Balance Tracking
+        self.poly_balance: Decimal = Decimal("0")
+        self.base_balance: Decimal = Decimal("0")
 
         # Fill quality tracking
         self._fill_quality_window: list[float] = []  # Rolling window
@@ -108,9 +117,6 @@ class TradeExecutor:
         2. Within a group (same priority), execute in parallel (independent)
         3. Between groups, execute sequentially (dependencies)
 
-        Args:
-            result: Optimization result with trades to execute
-
         Returns:
             ExecutionResult with fills or failure reason
         """
@@ -119,6 +125,41 @@ class TradeExecutor:
                 success=False,
                 reason="No trades to execute",
             )
+
+        # Rule 1: Pre-flight Balance Check
+        required_poly = sum((t.notional_value for t in result.trades if t.exchange == "polymarket"), Decimal("0"))
+        required_base = sum((t.notional_value for t in result.trades if t.exchange == "limitless"), Decimal("0"))
+        
+        if not self._paper_mode:
+            if self.poly_balance < required_poly:
+                return ExecutionResult(
+                    success=False, 
+                    reason=f"Insufficient Poly balance: {self.poly_balance} < {required_poly}"
+                )
+            if self.base_balance < required_base:
+                return ExecutionResult(
+                    success=False, 
+                    reason=f"Insufficient Base balance: {self.base_balance} < {required_base}"
+                )
+
+        # 1. Dual Balance Checks
+        poly_cost = sum(float(t.notional_value) for t in result.trades if t.exchange == "polymarket" and t.side.value == "BUY")
+        base_cost = sum(float(t.notional_value) for t in result.trades if t.exchange == "limitless" and t.side.value == "BUY")
+        
+        if not self._paper_mode:
+            if poly_cost > self.poly_balance:
+                return ExecutionResult(success=False, reason=f"Insufficient Polymarket balance: Need {poly_cost}, have {self.poly_balance}")
+            if base_cost > self.base_balance:
+                return ExecutionResult(success=False, reason=f"Insufficient Limitless balance: Need {base_cost}, have {self.base_balance}")
+            
+            # 2. In-Flight Capital Check
+            total_in_flight = poly_cost + base_cost
+            from polyquant.utils import config
+            if float(total_in_flight) > config.max_in_flight_capital:
+                return ExecutionResult(
+                    success=False, 
+                    reason=f"Exceeds max in-flight capital limit: {total_in_flight} > {config.max_in_flight_capital}"
+                )
 
         # Sort by priority (lower = first = illiquid)
         sorted_trades = sorted(result.trades, key=lambda t: t.priority)
@@ -136,6 +177,8 @@ class TradeExecutor:
         )
 
         filled: list[Fill] = []
+        total_filled_notional = Decimal("0")
+        total_failed_notional = Decimal("0")
         leg_counter = 0
 
         # Execute each priority group sequentially
@@ -153,6 +196,7 @@ class TradeExecutor:
             if len(group_fills) != len(priority_group):
                 # At least one leg failed - unwind everything
                 failed_trades = [t for t in priority_group if not any(f.trade == t for f in group_fills)]
+                total_failed_notional += sum((t.notional_value for t in failed_trades), Decimal("0"))
                 logger.warning(
                     "Batch execution failed, unwinding",
                     group_idx=group_idx,
@@ -164,10 +208,12 @@ class TradeExecutor:
                     success=False,
                     reason=f"Group {group_idx} failed: {failed_trades[0].outcome_id if failed_trades else 'unknown'}",
                     fills=filled,
-                    total_failed=sum(t.notional_value for t in failed_trades),
+                    total_filled=total_filled_notional,
+                    total_failed=total_failed_notional,
                 )
 
             filled.extend(group_fills)
+            total_filled_notional += sum(f.notional for f in group_fills)
             leg_counter += len(priority_group)
 
             logger.debug(
@@ -176,8 +222,6 @@ class TradeExecutor:
                 total_fills_so_far=len(filled),
             )
 
-        total = sum(f.notional for f in filled)
-
         # Track fill quality for all fills
         for f in filled:
             await self._track_fill_quality(f)
@@ -185,13 +229,22 @@ class TradeExecutor:
         logger.info(
             "Atomic execution complete",
             fills=len(filled),
-            total_notional=total,
+            total_notional=total_filled_notional,
         )
+        
+        # Record fills to persistent storage
+        if self._trade_store and filled:
+            asyncio.create_task(self._trade_store.record_fills(filled))
+
+        # Update local balances for immediate consistency
+        self.poly_balance -= sum((f.notional for f in filled if f.trade.exchange == "polymarket"), Decimal("0"))
+        self.base_balance -= sum((f.notional for f in filled if f.trade.exchange == "limitless"), Decimal("0"))
 
         return ExecutionResult(
             success=True,
             fills=filled,
-            total_filled=total,
+            total_filled=total_filled_notional,
+            total_failed=total_failed_notional,
         )
 
     async def _track_fill_quality(self, fill: Fill) -> None:
@@ -328,6 +381,14 @@ class TradeExecutor:
                     price=fill_result.filled_price,
                 )
                 successful_fills.append(fill_result)
+                
+                if fill_result.filled_size < trade.size: # Compare Decimal with Decimal
+                    logger.warning(
+                        "Partial fill detected. Breaking delta neutrality. Halting batch to trigger unwind.",
+                        filled=fill_result.filled_size,
+                        requested=trade.size
+                    )
+                    break
 
         return successful_fills
     
@@ -346,21 +407,47 @@ class TradeExecutor:
                 filled_price=trade.limit_price,
             )
         
-        # Real execution via CLOB API
+        # Real execution via API
         try:
-            # TODO: Implement real API call
-            # response = await self._client.submit_order(
-            #     token_id=trade.outcome_id,
-            #     side=trade.side.value,
-            #     size=trade.size,
-            #     price=trade.limit_price,
-            #     time_in_force=trade.time_in_force.value,
-            # )
-            logger.warning("Real execution not implemented yet")
-            return None
+            filled_amount = Decimal("0")
+            price = Decimal("0")
+            order_id = ""
+            fill_quality = 0.0
+
+            if trade.exchange == "limitless":
+                if not self._limitless_client:
+                    return None
+                # Call Limitless API
+                is_buy = trade.side == OrderSide.BUY
+                market_slug = trade.reason.split("slug:")[1] if "slug:" in trade.reason else trade.outcome_id # Fallback
+                
+                # We need the market to get exchangeContract. We fetch it here, but in production, 
+                # we'd inject it during optimization to save latency.
+                market_info = await self._limitless_client.get_market(market_slug)
+                res = await self._limitless_client.place_order(
+                    market=market_info,
+                    token_id=trade.outcome_id,
+                    price=trade.limit_price,
+                    size=trade.size,
+                    is_buy=is_buy
+                )
+                if res and res.get("id"):
+                    actual_filled_size = float(res.get("filledAmount", res.get("filledSize", 0.0)))
+                    # Fallback if API omitted explicit size but status states complete
+                    if actual_filled_size == 0.0 and res.get("status", "open") in ["filled", "closed", "matched"]:
+                         actual_filled_size = float(trade.size)
+                    return Fill(trade=trade, filled_size=actual_filled_size, filled_price=float(trade.limit_price), order_id=res["id"])
+                return None
+                
+            else:
+                if not self._client:
+                    return None
+                # Polymarket execution (Placeholder)
+                logger.warning("Real Polymarket execution not implemented yet")
+                return None
             
         except Exception as e:
-            logger.error("Order submission failed", error=str(e))
+            logger.error("Order submission failed", error=str(e), exchange=trade.exchange)
             return None
     
     async def _unwind(self, fills: list[Fill]) -> None:
@@ -373,7 +460,7 @@ class TradeExecutor:
         if not fills:
             return
             
-        logger.info("Starting unwind", fills_to_reverse=len(fills))
+        logger.warning("Leg Risk: Starting unwind of all previously filled legs", fills_to_reverse=len(fills))
         
         for fill in reversed(fills):
             # Reverse the side
@@ -387,7 +474,17 @@ class TradeExecutor:
                     size=fill.filled_size,
                 )
             else:
-                # TODO: Submit real unwind order
-                pass
+                logger.info(f"Unwinding {fill.filled_size} shares on {fill.trade.exchange}")
+                from decimal import Decimal
+                trade_to_unwind = ProposedTrade(
+                    outcome_id=fill.trade.outcome_id,
+                    side=reverse_side,
+                    size=Decimal(str(fill.filled_size)),
+                    limit_price=fill.trade.limit_price, 
+                    exchange=fill.trade.exchange,
+                    reason=fill.trade.reason
+                )
+                # Attempt to submit the unwind order
+                await self._submit_order(trade_to_unwind)
         
         logger.info("Unwind complete")

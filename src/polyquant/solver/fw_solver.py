@@ -719,16 +719,19 @@ class ArbitrageDetector:
                 )
                 
                 if size_result.recommended_size > 0:
-                    profit = Decimal(str(price_diff * size_result.recommended_size))
-                    
-                    trades.append(ProposedTrade(
-                        market_id=extract_market_id(outcome_id),
-                        outcome_id=outcome_id,
-                        side=OrderSide.BUY,
-                        size=size_result.recommended_size,
-                        limit_price=ob.best_ask
-                    ))
-                    total_expected_profit += profit
+                    vwap = ob.get_vwap(OrderSide.BUY, size_result.recommended_size)
+                    if vwap is not None and vwap < target_p:
+                        price_diff = target_p - float(vwap)
+                        profit = Decimal(str(price_diff * float(size_result.recommended_size)))
+                        
+                        trades.append(ProposedTrade(
+                            market_id=extract_market_id(outcome_id),
+                            outcome_id=outcome_id,
+                            side=OrderSide.BUY,
+                            size=size_result.recommended_size,
+                            limit_price=vwap
+                        ))
+                        total_expected_profit += profit
                 
             # Sell opportunity: Bid > Target
             if ob.best_bid and ob.best_bid > target_p:
@@ -757,19 +760,32 @@ class ArbitrageDetector:
                 )
                 
                 if size_result.recommended_size > 0:
-                    profit = Decimal(str(price_diff * size_result.recommended_size))
-                    
-                    trades.append(ProposedTrade(
-                        market_id=extract_market_id(outcome_id),
-                        outcome_id=outcome_id,
-                        side=OrderSide.SELL,
-                        size=size_result.recommended_size,
-                        limit_price=ob.best_bid
-                    ))
-                    total_expected_profit += profit
+                    vwap = ob.get_vwap(OrderSide.SELL, size_result.recommended_size)
+                    if vwap is not None and vwap > target_p:
+                        price_diff = float(vwap) - target_p
+                        profit = Decimal(str(price_diff * float(size_result.recommended_size)))
+                        
+                        trades.append(ProposedTrade(
+                            market_id=extract_market_id(outcome_id),
+                            outcome_id=outcome_id,
+                            side=OrderSide.SELL,
+                            size=size_result.recommended_size,
+                            limit_price=vwap
+                        ))
+                        total_expected_profit += profit
                 
         if not trades:
             return None
+            
+        # Deduct Fees and Gas
+        total_gas = Decimal(str(config.polygon_gas_per_tx)) * len(trades)
+        total_fees = sum((t.size * t.limit_price * Decimal(str(config.polymarket_taker_fee_pct))) for t in trades)
+        total_expected_profit -= (total_gas + total_fees)
+        
+        if total_expected_profit <= 0:
+            return None
+
+        from polyquant.utils import config
             
         return ArbitrageOpportunity(
             markets=list(set(t.market_id for t in trades)),

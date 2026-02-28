@@ -1,0 +1,124 @@
+﻿
+============================================================
+  Rule 3: Decimal/Fixed-point for currency
+============================================================
+2026-02-28T15:37:07.138746Z [debug    ] Consider installing rusty-rlp to improve pyrlp performance with a rust basedbackend. Not currently functional for Python 3.11 [rlp.codec]
+  [PASS]  Outcome.price is Decimal
+  [PASS]  OrderLevel.price is Decimal
+  [PASS]  OrderLevel.size is Decimal
+  [PASS]  ProposedTrade.size is Decimal
+  [PASS]  ProposedTrade.limit_price is Decimal
+  [PASS]  ProposedTrade.notional_value is Decimal
+  [PASS]  notional_value correct
+python : D:\GithubLocal
+\PolyQuant\tests\verify
+_safety_rules.py:69: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+At line:1 char:1
++ python tests/verify_s
+afety_rules.py > 
+out.txt 2>&1 ; 
+Get-Content out. ...
++ ~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~
+    + CategoryInfo     
+         : NotSpecifi  
+  ed: (D:\GithubLoca   
+ l\...(datetime.UTC    
+).:String) [], Rem    
+oteException
+    + FullyQualifiedEr 
+   rorId : NativeComm  
+  andError
+ 
+  fill_time=datetime.ut
+cnow(), 
+order_id="test",
+  [PASS]  Fill.filled_size is Decimal
+  [PASS]  Fill.filled_price is Decimal
+  [PASS]  Fill.notional is Decimal
+  [PASS]  ExecutionResult.total_filled is Decimal
+  [PASS]  ArbitrageOpportunity.expected_profit is Decimal
+
+============================================================
+  Rule 1: Balance check blocks insufficient funds
+============================================================
+  [FAIL]  Balance check - name 'limitless_client' is not defined
+
+============================================================
+  Rule 2 & 4: ACID TradeStore + UI visibility
+============================================================
+2026-02-28T15:37:07.585941Z [info     ] TradeStore initialized         [polyquant.data.trade_store] db_path=.test_trades.db
+  [PASS]  TradeStore DB created
+D:\GithubLocal\PolyQuan
+t\tests\verify_safety_r
+ules.py:157: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+  fill_time=datetime.ut
+cnow(),
+D:\GithubLocal\PolyQuan
+t\tests\verify_safety_r
+ules.py:164: 
+DeprecationWarning: dat
+etime.datetime.utcnow()
+ is deprecated and 
+scheduled for removal 
+in a future version. 
+Use timezone-aware 
+objects to represent 
+datetimes in UTC: datet
+ime.datetime.now(dateti
+me.UTC).
+  fill_time=datetime.ut
+cnow(),
+2026-02-28T15:37:07.586703Z [info     ] Fills recorded atomically      [polyquant.data.trade_store] count=2
+  [PASS]  Fills persisted (2 rows)
+  [PASS]  Filled size correct
+  [PASS]  Summary total_trades = 2
+  [PASS]  Summary total_notional > 0
+2026-02-28T15:37:07.662809Z [info     ] TradeStore closed              [polyquant.data.trade_store]
+
+============================================================
+  Rule 4: API endpoints exist in server.py
+============================================================
+  [PASS]  /api/trades endpoint exists
+  [PASS]  /api/trade-summary endpoint exists
+  [PASS]  set_trade_store exported
+
+============================================================
+  Integration: Navigator wiring
+============================================================
+  [FAIL]  Navigator receives TradeStore
+  [FAIL]  Navigator calls set_trade_store
+  [FAIL]  Navigator fetches poly balance
+  [FAIL]  Navigator passes trade_store to executor
+  [FAIL]  _refresh_balance_loop method exists
+  [FAIL]  __aexit__ cancels balance refresh
+  [FAIL]  __aexit__ closes TradeStore
+
+============================================================
+  SUMMARY
+============================================================
+
+  Total: 28  |  Passed: 20  |  Failed: 8
+
+  8 CHECK(S) FAILED - Review needed
