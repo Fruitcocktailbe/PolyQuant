@@ -87,7 +87,6 @@ Cargo.lock
 logs/
 
 # Local data
-data/
 *.db
 *.sqlite
 
@@ -113,3 +112,6 @@ redis.zip
 
 # Runtime data (generated manifests)
 .polyquant/
+
+# Node
+node_modules/
