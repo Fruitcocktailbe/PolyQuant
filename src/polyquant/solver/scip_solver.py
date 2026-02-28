@@ -251,7 +251,7 @@ class SCIPSolver:
         # Week 3 Optimization: Aggressive SCIP tuning for speed
         # These parameters trade 1-2% optimality for 3-5× speed improvement
         model.setParam("limits/time", self.timeout_seconds)
-        model.setParam("limits/gap", 0.01)  # Accept 1% optimality gap
+        model.setParam("limits/gap", config.scip_gap)  # Accept optimality gap from config
         model.setParam("presolving/maxrounds", 0)  # Skip presolve (saves ~5-10ms)
         model.setParam("separating/maxrounds", 1)  # Minimal cut generation
         
@@ -320,7 +320,7 @@ class SCIPSolver:
                 buy_size = model.getVal(x_buy[outcome_id])
                 sell_size = model.getVal(x_sell[outcome_id])
                 
-                if buy_size > 0.01:  # Minimum size threshold
+                if buy_size > config.min_trade_size:  # Minimum size threshold
                     ob = order_books[outcome_id]
                     # Priority: lower depth = lower priority number = execute first
                     depth = ob.total_ask_depth() if ob.asks else 1.0
@@ -336,7 +336,7 @@ class SCIPSolver:
                         )
                     )
                 
-                if sell_size > 0.01:
+                if sell_size > config.min_trade_size:
                     ob = order_books[outcome_id]
                     depth = ob.total_bid_depth() if ob.bids else 1.0
                     priority = int(10000 / max(depth, 1))

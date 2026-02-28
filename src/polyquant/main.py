@@ -41,14 +41,14 @@ import argparse
 import signal
 from typing import Any
 
-from polyquant.utils import get_logger
+from polyquant.utils import config, get_logger
 
 logger = get_logger(__name__)
 
 
 async def run_map_maker(
     limit: int = 500,
-    min_liquidity: float = 1000,
+    min_liquidity: float | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     """
@@ -67,7 +67,8 @@ async def run_map_maker(
     """
     from polyquant.map_maker import MapMaker
 
-    logger.info("Starting Map Maker...")
+    if min_liquidity is None:
+        min_liquidity = config.min_liquidity
 
     try:
         async with MapMaker() as map_maker:

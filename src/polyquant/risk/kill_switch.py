@@ -69,6 +69,7 @@ class TriggerReason(str, Enum):
     API_ERRORS = "api_error_rate_exceeded"
     MANUAL = "manual_trigger"
     LATENCY = "latency_exceeded"
+    UNWIND_FAILURE = "unwind_failure"
     UNKNOWN = "unknown"
 
 

@@ -63,7 +63,7 @@ def call_llm_json(
     prompt: str,
     system_prompt: str = "",
     model: str = DEFAULT_MODEL,
-    temperature: float = 0.3,
+    temperature: float | None = None,
 ) -> dict[str, Any] | None:
     """
     Call the LLM and parse a JSON response.
@@ -80,6 +80,9 @@ def call_llm_json(
     client = get_llm_client()
     if not client:
         return None
+
+    if temperature is None:
+        temperature = config.llm_temperature
 
     messages = []
     if system_prompt:

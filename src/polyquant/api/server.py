@@ -138,3 +138,28 @@ async def kill_switch_http():
     """Alternative HTTP endpoint for the kill switch."""
     monitor.trigger_kill_switch()
     return {"status": "triggered"}
+
+
+# Trade history from SQLite (Rule 4: every trade visible in UI)
+_trade_store = None
+
+def set_trade_store(store):
+    """Called by Navigator at startup to share the TradeStore instance."""
+    global _trade_store
+    _trade_store = store
+
+@app.get("/api/trades")
+async def get_recent_trades(limit: int = 50):
+    """Fetch recent trade history from SQLite."""
+    if _trade_store is None:
+        return {"trades": [], "error": "TradeStore not initialized"}
+    trades = await _trade_store.get_recent_trades(limit=limit)
+    return {"trades": trades}
+
+@app.get("/api/trade-summary")
+async def get_trade_summary():
+    """Aggregate trade statistics."""
+    if _trade_store is None:
+        return {"summary": {}, "error": "TradeStore not initialized"}
+    summary = await _trade_store.get_trade_summary()
+    return {"summary": summary}

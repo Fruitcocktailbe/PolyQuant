@@ -78,11 +78,9 @@ PolyQuant operates as a **two-brain system**:
 This is the single entry point for the entire system. It uses `argparse` to expose two modes:
 
 ```bash
-python -m polyquant.main map              # Run Slow Brain
-python -m polyquant.main trade            # Run Fast Brain
-python -m polyquant.main map --force      # Re-analyze already-processed markets
-python -m polyquant.main map --limit 100  # Scan fewer markets
-python -m polyquant.main map --min-liquidity 500  # Lower liquidity threshold
+python -m polyquant.main map --min-liquidity 1000 --limit 0  # Scan all events with $1k+ liquidity
+python -m polyquant.main map --limit 20 --force              # Re-analyze top 20 liquid events
+python -m polyquant.main trade                               # Start the real-time Navigator
 ```
 
 ### What happens on startup:
@@ -220,7 +218,7 @@ events = await self._polymarket.get_active_events(
 
 #### Phase 2: Auto-Cluster NegRisk (No LLM, ~10ms)
 
-NegRisk markets are Polymarket's multi-outcome events where all outcomes are mutually exclusive and exhaustive (sum to 1.0). These are **automatically clustered** without any LLM call:
+NegRisk markets are Polymarket's multi-outcome events where all outcomes are mutually exclusive and exhaustive (sum to 1.0). These are **automatically clustered** without any LLM call by detecting the `negRiskMarketID` field in the event data:
 
 ```python
 if neg_risk_id and len(valid_markets) > 1:
@@ -1017,15 +1015,15 @@ ArbitrageOpportunity                                │
 
 | File | Lines | Size | Purpose |
 |------|-------|------|---------|
-| [`main.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/main.py) | 197 | 5.7KB | CLI entry point, `map`/`trade` mode routing |
-| [`map_maker.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/map_maker.py) | ~487 | 18KB | Offline analysis orchestrator |
+| [`main.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/main.py) | ~220 | 6.5KB | CLI entry point, `map`/`trade` mode routing |
+| [`map_maker.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/map_maker.py) | ~500 | 18KB | Offline analysis orchestrator |
 | [`navigator.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/navigator.py) | ~730 | 30KB | Real-time trading engine |
 
 ### Agents (`agents/`)
 
 | File | Lines | Size | Purpose |
 |------|-------|------|---------|
-| [`discovery.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/discovery.py) | ~460 | 19KB | Market scanning + LLM clustering |
+| [`discovery.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/discovery.py) | ~500 | 19KB | 3-Phase market scanning (event-based) |
 | [`logic_architect.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/logic_architect.py) | 659 | 25KB | Dependency → constraint matrix conversion |
 | [`validator.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/validator.py) | 413 | 15KB | Constraint quality control |
 | [`correlation.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/correlation.py) | 66 | 2.4KB | Statistical leader-laggard detection |
@@ -1035,9 +1033,9 @@ ArbitrageOpportunity                                │
 
 | File | Lines | Size | Purpose |
 |------|-------|------|---------|
-| [`polymarket_client.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/polymarket_client.py) | 893 | 32KB | REST + WebSocket client for all 4 APIs |
+| [`polymarket_client.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/polymarket_client.py) | ~900 | 32KB | REST + WebSocket client for all 4 APIs |
 | [`market_models.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/market_models.py) | 315 | 9.6KB | All Pydantic data models |
-| [`constraint_store.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/constraint_store.py) | ~284 | 10KB | Manifest persistence (JSON) |
+| [`constraint_store.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/constraint_store.py) | ~300 | 10KB | Manifest persistence (JSON) |
 | [`price_cache.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/price_cache.py) | 188 | 6KB | In-memory order book cache |
 | [`auth.py`](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/auth.py) | ~180 | 5.9KB | EIP-712 local signing for Polygon |
 

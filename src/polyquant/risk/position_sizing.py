@@ -116,14 +116,6 @@ class PositionSizer:
         print(f"Limited by: {result.limited_by}")
     """
     
-    # Default conservative limits
-    DEFAULT_LIMITS = PositionLimits(
-        max_single_trade_pct=0.05,  # 5% per trade
-        max_total_exposure_pct=0.25,  # 25% total
-        max_orderbook_depth_pct=0.5,  # 50% of order book
-        kelly_fraction=0.5,  # Half Kelly
-    )
-    
     def __init__(
         self,
         capital: float = 10000.0,
@@ -139,21 +131,19 @@ class PositionSizer:
             current_exposure: Current open exposure
         """
         self.capital = capital
-        self.limits = limits or self.DEFAULT_LIMITS
         self.current_exposure = current_exposure
+
+        # Apply config-driven defaults if available, otherwise use class defaults
+        self.limits = limits or PositionLimits(
+            max_single_trade_pct=config.max_single_trade_pct,
+            max_total_exposure_pct=config.max_total_exposure_pct,
+            max_orderbook_depth_pct=config.orderbook_depth_cap,
+            kelly_fraction=config.kelly_fraction,
+        )
 
         # Empirical Kelly: track edge estimates to compute CV
         self._edge_history: deque[float] = deque(maxlen=50)
         self._cv_edge: float = 0.0  # Coefficient of variation of edge
-        
-        # Use config for orderbook depth cap if available
-        if hasattr(config, 'orderbook_depth_cap'):
-            self.limits = PositionLimits(
-                max_single_trade_pct=self.limits.max_single_trade_pct,
-                max_total_exposure_pct=self.limits.max_total_exposure_pct,
-                max_orderbook_depth_pct=config.orderbook_depth_cap,
-                kelly_fraction=self.limits.kelly_fraction,
-            )
         
         logger.info(
             "PositionSizer initialized",
@@ -192,7 +182,7 @@ class PositionSizer:
         # Price band validation - reject trades at extreme prices
         # Price = 1 / odds for fair odds approximation
         implied_price = 1.0 / odds if odds > 0 else 0.5
-        if implied_price < 0.02 or implied_price > 0.98:
+        if implied_price < config.zombie_low_threshold or implied_price > config.zombie_high_threshold:
             logger.warning(
                 "Price band rejection",
                 implied_price=implied_price,

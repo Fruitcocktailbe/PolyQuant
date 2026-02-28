@@ -772,7 +772,7 @@ CRITICAL RULES:
             call_llm_json,
             prompt=f"Analyze these markets for logical dependencies:\n\n{market_descriptions}",
             system_prompt=self.ANALYSIS_PROMPT,
-            temperature=0.1,
+            temperature=config.llm_temperature,
         )
         
         if not result:

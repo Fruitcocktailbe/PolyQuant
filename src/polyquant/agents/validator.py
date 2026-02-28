@@ -341,7 +341,7 @@ Be thorough and conservative. Flag anything that could cause issues."""
             ))
 
         # Warn on high urgency with low confidence
-        if constraint.urgency == "high" and constraint.confidence < 0.8:
+        if constraint.urgency == "high" and constraint.confidence < config.validator_confidence_threshold:
             issues.append(ValidationIssue(
                 severity="warning",
                 category="liquidity",
@@ -428,7 +428,7 @@ Be thorough and conservative. Flag anything that could cause issues."""
             call_llm_json,
             prompt=f"ANALYSIS TO VALIDATE:\n\n{analysis_text}",
             system_prompt=self.VALIDATION_PROMPT,
-            temperature=0.1,
+            temperature=config.llm_temperature,
         )
         
         if not result:

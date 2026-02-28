@@ -34,3 +34,6 @@ prometheus-client>=0.19.0
 # API / UI
 fastapi>=0.109.0
 uvicorn>=0.27.0
+
+# Polymarket CLOB SDK (live order submission)
+py-clob-client>=0.1.0

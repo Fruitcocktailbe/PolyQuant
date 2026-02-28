@@ -60,9 +60,9 @@ class FWSolver:
 
     def __init__(self, scip_solver: SCIPSolver):
         self.solver = scip_solver
-        self.epsilon = 0.1  # Initial contraction parameter
-        self.alpha = 0.9    # Extraction guarantee threshold
-        self.min_profit = 0.05 # Minimum profit threshold
+        self.epsilon = config.initial_epsilon
+        self.alpha = config.extraction_alpha
+        self.min_profit = config.min_profit_threshold
 
         # Gap at interior point (for correct epsilon adaptation)
         self.g_u: float | None = None
@@ -667,7 +667,7 @@ class ArbitrageDetector:
         self,
         validated: "ValidatedResult",
         order_books: Dict[str, OrderBook],
-        min_profit: float = 0.05,
+        min_profit: float | None = None,
     ) -> Optional[ArbitrageOpportunity]:
         """
         Detect arbitrage using the research-backed pipeline:
@@ -675,6 +675,9 @@ class ArbitrageDetector:
         2. BarrierFW
         3. Profit Guarantee
         """
+        if min_profit is None:
+            min_profit = config.min_profit_threshold
+
         # Set solver threshold
         self.fw_solver.min_profit = min_profit
 

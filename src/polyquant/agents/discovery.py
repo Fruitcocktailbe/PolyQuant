@@ -222,13 +222,14 @@ The YES Price is the current market probability (0.00 to 1.00).
     
     async def scan_markets(
         self,
+        min_liquidity: float | None = None,
         limit: int = 100,
-        min_liquidity: float = 1000.0,
         skip_processed: bool = True,
         start_offset: int = 0,
+        force: bool = False,
     ) -> list[MarketCluster]:
         """
-        Scan Polymarket for markets and cluster them to find arbitrage.
+        Scan Polymarket for logic clusters using a 3-phase pipeline.
         
         Uses a 3-phase pipeline:
           1. Fetch events from /events API (sorted by liquidity, fast)
@@ -236,6 +237,7 @@ The YES Price is the current market probability (0.00 to 1.00).
           3. Send multi-market events to LLM for constraint analysis
         
         Args:
+            min_liquidity: Stop when event liquidity drops below this (default from config)
             limit: Max events to fetch (0 for all above threshold)
             min_liquidity: Stop when event liquidity drops below this
             skip_processed: Skip events we've already analyzed
@@ -253,6 +255,9 @@ The YES Price is the current market probability (0.00 to 1.00).
             skip_processed=skip_processed,
         )
         
+        if min_liquidity is None:
+            min_liquidity = config.min_liquidity
+
         # ── Phase 1: Fetch events from API (sorted by liquidity desc) ──
         events = await self._polymarket.get_active_events(
             min_liquidity=min_liquidity,
@@ -456,7 +461,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                 call_llm_json,
                 prompt=f"Analyze these {len(markets)} markets for arbitrage opportunities:\n\n{market_descriptions}",
                 system_prompt=self.CLUSTERING_PROMPT,
-                temperature=0.2,
+                temperature=config.llm_temperature,
             )
             
             if not result:
