@@ -2,7 +2,6 @@ import { useEffect, useState, useMemo, useCallback, memo } from 'react';
 import { api, SystemState } from '../services/api';
 import { LogTerminal } from './LogTerminal';
 import { KillSwitch } from './KillSwitch';
-import { MarketList } from './MarketList';
 import { Activity, Cpu, DollarSign, Wifi, Layers } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
@@ -116,6 +115,42 @@ const EquityChart = memo<{ data: { time: number; value: number }[] }>(({ data })
 ));
 EquityChart.displayName = 'EquityChart';
 
+// Memoized Cluster card
+const ClusterCard = memo<{ cluster: any }>(({ cluster }) => (
+    <div className="p-3 border-b border-white/5 hover:bg-white/5 transition-colors">
+        <div className="flex justify-between items-center mb-1">
+            <span className="text-[10px] font-bold text-neon-cyan uppercase tracking-wider">{cluster.topic}</span>
+            <span className="text-[10px] text-gray-600 font-mono">#{cluster.id.slice(0, 4)}</span>
+        </div>
+        <div className="flex justify-between items-center">
+            <span className="text-[10px] text-gray-400">{cluster.count} Markets</span>
+            <span className="text-[10px] px-1.5 py-0.5 bg-neon-green/10 text-neon-green rounded-none border border-neon-green/20 uppercase tracking-tighter">
+                {cluster.status}
+            </span>
+        </div>
+    </div>
+));
+
+// Memoized Opportunity ticker
+const OpportunityCard = memo<{ opp: any }>(({ opp }) => (
+    <div className="p-3 bg-neon-purple/5 border-l-2 border-neon-purple mb-2 animate-in slide-in-from-right duration-300">
+        <div className="flex justify-between items-start mb-2">
+            <div>
+                <div className="text-[10px] font-bold text-white uppercase tracking-widest">Opportunity Detected</div>
+                <div className="text-[8px] text-gray-500 font-mono">{opp.cluster_id}</div>
+            </div>
+            <div className="text-neon-green font-mono font-bold text-sm">+${opp.profit.toFixed(2)}</div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 mt-2">
+            {opp.trades && opp.trades.slice(0, 2).map((t: any, idx: number) => (
+                <div key={idx} className="text-[8px] font-mono text-gray-400 border border-white/5 p-1 bg-black/20">
+                    {t.side} {t.size} @ ${t.price}
+                </div>
+            ))}
+        </div>
+    </div>
+));
+
 // Initial state constant (defined outside component to avoid recreation)
 const INITIAL_STATE: SystemState = {
     status: 'OFFLINE',
@@ -123,7 +158,9 @@ const INITIAL_STATE: SystemState = {
     active_solvers: 0,
     global_latency_ms: 0,
     kill_switch_active: false,
-    markets: [],
+    active_positions: [],
+    clusters: [],
+    opportunities: [],
     logs: [],
 };
 
@@ -171,12 +208,11 @@ export const Dashboard: React.FC = () => {
                             label="Active Solvers"
                             value={state.active_solvers}
                             color="text-neon-cyan"
-                            subValue="+2.5%"
                         />
                         <StatCard
                             icon={<Layers className="w-3 h-3" />}
-                            label="Mkts Scanned"
-                            value={450}
+                            label="Clusters Mapped"
+                            value={state.clusters.length}
                             color="text-white"
                         />
                     </div>
@@ -193,37 +229,77 @@ export const Dashboard: React.FC = () => {
                     </div>
                 </div>
 
-                {/* Right Col: Positions */}
-                <div className="col-span-3 row-span-12 bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col relative overflow-hidden">
-                    <div className="p-4 border-b border-white/5 bg-black/20 flex justify-between items-center">
-                        <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em]">
-                            Active Positions
-                        </h3>
-                        <div className="px-2 py-0.5 bg-neon-cyan/10 text-neon-cyan text-[10px] font-mono border border-neon-cyan/20">
-                            LIVE
+                {/* Right Col: Discovery & Reasoning Feed */}
+                <div className="col-span-3 row-span-12 flex flex-col gap-3 overflow-hidden">
+                    {/* Top: Discovered Clusters (MapMaker Output) */}
+                    <div className="flex-[0.4] bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
+                        <div className="p-3 border-b border-white/5 bg-black/20 flex justify-between items-center">
+                            <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em]">
+                                Knowledge Map
+                            </h3>
+                            <div className="px-2 py-0.5 bg-neon-cyan/10 text-neon-cyan text-[8px] font-mono border border-neon-cyan/20">
+                                MAPMAKER
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto custom-scrollbar">
+                            {state.clusters.length === 0 && (
+                                <div className="p-4 text-center text-[10px] text-gray-600 font-mono mt-4">
+                                    No clusters discovered yet...
+                                </div>
+                            )}
+                            {state.clusters.map((c, idx) => (
+                                <ClusterCard key={idx} cluster={c} />
+                            ))}
                         </div>
                     </div>
 
-                    <div className="flex-1 overflow-y-auto custom-scrollbar flex flex-col min-h-0">
-                        <MarketList markets={state.markets} />
-                    </div>
+                    {/* Bottom: Live Opportunities (Navigator Output) */}
+                    <div className="flex-[0.6] bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
+                        <div className="p-3 border-b border-white/5 bg-black/20 flex justify-between items-center">
+                            <h3 className="text-[10px] font-bold text-neon-purple uppercase tracking-[0.2em]">
+                                Strategy Ticker
+                            </h3>
+                            <div className="px-2 py-0.5 bg-neon-purple/10 text-neon-purple text-[8px] font-mono border border-neon-purple/20">
+                                NAVIGATOR
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-3 custom-scrollbar">
+                            {state.opportunities.length === 0 && (
+                                <div className="text-center text-[10px] text-gray-600 font-mono mt-10">
+                                    Scanning for arbitrage...
+                                </div>
+                            )}
+                            {[...state.opportunities].reverse().map((opp, idx) => (
+                                <OpportunityCard key={idx} opp={opp} />
+                            ))}
+                        </div>
 
-                    <div className="border-t border-white/5 p-2 bg-black/20">
-                        <button
-                            onClick={() => setShowRawData(!showRawData)}
-                            className="text-[10px] text-gray-500 hover:text-neon-cyan transition-colors flex items-center gap-1 uppercase tracking-tighter"
-                        >
-                            <Layers className="w-3 h-3" />
-                            {showRawData ? 'Hide Raw State' : 'Show Raw State'}
-                        </button>
-
-                        {showRawData && (
-                            <pre className="mt-2 text-[8px] font-mono text-neon-green/70 bg-black/50 p-2 rounded overflow-auto max-h-40 custom-scrollbar">
-                                {JSON.stringify(state, null, 2)}
-                            </pre>
-                        )}
+                        <div className="border-t border-white/5 p-2 bg-black/20 mt-auto">
+                            <button
+                                onClick={() => setShowRawData(!showRawData)}
+                                className="text-[10px] text-gray-500 hover:text-neon-cyan transition-colors flex items-center gap-1 uppercase tracking-tighter w-full justify-center"
+                            >
+                                <Layers className="w-2 h-2" />
+                                {showRawData ? 'Hide Debug' : 'Show Debug'}
+                            </button>
+                        </div>
                     </div>
                 </div>
+
+                {/* Raw Debug Modal Overlay (Conditional) */}
+                {showRawData && (
+                    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-10">
+                        <div className="bg-obsidian border border-white/10 w-full max-w-4xl max-h-full flex flex-col overflow-hidden shadow-2xl">
+                            <div className="p-4 border-b border-white/5 flex justify-between items-center">
+                                <span className="text-xs font-mono text-neon-cyan">SYSTEM_STATE.JSON</span>
+                                <button onClick={() => setShowRawData(false)} className="text-gray-500 hover:text-white">✕</button>
+                            </div>
+                            <pre className="flex-1 overflow-auto p-6 text-[10px] font-mono text-neon-green/80 custom-scrollbar">
+                                {JSON.stringify(state, null, 2)}
+                            </pre>
+                        </div>
+                    </div>
+                )}
             </main>
         </div>
     );

@@ -334,36 +334,43 @@ class RedisCache:
     
     async def set_heartbeat(self) -> None:
         """
-        Update heartbeat timestamp.
-        
+        Update heartbeat timestamp using monotonic time.
+
         Call this every loop iteration. If the timestamp stops updating,
-        an external watchdog can detect the hung process.
+        it indicates the process may be hung.
+
+        Note: Uses monotonic time for consistency with PriceCache.
+        For cross-process monitoring, use wall-clock time instead.
         """
         if not self._is_connected or not self._client:
             return
-            
-        from datetime import datetime
+
+        import time
         try:
-            ts = str(datetime.utcnow().timestamp())
+            # Use monotonic time for consistency and performance
+            ts = str(time.monotonic())
             await self._client.set(self.HEARTBEAT_KEY, ts)
         except Exception as e:
             logger.warning(f"Failed to set heartbeat: {e}")
-    
+
     async def get_heartbeat_age(self) -> float | None:
         """
         Get seconds since last heartbeat.
-        
+
         Returns:
             Age in seconds, or None if no heartbeat or not connected
+
+        Note: Uses monotonic time - only valid within the same process.
         """
         if not self._is_connected or not self._client:
             return None
-            
-        from datetime import datetime
+
+        import time
         try:
             ts = await self._client.get(self.HEARTBEAT_KEY)
             if ts:
-                return datetime.utcnow().timestamp() - float(ts)
+                # Calculate age using monotonic time
+                return time.monotonic() - float(ts)
             return None
         except Exception as e:
             logger.warning(f"Failed to get heartbeat: {e}")

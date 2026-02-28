@@ -48,7 +48,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-import google.generativeai as genai
+from polyquant.utils.llm_client import call_llm_json
 from pydantic import BaseModel, Field
 
 from polyquant.agents.logic_architect import AnalysisResult, LogicalConstraint
@@ -146,6 +146,7 @@ Your task is to verify that logical constraints between markets are:
 2. COMPLETE: Important relationships aren't missing
 3. CORRECT: The logic accurately reflects the market descriptions
 4. EDGE-CASE-FREE: Resolution criteria edge cases are handled
+5. EXECUTABLE: Constraints have sufficient liquidity to trade profitably
 
 VALIDATION CHECKLIST:
 □ Do the constraint coefficients make mathematical sense?
@@ -153,6 +154,19 @@ VALIDATION CHECKLIST:
 □ Are implication directions correct (A->B vs B->A)?
 □ Are there edge cases in market resolution that could break constraints?
 □ Are confidence scores calibrated appropriately?
+
+LIQUIDITY VALIDATION (Phase 6):
+□ REJECT constraints where any outcome has liquidity_score = "low"
+□ WARN if min_tradeable_size < $500 (not worth execution costs)
+□ VERIFY all legs have matching liquidity (can't buy $10k of A if only $2k of B)
+□ Check spread costs: total_spread_cost < expected_profit
+□ Verify closes_in_hours > 1 (avoid last-minute resolution chaos)
+□ Flag constraints with >3 simultaneous trades (atomic execution risk)
+
+CONFIDENCE ADJUSTMENTS:
+- Increase by 0.1 if liquidity_score = "high" on all legs
+- Decrease by 0.2 if any outcome has spread > 0.05
+- Decrease by 0.1 if closes_in_hours < 2
 
 COMMON EDGE CASES TO CHECK:
 - "Win by X points" vs "Win outright" - different resolutions
@@ -167,7 +181,7 @@ OUTPUT FORMAT (JSON):
     "issues": [
         {
             "severity": "error" or "warning",
-            "category": "consistency/completeness/correctness/edge_case",
+            "category": "consistency/completeness/correctness/edge_case/liquidity",
             "description": "What the issue is",
             "affected_constraints": ["constraint_id_1"],
             "suggested_fix": "How to fix it"
@@ -176,6 +190,9 @@ OUTPUT FORMAT (JSON):
     "adjusted_confidences": {
         "constraint_id": 0.7
     },
+    "execution_warnings": [
+        "Constraint c1: Spread cost (0.03) may eat into profit (0.05)"
+    ],
     "validation_notes": "General observations about the constraints"
 }
 
@@ -183,25 +200,16 @@ Be thorough and conservative. Flag anything that could cause issues."""
 
     def __init__(self):
         """Initialize the Validator Agent."""
-        self._genai_model = None
+        self._llm_available = False
         
         logger.info("ValidatorAgent initialized")
     
     async def __aenter__(self) -> "ValidatorAgent":
-        """Async context manager - initialize Gemini client."""
-        api_key = config.gemini_api_key.get_secret_value()
-        if not api_key or "your-" in api_key:
-            logger.warning("Gemini API key not set - running in No-LLM mode")
-            self._genai_model = None
-        else:
-            genai.configure(api_key=api_key)
-            self._genai_model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash-thinking-exp",
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,  # Low temperature for precise validation
-                ),
-            )
+        """Async context manager - check LLM availability."""
+        from polyquant.utils.llm_client import get_llm_client
+        self._llm_available = get_llm_client() is not None
+        if not self._llm_available:
+            logger.warning("LLM not available - running in No-LLM mode")
         return self
     
     async def __aexit__(self, *args) -> None:
@@ -226,8 +234,8 @@ Be thorough and conservative. Flag anything that could cause issues."""
         Returns:
             ValidatedResult with validation status and any issues
         """
-        if not self._genai_model:
-            logger.info("Gemini not initialized, skipping validation")
+        if not self._llm_available:
+            logger.info("LLM not available, skipping validation")
             return ValidatedResult(
                 original=analysis,
                 is_valid=True,  # Assume valid in No-LLM mode
@@ -250,7 +258,15 @@ Be thorough and conservative. Flag anything that could cause issues."""
             # Call Gemini for validation
             response = await self._call_gemini(analysis_text)
             result = self._parse_response(response, analysis)
-            
+
+            # Phase 6: Run liquidity validation on each constraint
+            for constraint in analysis.constraints:
+                liq_valid, liq_issues = self._check_liquidity_validity(constraint)
+                if liq_issues:
+                    result.issues.extend(liq_issues)
+                    if not liq_valid:
+                        result.is_valid = False
+
         except Exception as e:
             logger.error("Validation failed", error=str(e))
             # Return a result indicating validation couldn't complete
@@ -275,18 +291,82 @@ Be thorough and conservative. Flag anything that could cause issues."""
         
         return result
     
+    def _check_liquidity_validity(
+        self,
+        constraint: LogicalConstraint,
+    ) -> tuple[bool, list[ValidationIssue]]:
+        """
+        Phase 6: Validate constraint has sufficient liquidity for execution.
+
+        Checks:
+        - Rejects low liquidity constraints (can't trade profitably)
+        - Warns on small tradeable sizes (<$500)
+        - Flags urgency concerns (closing <2h)
+
+        Returns:
+            Tuple of (is_valid, list of issues)
+        """
+        issues = []
+
+        # Check liquidity score
+        if constraint.liquidity_score == "low":
+            issues.append(ValidationIssue(
+                severity="error",
+                category="liquidity",
+                description=(
+                    f"Constraint '{constraint.description}' has low liquidity - "
+                    f"cannot execute profitably"
+                ),
+                affected_constraints=[constraint.constraint_id],
+                suggested_fix="Wait for deeper order books or skip this constraint",
+            ))
+            logger.warning(
+                "Constraint rejected: low liquidity",
+                constraint_id=constraint.constraint_id,
+                min_size=constraint.min_tradeable_size,
+            )
+            return False, issues
+
+        # Warn on small tradeable size
+        if constraint.min_tradeable_size is not None and constraint.min_tradeable_size < 500:
+            issues.append(ValidationIssue(
+                severity="warning",
+                category="liquidity",
+                description=(
+                    f"Constraint '{constraint.description}' has small tradeable size "
+                    f"(${constraint.min_tradeable_size:.0f}) - may not cover execution costs"
+                ),
+                affected_constraints=[constraint.constraint_id],
+                suggested_fix="Consider minimum trade size of $500 for profitability",
+            ))
+
+        # Warn on high urgency with low confidence
+        if constraint.urgency == "high" and constraint.confidence < 0.8:
+            issues.append(ValidationIssue(
+                severity="warning",
+                category="liquidity",
+                description=(
+                    f"Constraint '{constraint.description}' has high urgency but low confidence "
+                    f"({constraint.confidence:.2f}) - risky near resolution"
+                ),
+                affected_constraints=[constraint.constraint_id],
+                suggested_fix="Increase confidence threshold for high-urgency trades",
+            ))
+
+        return len(issues) == 0 or all(i.severity == "warning" for i in issues), issues
+
     async def validate_single_constraint(
         self,
         constraint: LogicalConstraint,
     ) -> tuple[bool, list[ValidationIssue]]:
         """
         Validate a single constraint in isolation.
-        
+
         Useful for quick checks during development or debugging.
-        
+
         Args:
             constraint: The constraint to validate
-            
+
         Returns:
             Tuple of (is_valid, list of issues)
         """
@@ -340,28 +420,21 @@ Be thorough and conservative. Flag anything that could cause issues."""
     
     async def _call_gemini(self, analysis_text: str) -> dict[str, Any]:
         """
-        Call Gemini Flash Thinking for validation.
+        Call LLM via OpenRouter for validation.
         """
-        if not self._genai_model:
-            raise RuntimeError("Gemini client not initialized")
-        
-        logger.debug("Calling Gemini Flash Thinking for validation")
+        logger.debug("Calling LLM for constraint validation")
 
-        # Use asyncio.to_thread to avoid blocking the event loop
-        response = await asyncio.to_thread(
-            self._genai_model.generate_content,
-            f"{self.VALIDATION_PROMPT}\n\n---\n\nANALYSIS TO VALIDATE:\n\n{analysis_text}"
+        result = await asyncio.to_thread(
+            call_llm_json,
+            prompt=f"ANALYSIS TO VALIDATE:\n\n{analysis_text}",
+            system_prompt=self.VALIDATION_PROMPT,
+            temperature=0.1,
         )
         
-        content = response.text
+        if not result:
+            raise ValueError("LLM returned empty response")
         
-        # Parse JSON from response
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-        
-        return json.loads(content.strip())
+        return result
     
     def _parse_response(
         self,

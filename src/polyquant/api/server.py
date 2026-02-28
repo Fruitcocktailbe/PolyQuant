@@ -37,7 +37,8 @@ class SystemState(BaseModel):
     global_latency_ms: float = 0.0
     kill_switch_active: bool = False
     active_positions: List[Dict[str, Any]] = []
-    markets: List[Dict[str, Any]] = []
+    clusters: List[Dict[str, Any]] = []  # Discovered by MapMaker
+    opportunities: List[Dict[str, Any]] = []  # Detected by Navigator
     logs: List[str] = []
 
 class Monitor:

@@ -115,6 +115,8 @@ MapMaker
 │   └── Analyzes logical dependencies between markets
 ├── ValidatorAgent (Gemini 2.0 Flash Thinking)
 │   └── Validates constraint matrices
+├── CorrelationAgent (Statistical)
+│   └── Identifies leader-laggard price relationships
 └── ConstraintStore
     └── Persists manifests to disk
 ```
@@ -130,6 +132,8 @@ Navigator
 │   └── Real-time price updates from WebSocket
 ├── ArbitrageDetector
 │   └── Detects opportunities using Frank-Wolfe solver
+├── MicrostructureAgent (Real-time)
+│   └── Analyzes order book imbalance and spread
 ├── PositionSizer
 │   └── Kelly Criterion for position sizing
 ├── KillSwitch
@@ -184,7 +188,9 @@ Polymarket API
     ↓
 DiscoveryAgent (Gemini) → Market Clusters
     ↓
-LogicArchitect (Gemini) → Dependencies + Constraints
+LogicArchitect (Gemini) → Dependencies
+    ↓
+CorrelationAgent (Stats) → Leader-Laggard Signals
     ↓
 ValidatorAgent (Gemini) → Validated Constraints
     ↓
@@ -195,7 +201,9 @@ ConstraintStore → manifests/*.json (saved to disk)
 ```
 ConstraintStore → Load manifests → ExecutionGuard (in-memory)
                                            ↓
-Polymarket WebSocket → PriceCache → ArbitrageDetector
+Polymarket WebSocket → PriceCache → MicrostructureAgent
+                                           ↓
+                                    ArbitrageDetector
                                            ↓
                                     Opportunity Found?
                                            ↓

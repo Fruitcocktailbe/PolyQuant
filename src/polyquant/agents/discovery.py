@@ -38,7 +38,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-import google.generativeai as genai
+from polyquant.utils.llm_client import call_llm_json
 from pydantic import BaseModel, Field
 
 from polyquant.data import Market, PolymarketClient
@@ -90,57 +90,60 @@ class DiscoveryAgent:
                 print(f"  Markets: {len(cluster.markets)}")
     """
     
-    # System prompt for Gemini's clustering task
-    # System prompt for Gemini's clustering task
-    # OPTIMIZED for "Event Clustering" to find conflicting/correlated markets
-    CLUSTERING_PROMPT = """You are an expert at analyzing prediction markets and identifying "Event Clusters".
+    # System prompt for LLM clustering - optimized for arbitrage detection
+    CLUSTERING_PROMPT = """You are a prediction market arbitrage detector. Your ONLY job is to find markets whose outcomes are LOGICALLY LINKED, creating potential arbitrage opportunities.
 
-YOUR GOAL:
-Group markets that are about the **SAME underlying real-world event**, even if they are phrased differently.
-We want to find markets that might CONFLICT or CORRELATE with each other.
+## CONSTRAINT TYPES TO FIND:
+1. **MUTUALLY_EXCLUSIVE**: Only one can be YES. Sum of YES prices must be <= 1.
+   Example: "Will Trump win 2024?" vs "Will Biden win 2024?" (same election)
+2. **EXHAUSTIVE**: The outcomes cover ALL possibilities. Sum of YES prices must = 1.
+   Example: All candidates in a single race listed as separate markets.
+3. **IMPLICATION**: If A is YES, B MUST be YES. So P(B) >= P(A).
+   Example: "Trump wins" -> "A Republican wins" (Trump IS a Republican)
+4. **CONDITIONAL**: A's outcome significantly changes B's probability.
+   Example: "Fed cuts rates" affects "S&P hits 6000"
 
-### 1. WHAT IS AN EVENT CLUSTER?
-An event cluster is a set of markets whose outcomes depend on the same future reality.
-- **Good Cluster (Same Event)**: "Will Trump win 2024?" + "Will a Republican win 2024?" + "Winner of 2024 US Election"
-- **Good Cluster (Dependent Events)**: "Will BTC hit 100k?" + "Will ETH hit 10k?" (Crypto Market Cycle)
-- **Bad Cluster (Just a Topic)**: "Will Trump win?" + "Will Biden have ice cream?" (Same person, unrelated events)
+## INPUT FORMAT:
+Each market has: ID, Question, YES Price, Liquidity ($)
+The YES Price is the current market probability (0.00 to 1.00).
 
-### 2. INPUT DATA
-You will be given a list of markets. Each has:
-- `ID`: Unique identifier
-- `Question`: The main question
-- `Volume/Liquidity`: Use this to prioritize! High volume markets are the "anchors" of a cluster.
+## YOUR TASK:
+1. Scan ALL markets for pairs or groups with logical dependencies.
+2. Group them into clusters where arbitrage may exist.
+3. For each cluster, specify the EXACT constraint type and which markets are involved.
+4. Flag any obvious price violations (e.g., P(Trump) = 0.60 but P(Republican) = 0.55 violates IMPLICATION).
 
-### 3. YOUR TASK
-1. Scan the list for related markets.
-2. Group them into clusters.
-3. For each cluster, identify **Potential Logical Dependencies**.
-   - *Example*: "If Market A resolves YES, Market B MUST resolve NO" (Mutually Exclusive)
-   - *Example*: "If Market A resolves YES, Market B MUST resolve YES" (Subset/Implication)
-
-### 4. OUTPUT JSON
-Return a JSON object with this EXACT structure:
+## OUTPUT (strict JSON, no comments):
 {
-    "clusters": [
+  "clusters": [
+    {
+      "topic": "Short description (e.g. '2024 US Presidential Election')",
+      "market_ids": ["id1", "id2"],
+      "constraints": [
         {
-            "topic": "Short accurate description of the event (e.g. 'US Election 2024')",
-            "market_ids": ["id1", "id2", "id3"],
-            "potential_dependencies": [
-                "Market id1 (Trump Win) implies Market id2 (GOP Win)",
-                "Market id1 and Market id3 are mutually exclusive"
-            ],
-            "confidence": 0.9  // How sure are you these are related? (0.0 to 1.0)
+          "type": "IMPLICATION",
+          "market_ids": ["id1", "id2"],
+          "description": "If id1 (Trump wins) is YES, id2 (Republican wins) MUST be YES"
         }
-    ]
+      ],
+      "arbitrage_signal": "Describe any spotted price violation, or 'none' if prices look consistent",
+      "confidence": 0.95
+    }
+  ]
 }
 
-*CRITICAL*: Do not include markets in a cluster if they are only loosely related by topic but have no logical connection. We want ARBITRAGE opportunities, not just categories.
+## CRITICAL RULES:
+- ONLY group markets with LOGICAL dependencies, NOT just topic similarity.
+- Markets with NO logical link to ANY other market must be EXCLUDED entirely.
+- Prefer clusters where you can spot an actual price violation.
+- If a market could belong to multiple clusters, place it in the one with the strongest logical link.
+- Return an empty clusters array if no logical links exist.
 """
 
     def __init__(self):
         """Initialize the Discovery Agent."""
         self._polymarket: PolymarketClient | None = None
-        self._genai_model = None
+        self._llm_available = False
         self._processed_markets: set[str] = set()
         
         logger.info("DiscoveryAgent initialized")
@@ -151,20 +154,11 @@ Return a JSON object with this EXACT structure:
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
         
-        # Configure Gemini
-        api_key = config.gemini_api_key.get_secret_value()
-        if not api_key or "your-" in api_key:
-            logger.warning("Gemini API key not set - running in No-LLM mode")
-            self._genai_model = None
-        else:
-            genai.configure(api_key=api_key)
-            self._genai_model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.3,
-                ),
-            )
+        # Check if LLM is available (via OpenRouter)
+        from polyquant.utils.llm_client import get_llm_client
+        self._llm_available = get_llm_client() is not None
+        if not self._llm_available:
+            logger.warning("LLM not available - running in No-LLM mode")
         
         # Connect to Redis
         await cache.connect()
@@ -179,21 +173,50 @@ Return a JSON object with this EXACT structure:
     def _is_zombie_market(self, market: Market) -> bool:
         """
         Detect "zombie" markets that shouldn't be traded.
-        
-        A zombie market has:
-        - Extreme prices (< 0.02 or > 0.98) suggesting resolution
-        - All outcomes near 0 or 1 (already resolved)
-        
+
+        A zombie market has ALL outcomes at extreme prices (< 0.02 or > 0.98),
+        suggesting the market is already resolved or broken.
+
+        ENHANCED (Week 5): Changed from ANY to ALL logic to avoid filtering
+        markets with mixed prices that could be arbitrage opportunities.
+
         Args:
             market: Market to check
-            
+
         Returns:
             True if zombie (should be filtered), False if valid
         """
-        for outcome in market.outcomes:
-            # Extreme prices suggest resolution or broken market
-            if outcome.price < 0.02 or outcome.price > 0.98:
-                return True
+        if not market.outcomes:
+            return True  # No outcomes = invalid market
+
+        # Count extreme outcomes
+        extreme_count = sum(
+            1 for o in market.outcomes
+            if o.price < 0.02 or o.price > 0.98
+        )
+
+        # Only filter if ALL outcomes are extreme
+        # This indicates the market is resolved or broken
+        if extreme_count == len(market.outcomes):
+            logger.debug(
+                "Zombie market detected (all outcomes extreme)",
+                market_id=market.market_id,
+                extreme_count=extreme_count,
+                total_outcomes=len(market.outcomes)
+            )
+            return True
+
+        # If some (but not all) outcomes are extreme, this might be
+        # a partially resolved market or mispricing opportunity
+        if extreme_count > 0:
+            logger.info(
+                "Market has extreme outcomes but keeping for arbitrage analysis",
+                market_id=market.market_id,
+                extreme_count=extreme_count,
+                total_outcomes=len(market.outcomes),
+                reason="Mixed prices may indicate arbitrage opportunity"
+            )
+
         return False
 
     
@@ -205,19 +228,18 @@ Return a JSON object with this EXACT structure:
         start_offset: int = 0,
     ) -> list[MarketCluster]:
         """
-        Scan Polymarket for markets and cluster them by topic.
+        Scan Polymarket for markets and cluster them to find arbitrage.
         
-        This is the main entry point for the Discovery Agent. It:
-        1. Fetches active markets from Polymarket
-        2. Filters by liquidity and processed status
-        3. Uses Gemini to cluster by topic
-        4. Returns clusters for the Logic Architect
+        Uses a 3-phase pipeline:
+          1. Fetch events from /events API (sorted by liquidity, fast)
+          2. Auto-cluster NegRisk groups (no LLM needed)
+          3. Send multi-market events to LLM for constraint analysis
         
         Args:
-            limit: Maximum number of markets to fetch
-            min_liquidity: Minimum liquidity threshold in dollars
-            skip_processed: Skip markets we've already analyzed
-            start_offset: offset to start scanning from
+            limit: Max events to fetch (0 for all above threshold)
+            min_liquidity: Stop when event liquidity drops below this
+            skip_processed: Skip events we've already analyzed
+            start_offset: Offset for pagination (unused in event mode)
             
         Returns:
             List of MarketCluster objects
@@ -226,137 +248,185 @@ Return a JSON object with this EXACT structure:
             raise RuntimeError("DiscoveryAgent not initialized. Use 'async with discovery:'")
         
         logger.info(
-            "Scanning markets",
-            limit=limit,
-            offset=start_offset,
+            "Scanning markets (event-based pipeline)",
             min_liquidity=min_liquidity,
+            skip_processed=skip_processed,
         )
         
-        all_markets: list[Market] = []
-        offset = start_offset
-        batch_size = 100  # API usually limits per request
+        # ── Phase 1: Fetch events from API (sorted by liquidity desc) ──
+        events = await self._polymarket.get_active_events(
+            min_liquidity=min_liquidity,
+            max_events=limit,
+        )
         
-        # Step 1: Fetch markets from Polymarket (with pagination)
-        while len(all_markets) < limit:
-            # Calculate how many more to fetch
-            remaining = limit - len(all_markets)
-            fetch_limit = min(batch_size, remaining)
-            
-            batch = await self._polymarket.get_active_markets(
-                limit=fetch_limit,
-                offset=offset,
-                min_liquidity=min_liquidity,
-            )
-            
-            if not batch:
-                break
-            
-            # Filter out zombie markets (extreme prices = resolution artifacts)
-            valid_markets = [m for m in batch if not self._is_zombie_market(m)]
-            zombie_count = len(batch) - len(valid_markets)
-            if zombie_count > 0:
-                logger.debug("Filtered zombie markets", count=zombie_count)
-                
-            all_markets.extend(valid_markets)
-            offset += len(batch)
-            
-            # Optimization: If we got fewer than requested, we likely hit the end
-            if len(batch) < fetch_limit:
-                break
-        
-        if not all_markets:
-            logger.info("No markets found matching criteria")
+        if not events:
+            logger.info("No events found matching criteria")
             return []
-        
-        # Step 2: Filter out already-processed markets (checking Redis)
-        markets_to_process = []
-        
-        if skip_processed:
-            for m in all_markets:
-                # Check local cache first
-                if m.market_id in self._processed_markets:
-                    continue
-                    
-                # Check Redis cache
-                if await cache.is_market_processed(m.market_id):
-                    self._processed_markets.add(m.market_id) # Update local cache
-                    continue
-                    
-                markets_to_process.append(m)
-        else:
-            markets_to_process = all_markets
-            
-        if not markets_to_process:
-            logger.info("All scanned markets already processed")
-            return []
-        
-        logger.info(f"Found {len(markets_to_process)} new markets to analyze")
-        
-        # Step 3: Optimization - Group NegRisk markets automatically
-        negrisk_groups: dict[str, list[Market]] = {}
-        other_markets: list[Market] = []
-        
-        negrisk_count: int = 0
-        for m in markets_to_process:
-            if m.negrisk and m.group_id:
-                if m.group_id not in negrisk_groups:
-                    negrisk_groups[m.group_id] = []
-                negrisk_groups[m.group_id].append(m)
-                negrisk_count += 1
-            else:
-                other_markets.append(m)
         
         logger.info(
-            "NegRisk Grouping Debug", 
-            total_markets=len(markets_to_process), 
-            negrisk_found=negrisk_count,
-            groups_formed=len(negrisk_groups)
+            "Phase 1 complete: events fetched",
+            events=len(events),
+            total_markets=sum(len(e["markets"]) for e in events),
         )
-                
+        
+        # ── Phase 2: Pre-filter and auto-cluster ──
         clusters: list[MarketCluster] = []
+        events_for_llm: list[dict] = []
         
-        # Process NegRisk groups (High Priority)
-        for group_id, group_markets in negrisk_groups.items():
-            total_price = 0.0
-            for m in group_markets:
-                 if m.outcomes:
-                     total_price += m.outcomes[0].price
+        for event in events:
+            event_id = event["event_id"]
+            event_title = event["title"]
+            markets: list[Market] = event["markets"]
+            neg_risk_id = event.get("neg_risk_market_id")
             
-            cluster_id = f"negrisk_{group_id}"
-            clusters.append(
-                MarketCluster(
-                    cluster_id=cluster_id,
-                    topic=f"NegRisk Group {group_id} (Sum: {total_price:.2f})",
-                    markets=group_markets,
-                    potential_dependencies=[],
+            # Skip already-processed events
+            if skip_processed and event_id in self._processed_markets:
+                continue
+            
+            # Skip if Redis says processed
+            if skip_processed and await cache.is_market_processed(f"event_{event_id}"):
+                self._processed_markets.add(event_id)
+                continue
+            
+            # Filter zombie markets (extreme prices)
+            valid_markets = [m for m in markets if not self._is_zombie_market(m)]
+            if not valid_markets:
+                continue
+            
+            # Price sanity: skip near-resolved markets
+            valid_markets = [
+                m for m in valid_markets
+                if not m.outcomes or not all(
+                    o.price < 0.03 or o.price > 0.97 for o in m.outcomes
                 )
-            )
+            ]
             
-        # Step 4: Cluster remaining markets using Gemini
-        if other_markets:
-            logger.info(f"Clustering {len(other_markets)} remaining markets with Gemini...")
-            generated_clusters = await self._cluster_markets(other_markets)
-            clusters.extend(generated_clusters)
+            if not valid_markets:
+                continue
+            
+            # Auto-cluster: NegRisk events with price deviation detection
+            # ENHANCED (Week 5): Explicit deviation detection for arbitrage opportunities
+            if neg_risk_id and len(valid_markets) > 1:
+                # Calculate actual price sum
+                total_price = sum(
+                    m.outcomes[0].price for m in valid_markets if m.outcomes
+                )
+
+                # Detect deviation from theoretical sum of 1.0
+                deviation = abs(total_price - 1.0)
+                deviation_pct = deviation * 100
+
+                # Classify market state based on deviation
+                if total_price < 0.98:
+                    market_state = "UNDERPRICED"
+                    arbitrage_type = "Buy Arbitrage (prices sum < 1.0)"
+                elif total_price > 1.02:
+                    market_state = "OVERPRICED"
+                    arbitrage_type = "Sell Arbitrage (prices sum > 1.0)"
+                else:
+                    market_state = "FAIR"
+                    arbitrage_type = "No deviation"
+
+                # Create dependency description with deviation info
+                dependency_desc = (
+                    f"[PARTITION] NegRisk group must sum to 1.0. "
+                    f"Actual: {total_price:.4f} ({market_state}). "
+                    f"Deviation: {deviation_pct:.2f}%. "
+                    f"Opportunity: {arbitrage_type}"
+                )
+
+                clusters.append(
+                    MarketCluster(
+                        cluster_id=f"negrisk_{event_id}",
+                        topic=f"[AUTO] {event_title} (NegRisk, Sum={total_price:.4f}, {market_state})",
+                        markets=valid_markets,
+                        potential_dependencies=[dependency_desc],
+                    )
+                )
+
+                # Log arbitrage signals for monitoring
+                if deviation > 0.02:  # >2% deviation
+                    logger.warning(
+                        "ARBITRAGE SIGNAL: Price deviation detected in NegRisk event",
+                        event=event_title,
+                        markets=len(valid_markets),
+                        price_sum=f"{total_price:.4f}",
+                        deviation_pct=f"{deviation_pct:.2f}%",
+                        state=market_state,
+                        opportunity=arbitrage_type,
+                    )
+                else:
+                    logger.info(
+                        "Auto-clustered NegRisk event (fair price)",
+                        event=event_title,
+                        markets=len(valid_markets),
+                        price_sum=f"{total_price:.4f}",
+                        state=market_state,
+                    )
+            elif len(valid_markets) > 1:
+                # Multi-market event → needs LLM to determine constraint types
+                events_for_llm.append({
+                    "event_id": event_id,
+                    "title": event_title,
+                    "markets": valid_markets,
+                    "liquidity": event["liquidity"],
+                    "tags": event.get("tags", []),
+                })
+            # Solo-market events → no constraints possible within event,
+            # but could have cross-event links, so include in LLM batch
+            else:
+                events_for_llm.append({
+                    "event_id": event_id,
+                    "title": event_title,
+                    "markets": valid_markets,
+                    "liquidity": event["liquidity"],
+                    "tags": event.get("tags", []),
+                })
         
-        # Step 5: Mark markets as processed in Redis
-        for market in markets_to_process:
-            self._processed_markets.add(market.market_id)
-            await cache.mark_market_processed(market.market_id)
+        auto_cluster_count = len(clusters)
+        logger.info(
+            "Phase 2 complete: pre-filtering done",
+            auto_clusters=auto_cluster_count,
+            events_for_llm=len(events_for_llm),
+        )
+        
+        # ── Phase 3: LLM analysis for within-event + cross-event constraints ──
+        if events_for_llm:
+            # Collect all markets from events needing LLM analysis
+            all_llm_markets: list[Market] = []
+            for event in events_for_llm:
+                all_llm_markets.extend(event["markets"])
+            
+            if all_llm_markets:
+                logger.info(
+                    f"Sending {len(all_llm_markets)} markets from "
+                    f"{len(events_for_llm)} events to LLM for clustering..."
+                )
+                llm_clusters = await self._cluster_markets(all_llm_markets)
+                clusters.extend(llm_clusters)
+        
+        # Mark all events as processed
+        for event in events:
+            event_id = event["event_id"]
+            self._processed_markets.add(event_id)
+            await cache.mark_market_processed(f"event_{event_id}")
         
         logger.info(
             "Market scan complete",
-            clusters_found=len(clusters),
-            markets_processed=len(markets_to_process),
+            auto_clusters=auto_cluster_count,
+            llm_clusters=len(clusters) - auto_cluster_count,
+            total_clusters=len(clusters),
+            total_markets=sum(len(c.markets) for c in clusters),
         )
         
         return clusters
     
     async def _cluster_markets(self, markets: list[Market]) -> list[MarketCluster]:
         """
-        Use Gemini to cluster markets by topic.
+        Use LLM (via OpenRouter) to cluster markets by topic.
         """
-        if not self._genai_model:
-            logger.info("Gemini not initialized, skipping clustering")
+        if not self._llm_available:
+            logger.info("LLM not available, skipping clustering")
             return [
                 MarketCluster(
                     topic="Uncategorized (No AI)",
@@ -365,30 +435,35 @@ Return a JSON object with this EXACT structure:
                 )
             ]
         
-        # Format markets for the prompt
-        market_descriptions = "\n".join([
-            f"ID: {m.market_id}\nQuestion: {m.question}\nDescription: {m.description[:200] if m.description else 'N/A'}\n"
-            for m in markets
-        ])
+        # Format markets for the prompt - include prices and liquidity
+        market_lines = []
+        for m in markets:
+            # Get YES price from first outcome, or 0 if unavailable
+            yes_price = m.outcomes[0].price if m.outcomes else 0.0
+            market_lines.append(
+                f"ID: {m.market_id} | Question: {m.question} | YES Price: {yes_price:.2f} | Liquidity: ${m.liquidity:,.0f}"
+            )
+        market_descriptions = "\n".join(market_lines)
         
         # Create market lookup for quick access
         market_lookup = {m.market_id: m for m in markets}
         
-        logger.debug("Calling Gemini for market clustering")
+        logger.debug("Calling LLM for market clustering", market_count=len(markets))
 
         try:
-            # Use asyncio.to_thread to avoid blocking the event loop
-            response = await asyncio.to_thread(
-                self._genai_model.generate_content,
-                f"{self.CLUSTERING_PROMPT}\n\nMarkets to analyze:\n{market_descriptions}"
+            # Call LLM via OpenRouter
+            result = await asyncio.to_thread(
+                call_llm_json,
+                prompt=f"Analyze these {len(markets)} markets for arbitrage opportunities:\n\n{market_descriptions}",
+                system_prompt=self.CLUSTERING_PROMPT,
+                temperature=0.2,
             )
             
-            # Parse response
-            response_text = response.text
-            result = json.loads(response_text)
+            if not result:
+                raise ValueError("LLM returned empty response")
             
         except Exception as e:
-            logger.error(f"Gemini clustering failed: {e}")
+            logger.error(f"LLM clustering failed: {e}")
             # Fallback: return all markets as a single cluster
             return [
                 MarketCluster(
@@ -407,14 +482,47 @@ Return a JSON object with this EXACT structure:
                 if mid in market_lookup
             ]
             
-            if cluster_markets:  # Only include non-empty clusters
-                clusters.append(
-                    MarketCluster(
-                        topic=cluster_data.get("topic", "Unknown"),
-                        markets=cluster_markets,
-                        potential_dependencies=cluster_data.get("potential_dependencies", []),
-                    )
+            if not cluster_markets:
+                continue
+            
+            # Parse structured constraints into dependency strings
+            dependencies = []
+            for constraint in cluster_data.get("constraints", []):
+                c_type = constraint.get("type", "UNKNOWN")
+                c_desc = constraint.get("description", "")
+                dependencies.append(f"[{c_type}] {c_desc}")
+            
+            # Also capture legacy format if present
+            for dep in cluster_data.get("potential_dependencies", []):
+                if dep not in dependencies:
+                    dependencies.append(dep)
+            
+            # Log arbitrage signals
+            arb_signal = cluster_data.get("arbitrage_signal", "none")
+            if arb_signal and arb_signal.lower() != "none":
+                logger.info(
+                    "Arbitrage signal detected",
+                    topic=cluster_data.get("topic"),
+                    signal=arb_signal,
                 )
+            
+            confidence = cluster_data.get("confidence", 0.0)
+            
+            clusters.append(
+                MarketCluster(
+                    topic=cluster_data.get("topic", "Unknown"),
+                    markets=cluster_markets,
+                    potential_dependencies=dependencies,
+                )
+            )
+            
+            logger.info(
+                "Cluster found",
+                topic=cluster_data.get("topic"),
+                markets=len(cluster_markets),
+                constraints=len(dependencies),
+                confidence=confidence,
+            )
         
         return clusters
     

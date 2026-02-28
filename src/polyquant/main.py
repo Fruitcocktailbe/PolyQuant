@@ -46,12 +46,21 @@ from polyquant.utils import get_logger
 logger = get_logger(__name__)
 
 
-async def run_map_maker() -> dict[str, Any]:
+async def run_map_maker(
+    limit: int = 500,
+    min_liquidity: float = 1000,
+    force: bool = False,
+) -> dict[str, Any]:
     """
     Run the Map Maker to build constraint manifests.
 
     This performs offline analysis of market structures and saves
     the results to disk for the Navigator to use.
+
+    Args:
+        limit: Maximum number of markets to analyze.
+        min_liquidity: Minimum liquidity threshold for markets.
+        force: Whether to force a re-scan of already processed markets.
 
     Returns:
         dict: Results summary with cluster count, constraint count, etc.
@@ -62,7 +71,11 @@ async def run_map_maker() -> dict[str, Any]:
 
     try:
         async with MapMaker() as map_maker:
-            result = await map_maker.build_map()
+            result = await map_maker.build_map(
+                limit=limit,
+                min_liquidity=min_liquidity,
+                skip_processed=not force,
+            )
 
             print("\n" + "=" * 60)
             print("Map Building Result:")
@@ -136,6 +149,25 @@ Examples:
         help="Execution mode (default: map)",
     )
 
+    # Map Maker arguments
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum markets to scan in 'map' mode (default: 500, 0 for all)",
+    )
+    parser.add_argument(
+        "--min-liquidity",
+        type=float,
+        default=1000.0,
+        help="Minimum liquidity threshold in 'map' mode (default: 1000)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-scan of already processed markets in 'map' mode",
+    )
+
     args = parser.parse_args()
 
     print(f"""
@@ -147,7 +179,11 @@ Examples:
     """)
 
     if args.mode == "map":
-        await run_map_maker()
+        await run_map_maker(
+            limit=args.limit,
+            min_liquidity=args.min_liquidity,
+            force=args.force,
+        )
     elif args.mode == "trade":
         await run_navigator()
     else:

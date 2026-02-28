@@ -94,11 +94,22 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
-# OS# Windows
-Thumbs.db
 ehthumbs.db
 Desktop.ini
 
 # Generated files
 convert_to_docx.py
 PolyQuant_Walkthrough.docx
+
+# Temporary / debug files
+tmp_*
+verif*
+verification_output*
+
+# Redis artifacts
+dump.rdb
+redis/
+redis.zip
+
+# Runtime data (generated manifests)
+.polyquant/

@@ -42,6 +42,7 @@ from typing import List, Dict, Tuple, Set, Optional, Any, TYPE_CHECKING
 from decimal import Decimal
 
 from polyquant.utils import get_logger
+from polyquant.utils.cache import cache  # Week 3: Redis persistence for InitFW
 from polyquant.solver.scip_solver import SCIPSolver
 if TYPE_CHECKING:
     from polyquant.agents.validator import ValidatedResult
@@ -73,39 +74,54 @@ class FWSolver:
         # Phase 3 Optimization: Enable vectorization for performance
         self.use_vectorization = True  # Can be disabled for debugging
 
-    def init_fw(
-        self, 
+    async def init_fw(
+        self,
         validated: "ValidatedResult",
         outcomes: List[str]
     ) -> Tuple[List[Dict[str, float]], Dict[str, float], Set[str]]:
         """
         Algorithm 3: InitFW
-        
+
         Constructs a valid set of starting vertices Z_0 and an interior point u.
         Also identifies settled securities.
-        
+
+        Week 3 Enhancement: Persistent Redis caching for cold start elimination.
+
         Args:
             validated: Constraints
             outcomes: List of outcome IDs
-            
+
         Returns:
             Z_0: List of valid vertex vectors (dicts)
             u: Interior point vector (dict)
             settled: Set of settled outcome IDs
         """
         logger.info("Running InitFW...")
-        
-        # 1. Check Cache
+
+        # 1. Check in-memory cache (fastest - no network latency)
         security_ids = sorted(outcomes)
         cache_key = ",".join(security_ids)
         if cache_key in self._u_cache:
-            logger.debug(f"InitFW Cache HIT for {len(outcomes)} outcomes")
+            logger.debug(f"InitFW in-memory cache HIT for {len(outcomes)} outcomes")
             Z_0, u, settled_ids = self._u_cache[cache_key]
             # Must copy mutable objects to avoid side effects if modified elsewhere
             # But here they are mostly read-only. Returning direct ref for speed.
             return Z_0, u, settled_ids
 
-        logger.debug(f"InitFW Cache MISS for {len(outcomes)} outcomes")
+        # 2. Check Redis cache (persistent across restarts)
+        redis_key = f"initfw:{cache_key}"
+        redis_result = await cache.get_solver_result(redis_key)
+        if redis_result:
+            logger.info(f"InitFW Redis cache HIT for {len(outcomes)} outcomes (cold start eliminated!)")
+            Z_0 = redis_result['Z_0']
+            u = redis_result['u']
+            settled_ids = set(redis_result['settled'])
+
+            # Save to in-memory cache for future fast access
+            self._u_cache[cache_key] = (Z_0, u, settled_ids)
+            return Z_0, u, settled_ids
+
+        logger.debug(f"InitFW cache MISS (in-memory + Redis) for {len(outcomes)} outcomes")
         
         Z_0: List[Dict[str, float]] = []
         sigma_hat: Dict[str, int] = {} # Extended partial outcome
@@ -161,10 +177,22 @@ class FWSolver:
             u[o] /= len(Z_0)
             
         logger.info(f"InitFW complete. |Z_0|={len(Z_0)}, Settled={len(settled_ids)}")
-        
-        # 2. Save to Cache
+
+        # 3. Save to both in-memory and Redis caches
         self._u_cache[cache_key] = (Z_0, u, settled_ids)
-        
+
+        # Week 3: Persist to Redis with long TTL (constraints are immutable)
+        await cache.set_solver_result(
+            redis_key,
+            {
+                'Z_0': Z_0,
+                'u': u,
+                'settled': list(settled_ids)  # Convert set to list for JSON
+            },
+            ttl_seconds=86400  # 24 hours - constraints don't change
+        )
+        logger.debug(f"InitFW result cached to Redis with 24h TTL")
+
         return Z_0, u, settled_ids
 
     def _vectorized_gradient(
@@ -286,7 +314,8 @@ class FWSolver:
         logger.info("Starting Barrier Frank-Wolfe...")
 
         # Phase 3 Optimization: Use vectorized operations if enabled
-        if self.use_vectorization and len(outcomes) > 10:
+        # Week 3: Lowered threshold from 10 to 5 for faster typical clusters
+        if self.use_vectorization and len(outcomes) > 5:
             return self._barrier_fw_vectorized(
                 validated, outcomes, market_prices, Z_0, u, max_iters
             )
@@ -395,11 +424,13 @@ class FWSolver:
             #     ε_t = min{g(μ_t)/(-4g_u), ε_{t-1}/2}
             # Else:
             #     ε_t = ε_{t-1}
-            if self.g_u is not None and self.g_u > 0:
-                gap_ratio = fw_gap / (-4 * self.g_u)
+            g_u_val: float = self.g_u if self.g_u is not None else 0.0
+            if abs(g_u_val) > 1e-10:
+                # Use absolute value to avoid negative gap issues
+                gap_ratio = fw_gap / (4 * abs(g_u_val))
                 if gap_ratio < epsilon:
                     epsilon = min(gap_ratio, epsilon / 2)
-                    epsilon = max(epsilon, 1e-4)  # Lower bound to prevent too small
+                    epsilon = max(epsilon, 1e-4) # Lower bound
                     logger.debug(f"Iter {t}: Reduced epsilon to {epsilon:.6f}")
             else:
                 # Fallback: simple heuristic
@@ -538,8 +569,9 @@ class FWSolver:
                 return best_mu_dict, best_profit_guarantee, kl
 
             # 7. Adaptive Epsilon Update
-            if self.g_u is not None and self.g_u > 0:
-                gap_ratio = fw_gap / (-4 * self.g_u)
+            g_u_val: float = self.g_u if self.g_u is not None else 0.0
+            if abs(g_u_val) > 1e-10:
+                gap_ratio = fw_gap / (4 * abs(g_u_val))
                 if gap_ratio < epsilon:
                     epsilon = min(gap_ratio, epsilon / 2)
                     epsilon = max(epsilon, 1e-4)
@@ -557,7 +589,7 @@ class FWSolver:
         best_mu_dict = {o: best_mu_vec[outcome_to_idx[o]] for o in outcomes}
         return best_mu_dict, best_profit_guarantee, 0.0
 
-    def find_opportunity(
+    async def find_opportunity(
         self,
         validated: "ValidatedResult",
         order_books: Dict[str, Any] # dict of OrderBook
@@ -567,6 +599,8 @@ class FWSolver:
 
         Handles settled securities by locking them to 0 or 1 and only
         optimizing over unsettled outcomes.
+
+        Week 3: Now async to support Redis-cached InitFW.
         """
         outcomes = list(order_books.keys())
         market_prices = {}
@@ -576,8 +610,8 @@ class FWSolver:
             best_ask = ob.best_ask or 1.0
             market_prices[o] = (best_bid + best_ask) / 2.0
 
-        # 1. InitFW - identifies settled securities
-        Z_0, u, settled = self.init_fw(validated, outcomes)
+        # 1. InitFW - identifies settled securities (Week 3: now async with Redis cache)
+        Z_0, u, settled = await self.init_fw(validated, outcomes)
         if not Z_0:
             return None
 
@@ -643,10 +677,10 @@ class ArbitrageDetector:
         """
         # Set solver threshold
         self.fw_solver.min_profit = min_profit
-        
-        # Run solver (CPU bound, so run in thread)
-        target_prices = await asyncio.to_thread(
-            self.fw_solver.find_opportunity,
+
+        # Week 3: find_opportunity is now async (for Redis-cached InitFW)
+        # Note: SCIP solver calls inside are still CPU-bound, but Redis I/O is async
+        target_prices = await self.fw_solver.find_opportunity(
             validated,
             order_books
         )

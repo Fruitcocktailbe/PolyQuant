@@ -5,7 +5,8 @@ export interface SystemState {
     global_latency_ms: number;
     kill_switch_active: boolean;
     active_positions: any[];
-    markets: any[];
+    clusters: any[];
+    opportunities: any[];
     logs: string[];
 }
 
@@ -25,7 +26,8 @@ class ApiService {
         global_latency_ms: 0,
         kill_switch_active: false,
         active_positions: [],
-        markets: [],
+        clusters: [],
+        opportunities: [],
         logs: [],
     };
 
@@ -90,7 +92,9 @@ class ApiService {
             newState.active_solvers !== this.state.active_solvers ||
             newState.global_latency_ms !== this.state.global_latency_ms ||
             newState.kill_switch_active !== this.state.kill_switch_active ||
-            newState.logs.length !== this.state.logs.length
+            newState.logs.length !== this.state.logs.length ||
+            newState.clusters.length !== this.state.clusters.length ||
+            newState.opportunities.length !== this.state.opportunities.length
         );
     }
 

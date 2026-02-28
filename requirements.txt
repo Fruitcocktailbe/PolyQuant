@@ -24,6 +24,8 @@ scipy>=1.12.0
 # Data & Caching
 redis>=5.0.0
 pandas>=2.2.0
+orjson>=3.9.0           # Fast JSON parsing (2-3x faster than stdlib)
+aiofiles>=23.0.0        # Async file I/O
 
 # Logging & Monitoring
 structlog>=24.1.0

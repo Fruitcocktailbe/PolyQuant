@@ -49,6 +49,8 @@ dependencies = [
     # Data & Caching
     "redis>=5.0.0",
     "pandas>=2.2.0",
+    "orjson>=3.9.0",
+    "aiofiles>=23.0.0",
     
     # Logging & Monitoring
     "structlog>=24.1.0",
@@ -70,7 +72,7 @@ dev = [
 ]
 
 [project.scripts]
-polyquant = "polyquant.legacy_orchestrator:main"
+polyquant = "polyquant.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

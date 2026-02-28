@@ -27,7 +27,13 @@ import hashlib
 from datetime import datetime
 from typing import Any
 
-from polyquant.agents import DiscoveryAgent, LogicArchitect, ValidatorAgent, MarketCluster
+from polyquant.agents import (
+    DiscoveryAgent,
+    LogicArchitect,
+    ValidatorAgent,
+    CorrelationEngine,
+    MarketCluster,
+)
 from polyquant.data import PolymarketClient
 from polyquant.data.constraint_store import (
     ConstraintStore,
@@ -64,6 +70,7 @@ class MapMaker:
         self._discovery: DiscoveryAgent | None = None
         self._logic_architect: LogicArchitect | None = None
         self._validator: ValidatorAgent | None = None
+        self._correlation_agent: CorrelationEngine | None = None
         self._polymarket: PolymarketClient | None = None
         self._store: ConstraintStore | None = None
         
@@ -86,6 +93,8 @@ class MapMaker:
         self._validator = ValidatorAgent()
         await self._validator.__aenter__()
 
+        self._correlation_agent = CorrelationEngine()
+
         # Initialize Polymarket client (for market data)
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
@@ -106,6 +115,9 @@ class MapMaker:
             await self._logic_architect.__aexit__(*args)
         if self._validator:
             await self._validator.__aexit__(*args)
+        if self._correlation_agent:
+            # Cleanup if needed
+            pass
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
         
@@ -115,6 +127,7 @@ class MapMaker:
         self,
         limit: int = 500,
         min_liquidity: float = 1000,
+        skip_processed: bool = True,
     ) -> dict[str, Any]:
         """
         Build the complete constraint map.
@@ -125,6 +138,7 @@ class MapMaker:
         Args:
             limit: Maximum number of markets to analyze.
             min_liquidity: Minimum liquidity threshold for markets.
+            skip_processed: Whether to skip markets already in the constraint store.
             
         Returns:
             Summary of the map building process.
@@ -161,8 +175,20 @@ class MapMaker:
             clusters = await self._discovery.scan_markets(
                 limit=limit,
                 min_liquidity=min_liquidity,
+                skip_processed=skip_processed,
             )
             
+            # Record in monitor for UI
+            from polyquant.api.server import monitor
+            asyncio.create_task(monitor.update_status(
+                clusters=[{
+                    "id": c.cluster_id,
+                    "topic": c.topic,
+                    "count": len(c.markets),
+                    "status": "pending_analysis"
+                } for c in clusters]
+            ))
+
             logger.info(f"Discovered {len(clusters)} clusters")
             results["discovery"] = {
                 "clusters_found": len(clusters),
@@ -376,6 +402,22 @@ class MapMaker:
                 for d in validated.validated_dependencies
             ]
             
+            # Run Correlation Agent
+            correlations = []
+            if self._correlation_agent and self._polymarket:
+                async def history_provider(mid: str):
+                    h = await self._polymarket.get_history(mid)
+                    return [float(p.get("p", 0)) for p in h]
+                
+                # CorrelationAgent might need to be async or we fetch here
+                # Let's assume we can pass the provider and it handles it
+                # Logic: analyze_pairs(cluster.markets, history_provider)
+                signals = await self._correlation_agent.analyze_pairs(
+                    cluster.markets, 
+                    history_provider
+                )
+                correlations = [s.model_dump(mode="json") for s in signals]
+
             # Create manifest
             manifest = ConstraintManifest(
                 cluster_id=cluster.cluster_id,
@@ -383,6 +425,7 @@ class MapMaker:
                 market_ids=[m.market_id for m in cluster.markets],
                 constraints=stored_constraints,
                 dependencies=stored_dependencies,
+                correlations=correlations,
             )
 
             # Cache the result for future runs (5 minute TTL)

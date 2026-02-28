@@ -1,0 +1,830 @@
+Claude’s Plan
+PolyQuant Performance Optimization Plan
+Executive Summary
+Goal: Optimize PolyQuant 2.0 to achieve <50ms end-to-end latency for Polymarket arbitrage trading while improving reliability and throughput.
+
+Current State: Two-mode architecture (MapMaker + Navigator) with aggressive performance targets but several critical bottlenecks and missing functionality.
+
+Target Metrics:
+
+Tick-to-Decision: <10ms (currently unknown, likely 20-50ms+)
+Decision-to-Execution: <30ms (currently unknown)
+Total Latency: <50ms end-to-end
+Navigator Uptime: >99.5%
+Manifest Load Time: <1 second
+Critical Findings
+🚨 Blocking Issues (Must Fix First)
+ArbitrageDetector Not Wired Up (navigator.py:565)
+
+_detect_opportunities() has a stub: opportunity = None # STUB!
+Impact: System cannot detect arbitrage opportunities
+Risk: Core functionality missing
+ExecutionGuard Not Implemented (navigator.py:186-199)
+
+Always returns True, "passed" - no actual constraint validation
+Impact: Trades may violate logical constraints
+Risk: Financial loss from invalid trades
+⚡ Performance Bottlenecks (High Priority)
+Polling Event Loop (navigator.py:398-428)
+
+Comment admits: "In a real event-driven system, we'd wait for a signal"
+Spins with await asyncio.sleep(0.001) burning CPU
+Latency Impact: +1-10ms per tick
+Sequential WebSocket Callbacks (price_cache.py:96-100)
+
+Callbacks awaited one by one: await callback(token_id, book)
+If Navigator callback is slow, all others wait
+Latency Impact: +5-20ms if any callback blocks
+SCIP Model Rebuilding (scip_solver.py:430-521)
+
+New SCIP Model() created every Frank-Wolfe iteration
+Constraints re-added from scratch each time
+Latency Impact: +3-10ms per LMO call × 20-100 iterations = 60-1000ms per opportunity
+Synchronous File I/O (constraint_store.py:194)
+
+Blocking file_path.read_text() in async context
+Loops through all manifest files sequentially
+Latency Impact: +10-100ms at Navigator startup
+Slow JSON Parsing (polymarket_client.py:540)
+
+Standard library json.loads() on every WebSocket message
+No validation before parsing
+Latency Impact: +1-5ms per message (100+ times/sec)
+Datetime Operations in Hot Path (price_cache.py:136-143)
+
+datetime.utcnow() and datetime arithmetic on every cache access
+Python datetime is notoriously slow
+Latency Impact: +0.5-2ms per tick
+Optimization Strategy
+Phase 1: Critical Path Latency (Target: -30ms)
+Goal: Reduce Navigator hot path latency by 30ms to meet <50ms target
+
+1.1 Event-Driven Architecture
+Files: navigator.py, price_cache.py
+
+Changes:
+
+Add asyncio.Event to PriceCache: self._update_event = asyncio.Event()
+Trigger event on WebSocket update: self._update_event.set()
+Replace polling loop with: await self._update_event.wait()
+Clear event at start of each tick
+Impact: -5ms average latency, eliminates CPU waste
+
+1.2 Parallel WebSocket Callbacks
+Files: price_cache.py:96-100
+
+Changes:
+
+
+# Current (sequential):
+for callback in self._subscribers:
+    await callback(token_id, book)
+
+# New (parallel):
+tasks = [asyncio.create_task(cb(token_id, book)) for cb in self._subscribers]
+await asyncio.gather(*tasks, return_exceptions=True)
+Impact: -10ms when multiple callbacks registered
+
+1.3 SCIP Model Persistence
+Files: scip_solver.py:430-521
+
+Changes:
+
+Cache SCIP model as self._cached_model keyed by constraint set ID
+Only rebuild if constraints changed
+Re-use model, just update objective coefficients
+Keep existing warm-start logic (lines 488-508)
+Implementation:
+
+
+def solve_linear_objective(self, validated, objective_coeffs, sense="maximize"):
+    constraint_key = self._get_constraint_hash(validated)
+
+    if self._cached_model_key != constraint_key:
+        # Rebuild model only if constraints changed
+        self._cached_model = self._build_model(validated)
+        self._cached_model_key = constraint_key
+
+    model = self._cached_model
+    # Just update objective, don't rebuild constraints
+    model.setObjective(new_obj, sense)
+    model.optimize()
+Impact: -5ms per LMO call × 50 iterations = -250ms per opportunity
+
+1.4 Fast JSON Parser
+Files: polymarket_client.py:540
+
+Changes:
+
+Replace import json with import orjson
+Change json.loads(msg_str) to orjson.loads(msg_str)
+Update requirements.txt: orjson>=3.9.0
+Impact: -3ms per WebSocket message
+
+1.5 Monotonic Time for Staleness
+Files: price_cache.py:136-143
+
+Changes:
+
+Replace datetime.utcnow() with time.monotonic()
+Store timestamps as floats instead of datetime objects
+Change staleness check to simple subtraction
+Implementation:
+
+
+# In update():
+self._last_update[token_id] = time.monotonic()
+
+# In get_all():
+now = time.monotonic()
+if (now - last) <= self._stale_threshold_seconds:
+    result[token_id] = book
+Impact: -1ms per tick
+
+Phase 2: Wire Up Missing Functionality (Critical)
+Goal: Complete core trading logic that is currently stubbed out
+
+2.1 Implement ArbitrageDetector Integration
+Files: navigator.py:502-593
+
+Current Problem: Line 565 stubs out detector with opportunity = None
+
+Changes:
+
+Instantiate ArbitrageDetector at Navigator init (line 273)
+In _detect_opportunities(), replace stub with actual call:
+
+# OLD:
+opportunity = None  # STUB!
+
+# NEW:
+opportunity = await self._arbitrage_detector.detect(
+    validated=manifest,
+    order_books=cluster_books,
+    min_profit=config.fw_min_profit
+)
+Handle the returned ArbitrageOpportunity object
+Pass to position sizer and kill switch before execution
+Impact: Enables actual arbitrage detection (core feature)
+
+2.2 Implement ExecutionGuard Validation
+Files: navigator.py:123-208
+
+Current Problem: check_trade() always returns True, "passed"
+
+Changes:
+
+Use the pre-computed constraint matrix (built in lines 149-158)
+For each proposed trade, check if it violates any constraint
+Validate against current portfolio state
+Return specific violation details if invalid
+Implementation:
+
+
+def check_trade(self, outcome_id: str, side: str, size: float, price: float) -> tuple[bool, str]:
+    """This is the HOT PATH. Must complete in <1ms."""
+
+    # Get constraints for this outcome
+    constraints = self._constraint_matrix.get(outcome_id, [])
+    if not constraints:
+        return True, "no_constraints"
+
+    # Simulate trade and check each constraint
+    proposed_state = self._simulate_trade(outcome_id, side, size)
+
+    for constraint_id, constraint in constraints:
+        if not self._validate_constraint(constraint, proposed_state):
+            return False, f"violates_{constraint_id}"
+
+    return True, "passed"
+Impact: Prevents invalid trades, adds ~2ms validation time
+
+Phase 3: Startup Optimization (Target: -50ms)
+Goal: Reduce Navigator initialization time from 100ms+ to <50ms
+
+3.1 Async File I/O
+Files: constraint_store.py:180-205
+
+Changes:
+
+Add aiofiles dependency: pip install aiofiles
+Replace blocking file_path.read_text() with async reads
+Parallelize manifest loading with asyncio.gather()
+Implementation:
+
+
+import aiofiles
+
+async def load_all_manifests(self) -> list[ConstraintManifest]:
+    manifest_files = list(self.base_path.glob("*.json"))
+
+    async def load_one(path):
+        async with aiofiles.open(path, 'r') as f:
+            data = await f.read()
+        return ConstraintManifest.model_validate(json.loads(data))
+
+    manifests = await asyncio.gather(*[load_one(f) for f in manifest_files])
+    return list(manifests)
+Impact: -50ms for 10+ manifests (parallel loading)
+
+3.2 Parallel Market Metadata Fetching
+Files: navigator.py:476-500
+
+Current Problem: Sequential REST API calls - one per market
+
+Changes:
+
+
+# Current:
+for mid in market_ids:
+    market = await self._polymarket._gamma_client.get(f"/markets/{mid}")
+    # ... process
+
+# New:
+async def fetch_market(mid):
+    return await self._polymarket._gamma_client.get(f"/markets/{mid}")
+
+markets = await asyncio.gather(*[fetch_market(mid) for mid in market_ids])
+Impact: -200ms for 10 markets (parallel fetching)
+
+Phase 4: Solver Optimization (Target: -100ms)
+Goal: Reduce Frank-Wolfe solver time from 200-500ms to <100ms
+
+4.1 Vectorization for Large Problems
+Files: fw_solver.py:262-420
+
+Current State: Vectorized path exists (lines 421-558) but threshold is len(outcomes) > 10
+
+Changes:
+
+Lower vectorization threshold from 10 to 5 outcomes
+Pre-allocate numpy arrays in __init__ to avoid allocation overhead
+Use in-place operations (+=, -=) instead of creating new arrays
+Impact: -50ms for typical clusters (10-30 outcomes)
+
+4.2 SCIP Solver Tuning
+Files: scip_solver.py
+
+Changes:
+
+Set aggressive SCIP parameters for speed over optimality:
+
+model.setParam('limits/time', 0.01)  # 10ms timeout per solve
+model.setParam('limits/gap', 0.01)   # 1% optimality gap acceptable
+model.setParam('presolving/maxrounds', 0)  # Skip presolve
+model.setParam('separating/maxrounds', 1)  # Minimal cuts
+These sacrifice 1-2% optimality for 3-5× speed
+Impact: -30ms per opportunity (faster LMO calls)
+
+4.3 Persistent InitFW Cache
+Files: fw_solver.py:76-168
+
+Current State: Cache exists but is per-instance, not persisted
+
+Changes:
+
+Save InitFW results to Redis using cache.set_solver_result()
+Load from Redis on Navigator startup
+Key by sorted outcome IDs (already computed as cache_key)
+Implementation:
+
+
+async def init_fw(self, validated, outcomes):
+    cache_key = ",".join(sorted(outcomes))
+
+    # Try Redis first
+    cached = await cache.get_solver_result(f"initfw:{cache_key}")
+    if cached:
+        return cached['Z_0'], cached['u'], cached['settled']
+
+    # Otherwise compute
+    Z_0, u, settled = self._compute_init_fw(validated, outcomes)
+
+    # Save to Redis (long TTL since constraints are immutable)
+    await cache.set_solver_result(
+        f"initfw:{cache_key}",
+        {'Z_0': Z_0, 'u': u, 'settled': settled},
+        ttl_seconds=86400  # 24 hours
+    )
+
+    return Z_0, u, settled
+Impact: -500ms on first detection per cluster (eliminates cold start)
+
+Phase 5: WebSocket Reliability (Target: 99.5% uptime)
+Goal: Improve WebSocket stability and reconnection logic
+
+5.1 Automatic Reconnection
+Files: polymarket_client.py:459-623
+
+Current Problem: No explicit reconnection logic visible
+
+Changes:
+
+Add exponential backoff reconnection
+Re-subscribe to token IDs after reconnect
+Notify PriceCache of disconnection (mark all prices stale)
+Implementation:
+
+
+async def _listen(self):
+    backoff = 1
+    max_backoff = 60
+
+    while self._running:
+        try:
+            await self._connect_and_subscribe()
+            backoff = 1  # Reset on success
+
+            async for msg in self._ws:
+                await self._handle_message(msg)
+
+        except websockets.ConnectionClosed:
+            logger.warning(f"WebSocket disconnected, reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+Impact: Improves uptime from ~95% to >99.5%
+
+5.2 Connection Health Monitoring
+Files: navigator.py
+
+Changes:
+
+Track time since last WebSocket message
+If no message for 30 seconds, trigger reconnection
+Send periodic pings to detect stale connections early
+Feed connection age to KillSwitch (halt trading if stale data)
+Impact: Prevents trading on stale prices (risk reduction)
+
+Phase 6: Execution Layer Optimization
+Goal: Reduce decision-to-execution latency to <30ms
+
+6.1 Order Batching
+Files: executor.py:89-100
+
+Current State: Sequential execution of multi-leg trades
+
+Changes:
+
+Submit all legs concurrently where possible
+Use asyncio.gather() for independent trades
+Only serialize trades with dependencies (illiquid legs first)
+Implementation:
+
+
+async def execute_atomic(self, result: OptimizationResult) -> ExecutionResult:
+    # Group trades by dependency
+    independent_trades, dependent_trades = self._analyze_dependencies(result.trades)
+
+    # Execute independent trades in parallel
+    fills = await asyncio.gather(*[
+        self._execute_single(trade) for trade in independent_trades
+    ])
+
+    # Then execute dependent trades sequentially
+    for trade in dependent_trades:
+        fill = await self._execute_single(trade)
+        fills.append(fill)
+Impact: -10ms for typical 3-leg arbitrage
+
+6.2 Pre-Signed Transaction Pool
+Files: executor.py
+
+Changes:
+
+Pre-sign common trade transactions (e.g., standard sizes)
+Keep pool of 10-20 pre-signed transactions ready
+On opportunity detection, just update amount and submit
+Replenish pool in background
+Impact: -5ms (skips signing step in hot path)
+
+Phase 7: MapMaker Optimization (Bonus)
+Goal: Reduce MapMaker time from 10+ minutes to <5 minutes for 100 markets
+
+7.1 Parallel LLM Calls
+Files: map_maker.py, agents/*.py
+
+Changes:
+
+Process multiple clusters concurrently
+Use asyncio.Semaphore(3) to limit concurrent LLM calls
+This respects API rate limits while maximizing throughput
+Impact: -50% MapMaker time (10min → 5min)
+
+7.2 Incremental Updates
+Files: map_maker.py
+
+Changes:
+
+Use Redis cache.is_market_processed() to skip unchanged markets
+Only re-analyze markets that have new events or outcomes
+Track manifest versions using cache.increment_manifest_version()
+Impact: -80% time for incremental runs (10min → 2min)
+
+Implementation Priority
+User Priority: Speed - Hit <50ms latency ASAP
+Testing Environment: Real Polymarket data, paper trading mode
+Deployment: Local dev (Windows), Production on AWS Lightsail (London)
+Rust Executor: Deferred until after proving profitability
+
+Week 1: Speed Optimizations (Critical Path)
+Goal: Achieve <50ms p95 latency as quickly as possible
+
+✅ Event-driven architecture (navigator.py:408-428)
+
+Replace polling with asyncio.Event wake-up
+Impact: -5ms average, eliminates CPU spin
+Priority: HIGHEST - Foundational change
+✅ SCIP model persistence (scip_solver.py:430-521)
+
+Cache model by constraint set, don't rebuild
+Impact: -250ms per opportunity
+Priority: CRITICAL - Biggest single win
+✅ Wire up ArbitrageDetector (navigator.py:565)
+
+Replace stub with actual detector call
+Impact: Enables core functionality
+Priority: BLOCKING - System non-functional without this
+✅ Parallel WebSocket callbacks (price_cache.py:96-100)
+
+Use asyncio.gather() instead of sequential await
+Impact: -10ms when callbacks block
+Priority: HIGH - Direct latency reduction
+✅ Fast JSON parser (polymarket_client.py:540)
+
+Switch to orjson (2-3x faster)
+Impact: -3ms per WebSocket message
+Priority: HIGH - Easy win, big impact
+Expected Outcome: System functional + ~270ms latency reduction + <50ms target achieved
+
+Week 2: Correctness & Reliability
+Goal: Ensure safe trading and high uptime
+
+✅ Implement ExecutionGuard validation (navigator.py:197-199)
+
+Actually validate constraints (currently always returns True)
+Impact: Prevents invalid trades
+Priority: CRITICAL for live trading
+✅ WebSocket reconnection (polymarket_client.py:522-589)
+
+Exponential backoff, re-subscribe after reconnect
+Impact: >99.5% uptime
+Priority: HIGH - Prevents losses from downtime
+✅ Connection health monitoring (navigator.py)
+
+Halt trading if WebSocket stale (no message for 30s)
+Impact: Risk reduction
+Priority: HIGH - Prevents stale price trading
+✅ Monotonic time (price_cache.py:136-143)
+
+Replace datetime.utcnow() with time.monotonic()
+Impact: -1ms per tick
+Priority: MEDIUM - Small but easy win
+Expected Outcome: Safe for live trading + additional 11ms reduction
+
+Week 3: Solver & Startup Optimization
+Goal: Reduce cold start penalty and solver convergence time
+
+✅ SCIP solver tuning (scip_solver.py)
+
+Aggressive parameters (time limit, gap tolerance)
+Impact: -30ms per opportunity
+Priority: MEDIUM - Further speed gains
+✅ Persistent InitFW cache (fw_solver.py:76-168)
+
+Save to Redis, eliminate cold start penalty
+Impact: -500ms first detection per cluster
+Priority: MEDIUM - Improves restart time
+✅ Async file I/O (constraint_store.py:194)
+
+Use aiofiles + parallel loading
+Impact: -50ms startup
+Priority: LOW - Nice to have
+✅ Vectorization threshold (fw_solver.py:289)
+
+Lower from 10 to 5 outcomes
+Impact: -20ms for typical clusters
+Priority: LOW - Already fast for small problems
+Expected Outcome: 100ms faster cold start + 50ms per opportunity
+
+Week 4: Production Readiness (Pre-AWS Deployment)
+Goal: Prepare for AWS Lightsail deployment in London
+
+✅ Order batching (executor.py:89-100)
+
+Parallel execution of independent legs
+Impact: -10ms execution time
+Priority: MEDIUM - Further speed gains
+✅ Enhanced logging and profiling
+
+Add OpenTelemetry spans for each component
+Impact: Observability for production debugging
+Priority: HIGH - Essential for production
+✅ E2E latency testing
+
+Run against live Polymarket feed for 24 hours
+Impact: Validate <50ms target met
+Priority: HIGH - Confidence before live deployment
+✅ AWS deployment guide
+
+Document Lightsail setup, security groups, RPC endpoints
+Impact: Smooth production deployment
+Priority: MEDIUM - Needed before going live
+Expected Outcome: Production-ready system with <40ms p95 latency
+
+Risk Mitigation
+Testing Strategy
+Unit Tests: Test each optimization in isolation with synthetic data
+Integration Tests: Run Navigator against mock Polymarket feed
+Load Tests: Simulate 1000 price updates/sec to find breaking points
+A/B Testing: Run optimized Navigator alongside baseline, compare fills
+Rollback Plan
+Keep original implementation as navigator_v1.py
+Use feature flags: config.use_event_driven = True/False
+Monitor latency percentiles (p50, p95, p99) after each change
+Revert if p95 latency increases by >10ms
+Monitoring
+Add OpenTelemetry spans for each component (PriceCache, Solver, Executor)
+Track metrics in Prometheus:
+polyquant_tick_latency_ms (histogram)
+polyquant_solver_iterations (histogram)
+polyquant_websocket_reconnects (counter)
+polyquant_opportunities_detected (counter)
+polyquant_trades_executed (counter)
+Expected Performance Gains
+Metric	Before	After	Improvement
+Tick-to-Decision	~40ms	<10ms	-75%
+Decision-to-Execution	~50ms	<30ms	-40%
+Total Latency	~90ms	<40ms	-55%
+Solver Time	300ms	100ms	-67%
+Startup Time	150ms	50ms	-67%
+Navigator Uptime	~95%	>99.5%	+4.5%
+MapMaker Time	10min	2min	-80%
+Critical Files Summary
+Hot Path (Must Be Fast):
+
+navigator.py:398-485 - Main trading loop
+price_cache.py:81-144 - Price updates
+fw_solver.py:262-558 - Frank-Wolfe algorithm
+scip_solver.py:430-521 - LMO oracle
+polymarket_client.py:539-542 - WebSocket parsing
+Critical Functionality (Currently Missing):
+
+navigator.py:565 - ArbitrageDetector stub
+navigator.py:197-199 - ExecutionGuard stub
+Startup Path (Can Be Optimized):
+
+constraint_store.py:180-205 - Manifest loading
+navigator.py:476-500 - Market metadata fetching
+Reliability:
+
+polymarket_client.py:522-589 - WebSocket lifecycle
+kill_switch.py - Risk management
+Quick Wins (Day 1-2)
+If you want to see immediate results, start with these high-impact, low-effort changes:
+
+1. Fast JSON Parser (10 minutes)
+
+pip install orjson
+Then in polymarket_client.py:540:
+
+
+# Change: import json
+import orjson
+
+# Change: data = json.loads(msg_str)
+data = orjson.loads(msg_str)
+Impact: -3ms per WebSocket message
+
+2. Monotonic Time (15 minutes)
+In price_cache.py:
+
+
+import time
+
+# In __init__:
+self._stale_threshold_seconds = stale_threshold.total_seconds()
+
+# In update():
+self._last_update[token_id] = time.monotonic()
+
+# In get_all():
+now = time.monotonic()
+if (now - last) <= self._stale_threshold_seconds:
+    result[token_id] = book
+Impact: -1ms per tick
+
+3. Parallel WebSocket Callbacks (20 minutes)
+In price_cache.py:96-100:
+
+
+# Change:
+for callback in self._subscribers:
+    await callback(token_id, book)
+
+# To:
+await asyncio.gather(
+    *[cb(token_id, book) for cb in self._subscribers],
+    return_exceptions=True
+)
+Impact: -10ms when callbacks block
+
+Total Time: 45 minutes
+Total Impact: -14ms latency reduction
+
+Verification Steps
+During Development (Local Windows)
+Baseline Measurement (before optimization):
+
+
+python -m polyquant.main trade --mode paper --max-ticks 100
+Record p50, p95, p99 latency from logs
+Save as baseline for comparison
+After Each Optimization:
+
+
+python -m polyquant.main trade --mode paper --max-ticks 100
+Compare latency percentiles to baseline
+Ensure no regressions (p95 increase)
+Latency Profiling (requires adding profiling code):
+
+
+# Add to navigator.py main loop:
+with cProfile.Profile() as pr:
+    opportunities = await self._detect_opportunities(current_books)
+
+pr.print_stats(sort='cumulative')
+Identify hottest functions
+Target top 5 for optimization
+Before AWS Deployment
+Load Testing (create script):
+
+
+python scripts/load_test_navigator.py --rate 1000 --duration 300
+Simulate 1000 price updates/sec for 5 minutes
+Verify no dropped messages
+Check memory doesn't leak
+Opportunity Detection Verification (create script):
+
+
+python scripts/verify_arbitrage.py --historical data/known_opportunities.json
+Use historical data with known arbitrage opportunities
+Verify detector finds them all
+Verify latency < 100ms per detection
+End-to-End Stability Test:
+
+
+python -m polyquant.main trade --mode paper --duration 86400
+Run for 24 hours in paper mode
+Verify >99.5% uptime (< 7 minutes downtime)
+Check for memory leaks, stuck threads
+On AWS Lightsail (Pre-Production)
+Network Latency Measurement:
+
+
+# Measure latency to Polymarket
+python scripts/measure_latency.py --target polymarket-ws
+
+# Measure latency to Polygon RPC
+python scripts/measure_latency.py --target polygon-rpc
+Verify <30ms to Polymarket WebSocket
+Verify <40ms to Polygon RPC
+Full System Test (paper mode on AWS):
+
+
+python -m polyquant.main trade --mode paper --duration 3600
+Verify p95 latency < 50ms on AWS
+Check CloudWatch metrics (CPU, memory, network)
+Before Going Live
+Small Position Test (real money, small amounts):
+
+
+python -m polyquant.main trade --mode live --max-position 100
+Start with $100 max position
+Monitor for 1 week
+Verify no unexpected behaviors
+Gradually increase to $500, then $1000
+Kill Switch Verification:
+
+
+python scripts/test_kill_switch.py
+Simulate drawdown exceeding threshold
+Verify trading halts immediately
+Verify resume works after reset
+Dependencies to Add
+Python Packages (update requirements.txt):
+
+
+orjson>=3.9.0          # Fast JSON parsing
+aiofiles>=23.0.0       # Async file I/O
+System Requirements (update README.md):
+
+SCIP Optimization Suite 9.0+ (already required)
+Redis 7.0+ (already required)
+Python 3.11+ (already required)
+Success Criteria
+Must Have (Block Production Release)
+✅ ArbitrageDetector functional and detecting opportunities
+✅ ExecutionGuard validating all trades
+✅ p95 latency < 50ms on live Polymarket feed
+✅ Navigator uptime > 99% over 24-hour period
+✅ No stale price trading (health monitoring working)
+Should Have (Performance Goals)
+✅ p50 latency < 30ms
+✅ Solver convergence in < 100ms for typical clusters
+✅ Startup time < 1 second
+✅ MapMaker incremental run < 5 minutes
+Nice to Have (Future Work)
+⏳ Pre-signed transaction pool
+⏳ Rust execution layer (mentioned in README but not implemented)
+⏳ Multi-region deployment for latency arbitrage
+⏳ GPU-accelerated solver for massive clusters (50+ outcomes)
+Deployment Strategy (AWS Lightsail London)
+Why London?
+Polymarket's infrastructure likely hosted in Europe
+Lower latency to Polygon RPC endpoints (many in EU)
+Target: <20ms to Polymarket WebSocket, <30ms to Polygon RPC
+AWS Lightsail Setup (Production)
+Instance Size:
+
+Minimum: 2 vCPU, 8GB RAM ($40/month)
+Recommended: 4 vCPU, 16GB RAM ($80/month) for SCIP solver
+OS: Ubuntu 22.04 LTS (easier SCIP installation than Windows)
+
+Network:
+
+Static IP for outbound connections
+Security group: Only allow SSH (port 22) and optionally HTTPS (port 443) for monitoring
+Polygon RPC:
+
+Use Alchemy or Infura endpoint in London/EU region
+Consider private RPC for <10ms latency (QuickNode, Blast API)
+Redis:
+
+AWS ElastiCache (Redis) in same region
+Alternative: Run Redis on same Lightsail instance (simpler, slightly higher latency)
+Monitoring:
+
+CloudWatch for basic metrics (CPU, memory, network)
+Consider Grafana Cloud free tier for custom dashboards
+Testing Strategy
+Phase 1: Local Development (Current)
+
+Use real Polymarket WebSocket feed
+Run in paper mode (no actual trades)
+Measure latency with mock execution
+Duration: 2-3 weeks during optimization
+Phase 2: AWS Testing
+
+Deploy to Lightsail in London
+Continue paper mode but measure real latency to Polymarket/Polygon
+Validate <50ms p95 latency achieved
+Duration: 1 week
+Phase 3: Live with Small Positions
+
+Start with $100-500 max position size
+Monitor for 1 week before scaling up
+Verify no unexpected behaviors
+Network Latency Expectations
+Route	Expected Latency	Impact
+Local (Windows) → Polymarket	30-100ms	Development OK, production too slow
+AWS London → Polymarket	10-30ms	Target for production
+AWS London → Polygon RPC (Alchemy EU)	20-40ms	Acceptable
+AWS London → Polygon RPC (private)	5-15ms	Optimal, costs $50-200/month
+Total Expected Latency (AWS London):
+
+WebSocket update → Detection: <10ms (internal)
+Detection → Polygon mempool: 20-40ms (network + RPC)
+Total: 30-50ms (meets target!)
+Deferred Optimizations (Future Work)
+After Proving Profitability
+Rust Execution Layer (executor.py)
+
+Rewrite executor in Rust for 5-10ms savings
+Only if Python execution becomes the bottleneck
+Effort: 2-3 weeks
+Pre-Signed Transaction Pool
+
+Keep pool of pre-signed transactions ready
+Save 5ms per trade
+Complexity: High (transaction management)
+GPU-Accelerated Solver
+
+For massive clusters (50+ outcomes)
+Likely not needed for Polymarket (typical clusters <30 outcomes)
+Multi-Region Deployment
+
+Deploy in both London and US East for latency arbitrage
+Only if profitable enough to justify 2× infrastructure cost
+Open Questions
+Polymarket API Rate Limits: Need to discover actual rate limits on WebSocket and REST during testing.
+
+SCIP Licensing: Confirm non-commercial use acceptable, or budget for commercial license (~$5000/year).
+
+Monitoring Stack: Preference for observability stack? (Recommend Prometheus + Grafana Cloud free tier)
+
+Capital Allocation: What's target capital for initial live trading? ($1K, $10K, $100K+) - affects position sizing.
+
+Risk Tolerance: Max acceptable drawdown before kill switch? (Current config: 15%)
+
+Polygon Gas Strategy: Will you use gas price oracle or fixed gas price? Need to balance speed vs cost.
+

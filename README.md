@@ -14,10 +14,9 @@ PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage oppo
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Discovery  │ -> │  Reasoning  │ -> │ Verification│ -> │Optimization │ -> │  Execution  │
-│   Agent     │    │  (Logic     │    │  (Validator)│    │   (SCIP)    │    │  (Rust HFT) │
-│(Gemini 2.0) │    │  Architect) │    │(Gemini     │    │             │    │             │
-│             │    │             │    │ Thinking)   │    │             │    │             │
+│  Discovery  │ -> │  Map Maker  │ -> │  Validator  │ -> │ Navigator   │ -> │  Execution  │
+│   Agent     │    │(Correlation)│    │ (Reasoning) │    │ (Micro-     │    │  (SCIP/HFT) │
+│(Gemini 2.0) │    │(Logic Arch) │    │(Thinking)   │    │  structure) │    │             │
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
@@ -27,10 +26,11 @@ PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage oppo
 polyquant/
 ├── src/
 │   ├── agents/              # AI Agent implementations
-│   │   ├── __init__.py
 │   │   ├── discovery.py     # Phase 1: Market scanner (Gemini 2.0 Flash)
-│   │   ├── logic_architect.py # Phase 2: Dependency detection (DeepSeek-R1)
-│   │   └── validator.py     # Phase 3: Constraint verification (Gemini Thinking)
+│   │   ├── logic_architect.py # Phase 2: Dependency detection (Thinking)
+│   │   ├── validator.py     # Phase 3: Constraint verification (Thinking)
+│   │   ├── correlation.py   # NEW: Statistical relationship mapping
+│   │   └── microstructure.py # NEW: Real-time order book analysis
 │   ├── solver/              # Optimization engine
 │   │   ├── __init__.py
 │   │   ├── bregman.py       # Bregman projection algorithm
