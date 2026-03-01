@@ -237,14 +237,24 @@ class PolymarketClient:
         try:
             from py_clob_client.client import ClobClient
             
-            private_key = config.polygon_private_key.get_secret_value()
-            if private_key:
+            raw_key = config.polygon_private_key.get_secret_value()
+            # Sanitize: strip whitespace and 0x prefix
+            private_key = raw_key.strip()
+            if private_key.startswith("0x"):
+                private_key = private_key[2:]
+            
+            if private_key and len(private_key) >= 64:
                 self._sdk_client = ClobClient(
                     host=self.clob_url,
                     chain_id=137,  # Polygon Mainnet
                     key=private_key,
                 )
                 logger.info("CLOB SDK client initialized (live trading ready)")
+            elif raw_key:
+                logger.warning(
+                    "POLYGON_PRIVATE_KEY provided but seems invalid or too short. "
+                    "Running in paper mode only."
+                )
             else:
                 logger.info("No POLYGON_PRIVATE_KEY — SDK client not initialized (paper mode only)")
         except ImportError:

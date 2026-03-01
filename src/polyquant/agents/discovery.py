@@ -295,17 +295,6 @@ The YES Price is the current market probability (0.00 to 1.00).
             if not valid_markets:
                 continue
             
-            # Price sanity: skip near-resolved markets
-            valid_markets = [
-                m for m in valid_markets
-                if not m.outcomes or not all(
-                    o.price < 0.03 or o.price > 0.97 for o in m.outcomes
-                )
-            ]
-            
-            if not valid_markets:
-                continue
-            
             # Auto-cluster: NegRisk events with price deviation detection
             # ENHANCED (Week 5): Explicit deviation detection for arbitrage opportunities
             if neg_risk_id and len(valid_markets) > 1:

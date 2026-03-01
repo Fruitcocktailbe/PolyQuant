@@ -36,7 +36,11 @@ pip install -r requirements.txt
 
 # Create .env
 cp .env.example .env
-nano .env  # Add your API keys and Private Keys
+nano .env  # Add your API keys. POLYGON_PRIVATE_KEY can be empty for Paper Trading.
+
+# Generate Market Map (REQUIRED before trading)
+# This scans for arbitrage clusters and local constraints.
+python -m polyquant.map_maker
 ```
 
 ## 4. Running the Services
@@ -62,6 +66,8 @@ python -m polyquant.main trade
 ```bash
 cd web
 npm install
+# Fix Vite permissions
+chmod +x node_modules/.bin/vite
 npm run dev -- --host
 ```
 
@@ -79,4 +85,8 @@ In the Lightsail Console, open the following **Inbound Ports**:
 
 - **Stop All**: `CTRL+C` in all sessions.
 - **Restart Redis**: `sudo systemctl restart redis-server`
+- **Clear Scan Cache**: `redis-cli FLUSHALL` (Use this if you want to force a full rescan of all markets)
 - **View Logs**: Check `logs/` directory in the root or the Web Dashboard terminal.
+
+> [!NOTE]
+> `sentence-transformers` is used for cross-exchange matching. The first time the Map Maker runs, it will download a small model (~80MB). This is normal.
