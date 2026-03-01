@@ -40,15 +40,21 @@ def get_llm_client() -> OpenAI | None:
     Returns:
         OpenAI client configured for OpenRouter, or None if no API key.
     """
-    api_key = config.gemini_api_key.get_secret_value()
+    # Use config value, fall back to empty if missing
+    try:
+        api_key_wrapped = getattr(config, "gemini_api_key", None)
+        api_key = api_key_wrapped.get_secret_value() if api_key_wrapped else ""
+    except Exception:
+        api_key = ""
 
-    if not api_key or "your-" in api_key:
-        logger.warning("OPENROUTER_API_KEY / GEMINI_API_KEY not set — LLM features disabled")
+    if not api_key or len(api_key) < 10 or "your-" in api_key.lower():
+        logger.warning("LLM keys not configured — LLM clustering/matching disabled")
         return None
 
     client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
+        timeout=10.0,  # CRITICAL: Prevent 2GB RAM instances from hanging on network wait
         default_headers={
             "HTTP-Referer": "https://github.com/polyquant",
             "X-OpenRouter-Title": "PolyQuant",

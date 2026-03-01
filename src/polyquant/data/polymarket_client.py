@@ -320,7 +320,7 @@ class PolymarketClient:
                     markets.append(market)
             
             logger.info(
-                "Fetched markets",
+                f"Fetched {len(data)} markets ({len(markets)} after filtering)",
                 total=len(data),
                 after_filter=len(markets),
             )

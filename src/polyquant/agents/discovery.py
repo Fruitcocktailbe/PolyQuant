@@ -403,7 +403,7 @@ The YES Price is the current market probability (0.00 to 1.00).
             await cache.mark_market_processed(f"event_{event_id}")
         
         logger.info(
-            "Market scan complete",
+            f"Market scan complete: {len(clusters)} clusters (auto={auto_cluster_count}, llm={len(clusters) - auto_cluster_count})",
             auto_clusters=auto_cluster_count,
             llm_clusters=len(clusters) - auto_cluster_count,
             total_clusters=len(clusters),
@@ -416,8 +416,10 @@ The YES Price is the current market probability (0.00 to 1.00).
         """
         Use LLM (via OpenRouter) to cluster markets by topic.
         """
-        if not self._llm_available:
-            logger.info("LLM not available, skipping clustering")
+        # Re-check availability using the hardened client (handles missing/short keys)
+        from polyquant.utils.llm_client import get_llm_client
+        if get_llm_client() is None:
+            logger.info("LLM keys not found - using basic clustering only")
             return [
                 MarketCluster(
                     topic="Uncategorized (No AI)",
@@ -425,7 +427,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                     potential_dependencies=[],
                 )
             ]
-        
+
         # Format markets for the prompt - include prices and liquidity
         market_lines = []
         for m in markets:
@@ -438,8 +440,8 @@ The YES Price is the current market probability (0.00 to 1.00).
         
         # Create market lookup for quick access
         market_lookup = {m.market_id: m for m in markets}
-        
-        logger.debug("Calling LLM for market clustering", market_count=len(markets))
+
+        logger.info(f"Calling LLM for market clustering ({len(markets)} targets)", market_count=len(markets))
 
         try:
             # Call LLM via OpenRouter
