@@ -9,6 +9,8 @@ use alloy::signers::Signer;
 use alloy::sol;
 use alloy::sol_types::{eip712_domain, SolStruct};
 use anyhow::{anyhow, Result};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -89,27 +91,34 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
     // Persist nonce to journal for crash recovery
     state.journal.log_nonce("limitless", nonce, &trade.outcome_id);
 
-    // Parse price/size
+    // Parse price/size with exact decimal arithmetic (no f64 precision loss)
     let is_buy = matches!(trade.side, OrderSide::Buy);
-    let price: f64 = trade.limit_price.parse()?;
-    let size: f64 = trade.size.parse()?;
+    let price = Decimal::from_str(&trade.limit_price)
+        .map_err(|e| anyhow!("invalid limit_price '{}': {}", trade.limit_price, e))?;
+    let size = Decimal::from_str(&trade.size)
+        .map_err(|e| anyhow!("invalid size '{}': {}", trade.size, e))?;
+    let scale = Decimal::from(1_000_000u64);
 
     // Pessimistic rounding: ceil() for what we pay, floor() for what we receive
     let (maker_amount, taker_amount, side_uint) = if is_buy {
         // BUY: we pay makerAmount (USDC) → ceil; we receive takerAmount (tokens) → floor
-        let m = (price * size * 1e6).ceil() as u64;
-        let t = (size * 1e6).floor() as u64;
+        let m = (price * size * scale).ceil().to_u64()
+            .ok_or_else(|| anyhow!("maker_amount overflow for price={} size={}", price, size))?;
+        let t = (size * scale).floor().to_u64()
+            .ok_or_else(|| anyhow!("taker_amount overflow for size={}", size))?;
         (m, t, 0u8)
     } else {
         // SELL: we pay makerAmount (tokens) → ceil; we receive takerAmount (USDC) → floor
-        let m = (size * 1e6).ceil() as u64;
-        let t = (price * size * 1e6).floor() as u64;
+        let m = (size * scale).ceil().to_u64()
+            .ok_or_else(|| anyhow!("maker_amount overflow for size={}", size))?;
+        let t = (price * size * scale).floor().to_u64()
+            .ok_or_else(|| anyhow!("taker_amount overflow for price={} size={}", price, size))?;
         (m, t, 1u8)
     };
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let expiration = now + 60;
-    let salt = Uuid::new_v4().as_u128() as u64; // FIX: random salt
+    let expiration = now.checked_add(60).ok_or_else(|| anyhow!("timestamp overflow"))?;
+    let salt = Uuid::new_v4().as_u128(); // Full 128-bit entropy (was truncated to u64)
 
     let order = Order {
         salt: U256::from(salt),
@@ -173,7 +182,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
         "signature": sig_hex
     });
 
-    // Journal: intent to submit
+    // Journal: intent to submit (SYNCHRONOUS — durable before HTTP)
     state.journal.log_pre_submit(
         "limitless",
         &trade.outcome_id,
@@ -211,9 +220,10 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
             Some(&res_text),
         );
 
-        // On nonce-related errors, try to resync nonce
+        // On nonce-related errors, resync nonce (serialized via mutex to prevent race)
         if res_text.contains("nonce") || res_text.contains("Nonce") {
-            warn!("Nonce error detected, attempting resync");
+            warn!("Nonce error detected, attempting serialized resync");
+            let _guard = limitless.nonce_resync_lock.lock().await;
             if let Err(e) = resync_nonce(state).await {
                 warn!("Nonce resync failed: {:?}", e);
             }
@@ -231,23 +241,24 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
     // Parse response
     let res_json: Value = serde_json::from_str(&res_text).unwrap_or(serde_json::json!({}));
     let order_id = res_json["id"].as_str().unwrap_or("").to_string();
-    let actual_filled_size = res_json["filledAmount"]
-        .as_f64()
-        .or_else(|| res_json["filledSize"].as_f64())
-        .unwrap_or(0.0);
+    let actual_filled_str = res_json["filledAmount"]
+        .as_str()
+        .or_else(|| res_json["filledSize"].as_str())
+        .unwrap_or("0");
+    let actual_filled = Decimal::from_str(actual_filled_str).unwrap_or(Decimal::ZERO);
 
-    let final_filled_size = if actual_filled_size == 0.0
+    let final_filled_size = if actual_filled.is_zero()
         && ["filled", "closed", "matched"]
             .contains(&res_json["status"].as_str().unwrap_or(""))
     {
-        size
+        size.to_string()
     } else {
-        actual_filled_size
+        actual_filled.to_string()
     };
 
     let status_str = res_json["status"].as_str().unwrap_or("");
 
-    // Journal: result
+    // Journal: result (ASYNC — non-blocking)
     state.journal.log_post_submit(
         "limitless",
         &trade.outcome_id,
@@ -255,13 +266,13 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
         &trade.size,
         &trade.limit_price,
         &order_id,
-        &final_filled_size.to_string(),
+        &final_filled_size,
         &price.to_string(),
         Some(http_status),
         Some(&res_text),
     );
 
-    let error = if final_filled_size > 0.0 {
+    let error = if !actual_filled.is_zero() || ["filled", "closed", "matched"].contains(&status_str) {
         String::new()
     } else if !order_id.is_empty() {
         format!("order_status: {}", status_str)
@@ -276,7 +287,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
 
     Ok(Fill {
         trade: trade.clone(),
-        filled_size: final_filled_size.to_string(),
+        filled_size: final_filled_size,
         filled_price: price.to_string(),
         order_id,
         error,
@@ -284,6 +295,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
 }
 
 /// Resync nonce from RPC after a nonce error. Tries primary + fallback RPCs.
+/// Uses "safe" block tag (~1 min lag on Base L2, vs "finalized" which lags 12+ hours).
 async fn resync_nonce(state: &Arc<SharedState>) -> Result<()> {
     let limitless = state
         .limitless
@@ -293,7 +305,7 @@ async fn resync_nonce(state: &Arc<SharedState>) -> Result<()> {
     let nonce_req = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_getTransactionCount",
-        "params": [limitless.maker_address.to_string(), "finalized"],
+        "params": [limitless.maker_address.to_string(), "safe"],
         "id": 1
     });
 

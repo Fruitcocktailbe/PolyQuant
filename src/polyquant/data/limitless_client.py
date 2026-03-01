@@ -176,14 +176,18 @@ class LimitlessClient:
         raise RuntimeError(f"All RPC providers failed. Last error: {last_error}")
 
     async def get_base_network_nonce(self) -> int:
-        """Fetch the current transaction count (nonce) from Base RPC with failover."""
+        """Fetch the current transaction count (nonce) from Base RPC with failover.
+
+        Uses "safe" block tag (~1 min lag on Base L2). "finalized" lags 12+ hours
+        on Base because it means finalized to L1.
+        """
         if not self.address or self.address == ZERO_ADDRESS:
             return int(time.time())
 
         payload = {
             "jsonrpc": "2.0",
             "method": "eth_getTransactionCount",
-            "params": [self.address, "finalized"],
+            "params": [self.address, "safe"],
             "id": 1
         }
 

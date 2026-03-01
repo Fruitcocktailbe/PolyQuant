@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use dotenvy::dotenv;
@@ -16,7 +16,7 @@ use oms_sidecar::models::{ControlCommand, ExecutionResponse, Fill, IncomingMessa
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Starting PolyQuant OMS Sidecar v0.2...");
+    info!("Starting PolyQuant OMS Sidecar v0.3...");
 
     match dotenv() {
         Ok(_) => info!("Loaded .env file"),
@@ -33,6 +33,14 @@ async fn main() -> Result<()> {
             Ok(n) => info!("Limitless nonce warmed: {}", n),
             Err(e) => error!("Failed to warm Limitless nonce: {:?}", e),
         }
+    }
+
+    // Spawn background nonce gap detector (checks every 30s)
+    if state.limitless.is_some() {
+        let nonce_state = Arc::clone(&state);
+        task::spawn(async move {
+            nonce_gap_detector(nonce_state).await;
+        });
     }
 
     let mut socket = RepSocket::new();
@@ -270,11 +278,12 @@ async fn warm_limitless_nonce(state: &Arc<SharedState>) -> Result<u64> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Limitless not configured"))?;
 
-    // Fetch on-chain nonce (use "finalized" to avoid re-org races) with failover
+    // Fetch on-chain nonce with "safe" block tag (~1 min lag on Base L2).
+    // "finalized" lags 12+ hours on Base (finalized to L1), "safe" is 2/3 validator attestation.
     let nonce_req = json!({
         "jsonrpc": "2.0",
         "method": "eth_getTransactionCount",
-        "params": [limitless.maker_address.to_string(), "finalized"],
+        "params": [limitless.maker_address.to_string(), "safe"],
         "id": 1
     });
 
@@ -322,6 +331,74 @@ async fn warm_limitless_nonce(state: &Arc<SharedState>) -> Result<u64> {
 
     limitless.nonce.store(effective_nonce, Ordering::SeqCst);
     Ok(effective_nonce)
+}
+
+/// Background task: periodically checks for nonce gaps between local AtomicU64
+/// and on-chain nonce. If gap > 5, triggers a warning + automatic resync.
+async fn nonce_gap_detector(state: Arc<SharedState>) {
+    let interval = Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        if state.is_halted() {
+            continue;
+        }
+
+        let limitless = match state.limitless.as_ref() {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let local_nonce = limitless.nonce.load(Ordering::SeqCst);
+
+        let nonce_req = json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionCount",
+            "params": [limitless.maker_address.to_string(), "safe"],
+            "id": 1
+        });
+
+        let mut urls = vec![limitless.rpc_url.clone()];
+        urls.extend(limitless.rpc_fallback_urls.iter().cloned());
+
+        let mut on_chain_nonce: Option<u64> = None;
+        for url in &urls {
+            match state.http_client.post(url).json(&nonce_req).send().await {
+                Ok(res) => {
+                    if let Ok(data) = res.json::<serde_json::Value>().await {
+                        if let Some(hex) = data["result"].as_str() {
+                            if let Ok(n) = u64::from_str_radix(hex.trim_start_matches("0x"), 16) {
+                                on_chain_nonce = Some(n);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if let Some(chain_nonce) = on_chain_nonce {
+            let gap = local_nonce.saturating_sub(chain_nonce);
+            if gap > 5 {
+                warn!(
+                    "NONCE GAP DETECTED: local={} on_chain={} gap={} — possible stuck transactions",
+                    local_nonce, chain_nonce, gap
+                );
+                // Auto-resync: set local nonce to on-chain value
+                let _guard = limitless.nonce_resync_lock.lock().await;
+                limitless.nonce.store(chain_nonce, Ordering::SeqCst);
+                warn!("Nonce auto-resynced to on-chain value {}", chain_nonce);
+                state.journal.log_error(
+                    "limitless",
+                    "nonce_gap_detector",
+                    &format!("nonce_gap: local={} chain={} resynced", local_nonce, chain_nonce),
+                    None,
+                    None,
+                );
+            }
+        }
+    }
 }
 
 /// Scan the JSONL crash journal for the highest nonce assigned to limitless.
