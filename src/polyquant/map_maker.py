@@ -24,7 +24,9 @@ USAGE:
 
 import asyncio
 import hashlib
-from datetime import datetime
+import json
+import traceback
+from datetime import datetime, timezone
 from typing import Any
 
 from polyquant.agents import (
@@ -150,7 +152,7 @@ class MapMaker:
         Returns:
             Summary of the map building process.
         """
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
 
         # Get and increment version for this build
         current_version = await cache.get_manifest_version()
@@ -275,12 +277,14 @@ class MapMaker:
             await monitor.update_status(pipeline_stage="COMPLETE")
             
         except Exception as e:
-            logger.error("Map building failed", error=str(e))
+            tb = traceback.format_exc()
+            logger.error("Map building failed", error=str(e), exc_type=type(e).__name__, exc_info=True)
             results["status"] = "error"
-            results["error"] = str(e)
+            results["error"] = f"{type(e).__name__}: {str(e)}"
+            results["traceback"] = tb
         
         # Record timing
-        elapsed = (datetime.utcnow() - start_time).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(results["start_time"])).total_seconds()
         results["elapsed_seconds"] = elapsed
         
         logger.info(

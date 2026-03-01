@@ -71,8 +71,17 @@ class LocalSigner:
         
         # Initialize Python signer (eth_account)
         if not self._rust_signer:
-            self._account = Account.from_key(self._pk)
-            logger.info("Using Python eth_account for signing (slower but reliable)")
+            try:
+                # Sanitize: strip whitespace and 0x prefix
+                clean_pk = self._pk.strip()
+                if clean_pk.startswith("0x"):
+                    clean_pk = clean_pk[2:]
+                
+                self._account = Account.from_key(clean_pk)
+                logger.info("Using Python eth_account for signing (slower but reliable)")
+            except Exception as e:
+                logger.error(f"Failed to initialize account for signing: {e}")
+                self._account = None
 
     def sign_order(self, order_dict: Dict[str, Any]) -> str:
         """

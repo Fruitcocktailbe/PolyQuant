@@ -27,19 +27,28 @@ class LimitlessClient:
     def __init__(self):
         self.api_url = config.limitless_api_url
         self.api_key = config.limitless_api_key.get_secret_value()
-        self.private_key = config.base_private_key.get_secret_value()
-        
+        raw_key = config.base_private_key.get_secret_value()
+        # Sanitize: strip whitespace and 0x prefix
+        self.private_key = raw_key.strip()
+        if self.private_key.startswith("0x"):
+            self.private_key = self.private_key[2:]
+            
         self._rest_client: httpx.AsyncClient | None = None
         self._base_nonce: int | None = None
         
-        if self.private_key:
-            self.account = Account.from_key(self.private_key)
-            self.address = self.account.address
+        if self.private_key and len(self.private_key) >= 64:
+            try:
+                self.account = Account.from_key(self.private_key)
+                self.address = self.account.address
+            except Exception as e:
+                logger.warning(f"Failed to initialize Limitless account with key: {e}")
+                self.account = None
+                self.address = ZERO_ADDRESS
         else:
             self.account = None
             self.address = ZERO_ADDRESS
             
-        logger.info("LimitlessClient initialized", api_url=self.api_url)
+        logger.info("LimitlessClient initialized", api_url=self.api_url, address=self.address)
 
     async def __aenter__(self) -> "LimitlessClient":
         headers = {
