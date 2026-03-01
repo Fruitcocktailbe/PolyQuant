@@ -109,6 +109,24 @@ class PolyQuantConfig(BaseSettings):
         description="Polymarket WebSocket for real-time price and order updates"
     )
 
+    gamma_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        description="Timeout for Gamma API requests in seconds"
+    )
+
+    clob_timeout_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        description="Timeout for CLOB API requests in seconds"
+    )
+
+    http_max_retries: int = Field(
+        default=3,
+        ge=0,
+        description="Max HTTP retries for REST APIs"
+    )
+
     # =========================================================================
     # Limitless Connection Settings
     # =========================================================================
