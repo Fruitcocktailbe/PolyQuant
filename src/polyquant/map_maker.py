@@ -41,6 +41,7 @@ from polyquant.data.constraint_store import (
     StoredConstraint,
     StoredDependency,
 )
+from polyquant.data.market_models import Market # Added based on instruction's implied source for Market
 from polyquant.agents.exchange_matcher import ExchangeMatcher
 from polyquant.utils import config, get_logger
 from polyquant.api.server import monitor
@@ -431,14 +432,34 @@ class MapMaker:
             correlations = []
             if self._correlation_agent and self._polymarket:
                 async def history_provider(mid: str):
-                    h = await self._polymarket.get_history(mid)
-                    return [float(p.get("p", 0)) for p in h]
+                    # get_history returns a list of {"t": timestamp, "p": price} dicts
+                    # Correlation engine expects exactly that shape.
+                    return await self._polymarket.get_history(mid)
+                
+                # We want to correlate the specific token prices, not abstract markets.
+                # Assuming the first outcome represents the 'Yes' side for binary markets.
+                token_to_market = {}
+                token_markets = []
+                for m in cluster.markets:
+                    if m.outcomes and m.outcomes[0].token_id:
+                        token_id = m.outcomes[0].token_id
+                        token_to_market[token_id] = m
+                        # Create a dummy market with the token_id as its primary ID 
+                        # so the correlation engine tests the correct string
+                        token_market = Market(
+                            market_id=token_id, 
+                            question=m.question, 
+                            outcomes=m.outcomes,
+                            liquidity=m.liquidity,
+                            volume=m.volume,
+                        )
+                        token_markets.append(token_market)
                 
                 # CorrelationAgent might need to be async or we fetch here
                 # Let's assume we can pass the provider and it handles it
-                # Logic: analyze_pairs(cluster.markets, history_provider)
-                signals = await self._correlation_agent.analyze_pairs(
-                    cluster.markets, 
+                # Logic: scan_for_pairs(token_markets, history_provider)
+                signals = await self._correlation_agent.scan_for_pairs(
+                    token_markets, 
                     history_provider
                 )
                 correlations = [s.model_dump(mode="json") for s in signals]
@@ -450,14 +471,13 @@ class MapMaker:
             if self._exchange_matcher:
                 mapped = self._exchange_matcher.mapped_pairs
                 for m in cluster.markets:
-                    l_val = mapped.get(m.condition_id)
+                    l_val = mapped.get(m.market_id)
                     if l_val:
                         # Value might be "l_id|slug" or just "l_id"
                         if "|" in l_val:
                             l_id, l_slug = l_val.split("|", 1)
                         else:
                             l_id = l_val
-                            l_slug = ""
                             
                         if l_id not in market_ids:
                             market_ids.append(l_id)

@@ -814,17 +814,49 @@ class PolymarketClient:
         """Parse API response into Market object."""
         outcomes = []
         
-        # Parse tokens as outcomes
-        tokens = data.get("tokens", [])
-        for token in tokens:
-            outcomes.append(
-                Outcome(
-                    outcome_id=token.get("token_id", ""),
-                    name=token.get("outcome", "Unknown"),
-                    price=Decimal(str(token.get("price", "0.5"))),
-                    token_id=token.get("token_id", ""),
+        # In the /events endpoint, tokens aren't provided directly. 
+        # Instead, we get outcomes, outcomePrices, and clobTokenIds as JSON-encoded strings
+        tokens = data.get("tokens")
+        if tokens:
+            for token in tokens:
+                outcomes.append(
+                    Outcome(
+                        outcome_id=token.get("token_id", ""),
+                        name=token.get("outcome", "Unknown"),
+                        price=Decimal(str(token.get("price", "0.5"))),
+                        token_id=token.get("token_id", ""),
+                    )
                 )
-            )
+        else:
+            # Try to parse from the flattened event market structure
+            try:
+                import json
+                outcome_names = data.get("outcomes", "[]")
+                outcome_prices = data.get("outcomePrices", "[]")
+                clob_token_ids = data.get("clobTokenIds", "[]")
+                
+                if isinstance(outcome_names, str):
+                    outcome_names = json.loads(outcome_names)
+                if isinstance(outcome_prices, str):
+                    outcome_prices = json.loads(outcome_prices)
+                if isinstance(clob_token_ids, str):
+                    clob_token_ids = json.loads(clob_token_ids)
+                    
+                if isinstance(outcome_names, list) and isinstance(outcome_prices, list):
+                    for i, name in enumerate(outcome_names):
+                        price = outcome_prices[i] if i < len(outcome_prices) else "0.5"
+                        token_id = clob_token_ids[i] if isinstance(clob_token_ids, list) and i < len(clob_token_ids) else ""
+                        
+                        outcomes.append(
+                            Outcome(
+                                outcome_id=token_id,
+                                name=str(name),
+                                price=Decimal(str(price)),
+                                token_id=token_id,
+                            )
+                        )
+            except Exception as e:
+                logger.warning("Failed to parse flat outcomes strings", error=str(e), market=data.get("condition_id"))
         
         # Parse end date
         end_date = None

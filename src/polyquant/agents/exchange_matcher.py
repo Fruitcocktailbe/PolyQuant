@@ -122,7 +122,7 @@ class ExchangeMatcher:
         task_meta = []
         
         for p_idx, p_market in enumerate(poly_markets):
-            if p_market.condition_id in self.mapped_pairs:
+            if p_market.market_id in self.mapped_pairs:
                 continue # Already mapped
                 
             # Get top 3 indices for this Polymarket market
@@ -172,13 +172,13 @@ class ExchangeMatcher:
         logger.info(f"Firing {len(eval_tasks)} LLM verification requests concurrently...")
         results = await asyncio.gather(*eval_tasks, return_exceptions=True)
         
-        # Process results, grouping by Polymarket condition_id so we only map the first true match
+        # Process results, grouping by Polymarket market_id so we only map the first true match
         processed_p_market_ids = set()
         
         for meta, resp in zip(task_meta, results):
             p_market = meta["p_market"]
             
-            if p_market.condition_id in processed_p_market_ids:
+            if p_market.market_id in processed_p_market_ids:
                 continue # We already mapped this Polymarket event from a different Limitless suggestion
                 
             if isinstance(resp, Exception):
@@ -187,15 +187,15 @@ class ExchangeMatcher:
                 
             if resp and resp.get("is_match") is True:
                 logger.info(f"MATCH FOUND [{meta['sim_score']:.2f}]: {p_market.question[:30]}... == LIMITLESS {meta['l_title'][:30]}...")
-                self.mapped_pairs[p_market.condition_id] = meta["l_id"]
-                processed_p_market_ids.add(p_market.condition_id)
+                self.mapped_pairs[p_market.market_id] = meta["l_id"]
+                processed_p_market_ids.add(p_market.market_id)
                 new_matches += 1
                 
                 # Update UI Monitor with UI-friendly list
                 ui_pair = {
                     "polymarket_question": p_market.question,
                     "limitless_title": meta["l_title"],
-                    "polymarket_id": p_market.condition_id,
+                    "polymarket_id": p_market.market_id,
                     "limitless_id": meta["l_id"],
                     "similarity": round(meta["sim_score"], 2)
                 }

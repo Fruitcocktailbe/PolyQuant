@@ -169,6 +169,8 @@ def setup_web_logging():
     cancelled_filter = CancelledErrorFilter()
     logging.getLogger("uvicorn.error").addFilter(cancelled_filter)
     logging.getLogger("uvicorn.lifespan").addFilter(cancelled_filter)
+    logging.getLogger("uvicorn").addFilter(cancelled_filter)
+    logging.getLogger("asyncio").addFilter(cancelled_filter)
 
 # Global instance
 monitor = Monitor()

@@ -590,6 +590,18 @@ class Navigator:
                 logger.error("Limitless polling loop encountered error", error=str(e))
                 await asyncio.sleep(5.0) # Back off on error
 
+    def stop(self) -> None:
+        """Gracefully stop the navigator loop."""
+        logger.info("Stop signal received via signal_handler. Shutting down...")
+        self._is_running = False
+        if getattr(self, "_price_cache", None) and hasattr(self._price_cache, "_update_event"):
+            try:
+                # Wake up the event loop if waiting for price
+                # asyncio.Event handles thread safety internally for basic set() in same loop
+                self._price_cache._update_event.set()
+            except Exception:
+                pass
+
     async def __aexit__(self, *args: Any) -> None:
         """Cleanup all components."""
         logger.info("Shutting down Navigator...")

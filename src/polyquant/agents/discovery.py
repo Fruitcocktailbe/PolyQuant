@@ -314,15 +314,15 @@ The YES Price is the current market probability (0.00 to 1.00).
                     m.outcomes[0].price for m in valid_markets if m.outcomes
                 )
 
-                # Detect deviation from theoretical sum of 1.0
-                deviation = abs(total_price - 1.0)
+                # Detect deviation from theoretical sum of 1.0 (ensure types match)
+                deviation = abs(float(total_price) - 1.0)
                 deviation_pct = deviation * 100
 
                 # Classify market state based on deviation
-                if total_price < 0.98:
+                if float(total_price) < 0.98:
                     market_state = "UNDERPRICED"
                     arbitrage_type = "Buy Arbitrage (prices sum < 1.0)"
-                elif total_price > 1.02:
+                elif float(total_price) > 1.02:
                     market_state = "OVERPRICED"
                     arbitrage_type = "Sell Arbitrage (prices sum > 1.0)"
                 else:
@@ -350,7 +350,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                 if deviation > 0.02:  # >2% deviation
                     logger.warning(
                         "ARBITRAGE SIGNAL: Price deviation detected in NegRisk event",
-                        event=event_title,
+                        event_title=event_title,
                         markets=len(valid_markets),
                         price_sum=f"{total_price:.4f}",
                         deviation_pct=f"{deviation_pct:.2f}%",
@@ -360,7 +360,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                 else:
                     logger.info(
                         "Auto-clustered NegRisk event (fair price)",
-                        event=event_title,
+                        event_title=event_title,
                         markets=len(valid_markets),
                         price_sum=f"{total_price:.4f}",
                         state=market_state,
