@@ -148,6 +148,14 @@ class WebLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
+class CancelledErrorFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info and issubclass(record.exc_info[0], asyncio.CancelledError):
+            return False
+        if "CancelledError" in str(getattr(record, 'message', '')) or "CancelledError" in str(record.msg):
+            return False
+        return True
+
 def setup_web_logging():
     """Attach the WebLogHandler to the polyquant root logger."""
     pq_logger = logging.getLogger("polyquant")
@@ -156,6 +164,11 @@ def setup_web_logging():
     handler.setFormatter(formatter)
     pq_logger.addHandler(handler)
     logger.info("Web logging handler attached to 'polyquant' logger")
+
+    # Silence Starlette/Uvicorn CancelledError tracebacks on shutdown
+    cancelled_filter = CancelledErrorFilter()
+    logging.getLogger("uvicorn.error").addFilter(cancelled_filter)
+    logging.getLogger("uvicorn.lifespan").addFilter(cancelled_filter)
 
 # Global instance
 monitor = Monitor()
