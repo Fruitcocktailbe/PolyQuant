@@ -13,8 +13,20 @@ export interface SystemState {
     logs: string[];
 }
 
-export const WS_URL = "ws://localhost:8000/ws";
-export const API_URL = "http://localhost:8000";
+const getApiHost = () => {
+    if (typeof window !== 'undefined') {
+        const hostname = window.location.hostname;
+        // If we're on a remote server, use that hostname
+        if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
+            return hostname;
+        }
+    }
+    return 'localhost';
+};
+
+const host = getApiHost();
+export const WS_URL = `ws://${host}:8000/ws`;
+export const API_URL = `http://${host}:8000`;
 
 type Listener = (state: SystemState) => void;
 

@@ -99,3 +99,13 @@ In the Lightsail Console, open the following **Inbound Ports**:
 
 > [!NOTE]
 > `sentence-transformers` is used for cross-exchange matching. The first time the Map Maker runs, it will download a small model (~80MB). This is normal.
+
+## 7. Troubleshooting: "Connection Refused"
+
+If you can't connect to the dashboard (localhost:5173):
+
+1. **Check if Vite is running**: Ensure Session 3 says `Local: http://localhost:5173/` and `Network: http://<internal-ip>:5173/`.
+2. **SSH Tunneling (Recommended)**: If you are accessing from your local machine, you MUST run this in a terminal on your computer:
+   `ssh -L 5173:localhost:5173 -L 8000:localhost:8000 ubuntu@your-lightsail-ip`
+   Then open `http://localhost:5173` in your browser.
+3. **Public IP Access**: If not using a tunnel, open `http://<your-lightsail-ip>:5173`. Ensure ports 5173 and 8000 are open in the Lightsail Firewall settings.
