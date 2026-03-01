@@ -115,7 +115,7 @@ class LimitlessClient:
         offset = 0
         
         while True:
-            res = await self._retry_request("GET", "/markets", params={
+            res = await self._retry_request("GET", "/v2/markets", params={
                 "limit": limit,
                 "offset": offset, 
                 "status": "active"

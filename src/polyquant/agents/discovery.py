@@ -454,7 +454,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                 raise ValueError("LLM returned empty response")
             
         except Exception as e:
-            logger.error(f"LLM clustering failed: {e}")
+            logger.warning(f"LLM clustering failed, falling back to manual groups: {e}")
             # Fallback: return all markets as a single cluster
             return [
                 MarketCluster(

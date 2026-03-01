@@ -103,8 +103,10 @@ class ExchangeMatcher:
         l_docs = [f"{m.get('title', '')} {m.get('description', '')}" for m in limit_markets]
 
         # Stage 2: Vector Embeddings (Dense Semantic Embeddings)
-        if not config.enable_semantic_matching:
-            logger.info("Stage 2/3: Semantic Matching DISABLED by config (saving resources). Returning Stage 1 results only.")
+        from polyquant.utils.llm_client import get_llm_client
+        if not config.enable_semantic_matching or get_llm_client() is None:
+            reason = "DISABLED by config" if not config.enable_semantic_matching else "LLM KEY MISSING"
+            logger.info(f"Stage 2/3: Semantic Matching skipped ({reason}). Returning Stage 1 results only.")
             return self.mapped_pairs
 
         logger.info("Stage 2: Loading Semantic Embedding Model (all-MiniLM-L6-v2)...")
