@@ -40,8 +40,8 @@ class RustClient:
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
         self._socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
         self._socket.setsockopt(zmq.LINGER, 0)
-        # Disable Nagle's algorithm for low-latency small messages
-        self._socket.setsockopt(zmq.TCP_NODELAY, 1)
+        # Disable Nagle's algorithm (not supported directly as zmq.TCP_NODELAY in some pyzmq versions)
+        # self._socket.setsockopt(zmq.TCP_NODELAY, 1)
         # Prevent OOM from malformed messages (1MB limit)
         self._socket.setsockopt(zmq.MAXMSGSIZE, 1_048_576)
 
