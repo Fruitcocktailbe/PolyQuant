@@ -21,6 +21,14 @@ source $HOME/.cargo/env
 
 # Install SCIP Optimization Suite (Pre-compiled for Ubuntu recommended)
 sudo apt install -y scip
+
+# Create a Swap File (Recommended for 2GB RAM instances)
+# This helps prevent out-of-memory errors during memory-intensive operations like Map Maker.
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
 ## 3. Project Setup
@@ -36,7 +44,8 @@ pip install -r requirements.txt
 
 # Create .env
 cp .env.example .env
-nano .env  # Add your API keys. POLYGON_PRIVATE_KEY can be empty for Paper Trading.
+nano .env  # Add your API keys. 
+# LOW-RAM TIP: If Map Maker hangs, add: ENABLE_SEMANTIC_MATCHING=false
 
 # Generate Market Map (REQUIRED before trading)
 # This scans for arbitrage clusters and local constraints.

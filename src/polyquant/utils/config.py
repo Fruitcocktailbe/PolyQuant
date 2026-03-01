@@ -306,6 +306,11 @@ class PolyQuantConfig(BaseSettings):
         ge=0.5, le=1.0,
         description="Upper zombie price threshold (reject extreme prices)"
     )
+    
+    enable_semantic_matching: bool = Field(
+        default=True,
+        description="Enable heavy AI-based semantic matching for cross-exchange arbitrage. Disable on low-RAM systems."
+    )
 
     # =========================================================================
     # LLM Configuration

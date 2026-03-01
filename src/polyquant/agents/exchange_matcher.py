@@ -103,15 +103,29 @@ class ExchangeMatcher:
         l_docs = [f"{m.get('title', '')} {m.get('description', '')}" for m in limit_markets]
 
         # Stage 2: Vector Embeddings (Dense Semantic Embeddings)
-        logger.info("Stage 2: Running Semantic Vector Embeddings (all-MiniLM-L6-v2) to find Top-3 neighbors...")
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        if not config.enable_semantic_matching:
+            logger.info("Stage 2/3: Semantic Matching DISABLED by config (saving resources). Returning Stage 1 results only.")
+            return self.mapped_pairs
+
+        logger.info("Stage 2: Loading Semantic Embedding Model (all-MiniLM-L6-v2)...")
+        logger.info("Note: This may take several minutes if the model is being downloaded for the first time.")
+        try:
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Semantic model loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load semantic model: {e}")
+            logger.warning("Proceeding with empty mappings due to model load failure.")
+            return self.mapped_pairs
         
         # Encode corpuses into semantic vectors
+        logger.info(f"Encoding {len(p_docs)} Polymarket and {len(l_docs)} Limitless document embeddings...")
         p_embeddings = model.encode(p_docs, convert_to_tensor=True)
         l_embeddings = model.encode(l_docs, convert_to_tensor=True)
         
         # Compute cosine similarity
+        logger.info("Computing similarity matrix...")
         similarity_matrix = util.cos_sim(p_embeddings, l_embeddings).cpu().numpy()
+        logger.info("Similarity matrix computed.")
         
         # Stage 3: LLM Semantic Verification
         logger.info("Stage 3: Verifying Top-N neighbors using LLM Semantic Matching (Concurrent Async)...")
