@@ -115,11 +115,24 @@ class LimitlessClient:
         offset = 0
         
         while True:
-            res = await self._retry_request("GET", "/v2/markets", params={
-                "limit": limit,
-                "offset": offset, 
-                "status": "active"
-            })
+            # Try /v1/markets first as it's common for v1/v2 transitions
+            path = "/v1/markets" if offset == 0 else "/v1/markets" 
+            try:
+                res = await self._retry_request("GET", path, params={
+                    "limit": limit,
+                    "offset": offset, 
+                    "status": "active"
+                })
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404 and path == "/v1/markets":
+                    # Fallback to base /markets
+                    res = await self._retry_request("GET", "/markets", params={
+                        "limit": limit,
+                        "offset": offset, 
+                        "status": "active"
+                    })
+                else:
+                    raise e
             data = res.json()
             batch = data.get("data", []) or data.get("markets", [])
             

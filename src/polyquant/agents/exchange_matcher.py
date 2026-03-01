@@ -83,15 +83,21 @@ class ExchangeMatcher:
             poly_markets, _ = await p_client.get_active_markets(limit=1000, min_liquidity=5000.0)
             
         limit_markets_raw = []
-        async with LimitlessClient() as l_client:
-            # Fetch all active markets via pagination
-            limit_markets_raw = await l_client.get_markets()
+        try:
+            async with LimitlessClient() as l_client:
+                # Fetch all active markets via pagination
+                limit_markets_raw = await l_client.get_markets()
+        except Exception as e:
+            logger.warning(f"Failed to fetch Limitless markets, skipping cross-exchange matching: {e}")
             
-        # Filter Limitless for decent liquidity/volume (e.g., > 1000 volume)
-        limit_markets = [
-            m for m in limit_markets_raw 
-            if float(m.get("volume", 0)) > 5000.0 or float(m.get("liquidity", 0)) > 5000.0
-        ]
+        # Filter Limitless for decent liquidity/volume (e.g., > 5000 volume)
+        limit_markets = []
+        for m in limit_markets_raw:
+            try:
+                if float(m.get("volume", 0)) > 5000.0 or float(m.get("liquidity", 0)) > 5000.0:
+                    limit_markets.append(m)
+            except (ValueError, TypeError):
+                continue
         
         logger.info(f"Stage 1 Complete: {len(poly_markets)} Polymarket | {len(limit_markets)} Limitless targets.")
         
