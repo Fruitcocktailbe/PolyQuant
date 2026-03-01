@@ -97,6 +97,9 @@ class PolymarketClient:
 
         # py-clob-client SDK (initialized once in __aenter__, reused for all orders)
         self._sdk_client: Any = None
+        
+        # WebSocket client for real-time updates
+        self._ws_client: Any = None
 
         # Rate limiting for CLOB order submission
         self._order_semaphore = asyncio.Semaphore(5)    # Max 5 concurrent orders
