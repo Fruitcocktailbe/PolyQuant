@@ -70,6 +70,7 @@ class ConstraintManifest(BaseModel):
     cluster_id: str
     topic: str = ""
     market_ids: list[str] = Field(default_factory=list)
+    market_exchanges: dict[str, str] = Field(default_factory=dict)  # market_id -> exchange
     constraints: list[StoredConstraint] = Field(default_factory=list)
     dependencies: list[StoredDependency] = Field(default_factory=list)
     correlations: list[Any] = Field(default_factory=list)

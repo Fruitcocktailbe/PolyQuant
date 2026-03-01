@@ -594,6 +594,85 @@ class PolymarketClient:
                 logger.error("Order placement failed", error=str(e), outcome_id=trade.outcome_id)
                 return {"status": "error", "reason": str(e)}
 
+    async def place_orders(self, trades: list[ProposedTrade]) -> list[dict[str, Any]]:
+        """
+        Place multiple orders on the CLOB using a single batch request to reduce latency.
+        """
+        if not self._sdk_client:
+            logger.error("CLOB SDK not initialized.")
+            return [{"status": "error", "reason": "sdk_not_initialized"}] * len(trades)
+
+        await self._order_rate_limit.acquire()
+        async with self._order_semaphore:
+            try:
+                from py_clob_client.order_builder.constants import BUY, SELL
+                from py_clob_client.clob_types import OrderType
+
+                order_type_map = {
+                    "FOK": OrderType.FOK,
+                    "FAK": OrderType.FOK,
+                    "GTC": OrderType.GTC,
+                    "GTD": OrderType.GTC,
+                }
+                # Use same order type for the batch based on the first trade
+                order_type = order_type_map.get(trades[0].time_in_force.value, OrderType.FOK)
+                sdk = self._sdk_client
+
+                # Create orders concurrently
+                async def make_order(t: ProposedTrade):
+                    side = BUY if t.side == OrderSide.BUY else SELL
+                    return await asyncio.to_thread(
+                        sdk.create_order,
+                        token_id=t.outcome_id,
+                        price=float(t.limit_price),
+                        size=float(t.size),
+                        side=side,
+                    )
+                    
+                orders = await asyncio.gather(*(make_order(t) for t in trades))
+
+                # Submit to CLOB (sync) — run in thread
+                # Assuming post_orders returns a list of responses
+                results = await asyncio.to_thread(sdk.post_orders, orders, order_type)
+                
+                # Make sure results is a list
+                if not isinstance(results, list):
+                    # Fallback if SDK returns a single dict with an array
+                    if isinstance(results, dict) and "result" in results:
+                         results = results["result"]
+                    else:
+                         results = [results] * len(trades)
+
+                parsed_results = []
+                for i, trade in enumerate(trades):
+                    res = results[i] if i < len(results) else {}
+                    
+                    logger.info(
+                        "Batch order submitted",
+                        order_id=res.get("orderID"),
+                        status=res.get("status"),
+                        outcome_id=trade.outcome_id,
+                        size=trade.size,
+                    )
+                    
+                    if res.get("error"):
+                         parsed_results.append({
+                             "status": "error",
+                             "reason": res.get("errorMsg", "Unknown error"),
+                         })
+                    else:
+                         parsed_results.append({
+                             "status": "submitted",
+                             "order_id": res.get("orderID"),
+                             "raw_response": res,
+                         })
+
+                return parsed_results
+
+            except Exception as e:
+                logger.error("Batch placement failed", error=str(e))
+                return [{"status": "error", "reason": str(e)}] * len(trades)
+
     async def cancel_all_orders(self) -> dict[str, Any]:
         """
         Cancel all open orders on the CLOB and verify cancellation.
@@ -636,6 +715,10 @@ class PolymarketClient:
             if not verified:
                 logger.critical(
                     "CANCEL VERIFICATION FAILED — orders may still be live on CLOB"
+                )
+                raise RuntimeError(
+                    "Cancel verification failed after 3 attempts — "
+                    "open orders may remain on CLOB. Manual intervention required."
                 )
 
             return {

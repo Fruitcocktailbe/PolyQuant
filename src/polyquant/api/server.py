@@ -38,7 +38,10 @@ class SystemState(BaseModel):
     kill_switch_active: bool = False
     active_positions: List[Dict[str, Any]] = []
     clusters: List[Dict[str, Any]] = []  # Discovered by MapMaker
+    mapped_pairs: List[Dict[str, Any]] = []  # Cross-exchange pairs from ExchangeMatcher
     opportunities: List[Dict[str, Any]] = []  # Detected by Navigator
+    trades_executed: List[Dict[str, Any]] = []  # Finalized fills
+    pipeline_stage: str = "IDLE"  # "IDLE", "DISCOVERY", "LOGIC", "MATCHING", "COMPLETE"
     logs: List[str] = []
 
 class Monitor:
@@ -88,6 +91,17 @@ class Monitor:
             # Fire-and-forget: don't block pipeline waiting for broadcasts
             asyncio.create_task(self.broadcast({"type": "state_update", "data": self.state.model_dump()}))
 
+    async def record_trade(self, fill: Dict[str, Any]):
+        """Record an executed trade and broadcast."""
+        # Add to state
+        self.state.trades_executed.append(fill)
+        # Keep last 50
+        if len(self.state.trades_executed) > 50:
+            self.state.trades_executed.pop(0)
+        
+        # Broadcast
+        asyncio.create_task(self.broadcast({"type": "state_update", "data": self.state.model_dump()}))
+
     async def log(self, message: str, level: str = "INFO"):
         """Append a log message and broadcast it."""
         log_entry = f"[{level}] {message}"
@@ -108,6 +122,40 @@ class Monitor:
     def reset_kill_switch(self):
         self.state.kill_switch_active = False
         logger.info("Kill switch reset")
+
+class WebLogHandler(logging.Handler):
+    """
+    Custom logging handler that routes logs to the Monitor.
+    """
+    def __init__(self, monitor_instance: Monitor):
+        super().__init__()
+        self.monitor = monitor_instance
+        # Don't log our own WebSocket broadcasts or we'll loop infinitely
+        self.addFilter(logging.Filter("polyquant.api.server"))
+        # Only allow info and above for the UI to save bandwidth
+        self.setLevel(logging.INFO)
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            msg = self.format(record)
+            # Use fire-and-forget task to avoid blocking the logging thread
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.monitor.log(msg, record.levelname))
+            except RuntimeError:
+                # No event loop running (e.g. during shutdown), just skip
+                pass
+        except Exception:
+            self.handleError(record)
+
+def setup_web_logging():
+    """Attach the WebLogHandler to the polyquant root logger."""
+    pq_logger = logging.getLogger("polyquant")
+    handler = WebLogHandler(monitor)
+    formatter = logging.Formatter("%(message)s")
+    handler.setFormatter(formatter)
+    pq_logger.addHandler(handler)
+    logger.info("Web logging handler attached to 'polyquant' logger")
 
 # Global instance
 monitor = Monitor()

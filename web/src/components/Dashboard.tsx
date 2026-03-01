@@ -1,9 +1,13 @@
-import { useEffect, useState, useMemo, useCallback, memo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, memo } from 'react';
+import {
+    LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer
+} from 'recharts';
+import { Cpu, Layers, Activity, Wifi, DollarSign } from 'lucide-react';
 import { api, SystemState } from '../services/api';
+import { PipelineMonitor } from './PipelineMonitor';
+import { TradeLog } from './TradeLog';
 import { LogTerminal } from './LogTerminal';
 import { KillSwitch } from './KillSwitch';
-import { Activity, Cpu, DollarSign, Wifi, Layers } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 // Memoized stat card to prevent re-renders
 const StatCard = memo<{ icon: React.ReactNode; label: string; value: string | number; color?: string; subValue?: string }>(
@@ -132,24 +136,35 @@ const ClusterCard = memo<{ cluster: any }>(({ cluster }) => (
 ));
 
 // Memoized Opportunity ticker
-const OpportunityCard = memo<{ opp: any }>(({ opp }) => (
-    <div className="p-3 bg-neon-purple/5 border-l-2 border-neon-purple mb-2 animate-in slide-in-from-right duration-300">
-        <div className="flex justify-between items-start mb-2">
-            <div>
-                <div className="text-[10px] font-bold text-white uppercase tracking-widest">Opportunity Detected</div>
-                <div className="text-[8px] text-gray-500 font-mono">{opp.cluster_id}</div>
-            </div>
-            <div className="text-neon-green font-mono font-bold text-sm">+${opp.profit.toFixed(2)}</div>
-        </div>
-        <div className="grid grid-cols-2 gap-2 mt-2">
-            {opp.trades && opp.trades.slice(0, 2).map((t: any, idx: number) => (
-                <div key={idx} className="text-[8px] font-mono text-gray-400 border border-white/5 p-1 bg-black/20">
-                    {t.side} {t.size} @ ${t.price}
+const OpportunityCard = memo<{ opp: any }>(({ opp }) => {
+    const isCrossExchange = opp.trades?.some((t: any) => t.exchange === 'limitless');
+    const badgeColor = isCrossExchange ? 'bg-neon-purple/20 text-neon-purple border-neon-purple/40' : 'bg-neon-cyan/20 text-neon-cyan border-neon-cyan/40';
+    const badgeLabel = isCrossExchange ? 'CROSS-EXCHANGE' : 'INTRA-MARKET';
+
+    return (
+        <div className={`p-3 border-l-2 mb-2 animate-in slide-in-from-right duration-300 ${isCrossExchange ? 'bg-neon-purple/5 border-neon-purple' : 'bg-neon-cyan/5 border-neon-cyan'}`}>
+            <div className="flex justify-between items-start mb-2">
+                <div>
+                    <div className="flex items-center gap-2 mb-1">
+                        <span className={`text-[7px] px-1 py-0.5 border font-bold uppercase tracking-tighter ${badgeColor}`}>
+                            {badgeLabel}
+                        </span>
+                    </div>
+                    <div className="text-[10px] font-bold text-white uppercase tracking-widest">Opportunity Detected</div>
+                    <div className="text-[8px] text-gray-500 font-mono">{opp.cluster_id}</div>
                 </div>
-            ))}
+                <div className="text-neon-green font-mono font-bold text-sm">+${opp.profit?.toFixed(2) || '0.00'}</div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+                {opp.trades && opp.trades.slice(0, 2).map((t: any, idx: number) => (
+                    <div key={idx} className="text-[8px] font-mono text-gray-400 border border-white/5 p-1 bg-black/20 truncate">
+                        {t.side} {t.size} @ ${t.price} <span className="opacity-50 text-[6px]">({t.exchange?.slice(0, 4)})</span>
+                    </div>
+                ))}
+            </div>
         </div>
-    </div>
-));
+    );
+});
 
 // Initial state constant (defined outside component to avoid recreation)
 const INITIAL_STATE: SystemState = {
@@ -160,7 +175,10 @@ const INITIAL_STATE: SystemState = {
     kill_switch_active: false,
     active_positions: [],
     clusters: [],
+    mapped_pairs: [],
     opportunities: [],
+    trades_executed: [],
+    pipeline_stage: 'IDLE',
     logs: [],
 };
 
@@ -168,6 +186,7 @@ export const Dashboard: React.FC = () => {
     const [state, setState] = useState<SystemState>(INITIAL_STATE);
     const [equityHistory, setEquityHistory] = useState<{ time: number; value: number }[]>([]);
     const [showRawData, setShowRawData] = useState(false);
+    const [activeTab, setActiveTab] = useState<'chart' | 'terminal'>('chart');
 
     // Stable callback for state updates
     const handleStateUpdate = useCallback((newState: SystemState) => {
@@ -201,38 +220,88 @@ export const Dashboard: React.FC = () => {
 
             <main className="flex-1 p-3 grid grid-cols-12 grid-rows-12 gap-3 overflow-hidden">
                 {/* Left Col: Logs & Activity */}
-                <div className="col-span-3 row-span-12 flex flex-col gap-3">
+                <div className="col-span-2 row-span-12 flex flex-col gap-3">
                     <div className="grid grid-cols-1 gap-3 h-auto">
                         <StatCard
                             icon={<Cpu className="w-3 h-3" />}
-                            label="Active Solvers"
+                            label="Solvers"
                             value={state.active_solvers}
                             color="text-neon-cyan"
                         />
                         <StatCard
                             icon={<Layers className="w-3 h-3" />}
-                            label="Clusters Mapped"
+                            label="Clusters"
                             value={state.clusters.length}
                             color="text-white"
                         />
                     </div>
-                    <div className="flex-1 min-h-0 bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col">
-                        <LogTerminal logs={state.logs} />
+                    <div className="flex-1 min-h-0 bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col p-4">
+                        <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-4">Quick Stats</div>
+                        <div className="space-y-4">
+                            <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                                <span className="text-[10px] text-gray-500">Pipeline</span>
+                                <span className="text-[10px] text-neon-cyan font-mono">{state.pipeline_stage}</span>
+                            </div>
+                            <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                                <span className="text-[10px] text-gray-500">Opportunities</span>
+                                <span className="text-[10px] text-white font-mono">{state.opportunities.length}</span>
+                            </div>
+                            <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                                <span className="text-[10px] text-gray-500">Trades</span>
+                                <span className="text-[10px] text-neon-green font-mono">{state.trades_executed.length}</span>
+                            </div>
+                        </div>
+                        <div className="mt-auto pt-4 border-t border-white/5">
+                            <div className="text-[8px] text-gray-600 font-mono">SYSTEM_ID: PQ-V2-MAIN</div>
+                        </div>
                     </div>
                 </div>
 
                 {/* Center Col: Equity & Risk */}
                 <div className="col-span-6 row-span-12 flex flex-col gap-3">
-                    <EquityChart data={equityHistory} />
-                    <div className="h-48">
-                        <KillSwitch active={state.kill_switch_active} />
+                    <div className="flex-[0.65] flex flex-col min-h-0">
+                        {['DISCOVERY', 'LOGIC', 'MATCHING'].includes(state.pipeline_stage) ? (
+                            <PipelineMonitor stage={state.pipeline_stage} mappedPairs={state.mapped_pairs} />
+                        ) : (
+                            <div className="flex-1 flex flex-col min-h-0">
+                                <div className="flex h-10 border-b border-white/5 bg-black/20">
+                                    <button
+                                        onClick={() => setActiveTab('chart')}
+                                        className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'chart' ? 'border-neon-cyan text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+                                    >
+                                        EQUITY_CURVE
+                                    </button>
+                                    <button
+                                        onClick={() => setActiveTab('terminal')}
+                                        className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'terminal' ? 'border-neon-purple text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+                                    >
+                                        SYSTEM_TERMINAL
+                                    </button>
+                                </div>
+                                <div className="flex-1 min-h-0">
+                                    {activeTab === 'chart' ? (
+                                        <EquityChart data={equityHistory} />
+                                    ) : (
+                                        <div className="h-full bg-charcoal/50 border border-white/5 border-t-0 backdrop-blur-sm">
+                                            <LogTerminal logs={state.logs} />
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                    <div className="flex-[0.35] min-h-0 flex flex-col gap-3">
+                        <TradeLog trades={state.trades_executed} />
+                        <div className="h-20 shrink-0">
+                            <KillSwitch active={state.kill_switch_active} />
+                        </div>
                     </div>
                 </div>
 
                 {/* Right Col: Discovery & Reasoning Feed */}
-                <div className="col-span-3 row-span-12 flex flex-col gap-3 overflow-hidden">
+                <div className="col-span-4 row-span-12 flex flex-col gap-3 overflow-hidden">
                     {/* Top: Discovered Clusters (MapMaker Output) */}
-                    <div className="flex-[0.4] bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
+                    <div className="flex-[0.3] bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
                         <div className="p-3 border-b border-white/5 bg-black/20 flex justify-between items-center">
                             <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em]">
                                 Knowledge Map
@@ -253,34 +322,53 @@ export const Dashboard: React.FC = () => {
                         </div>
                     </div>
 
-                    {/* Bottom: Live Opportunities (Navigator Output) */}
-                    <div className="flex-[0.6] bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
-                        <div className="p-3 border-b border-white/5 bg-black/20 flex justify-between items-center">
-                            <h3 className="text-[10px] font-bold text-neon-purple uppercase tracking-[0.2em]">
-                                Strategy Ticker
-                            </h3>
-                            <div className="px-2 py-0.5 bg-neon-purple/10 text-neon-purple text-[8px] font-mono border border-neon-purple/20">
-                                NAVIGATOR
+                    {/* Bottom: Live Opportunities (Navigator Output) - SPLIT INTO 2 COLUMNS */}
+                    <div className="flex-[0.7] flex flex-col gap-3 min-h-0 relative">
+                        <div className="flex-1 grid grid-cols-2 gap-3 min-h-0">
+                            {/* Intra-Market Arbitrage */}
+                            <div className="bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
+                                <div className="p-2 border-b border-white/5 bg-black/40 flex justify-between items-center">
+                                    <h3 className="text-[9px] font-bold text-neon-cyan uppercase tracking-widest truncate">INTRA-MARKET</h3>
+                                </div>
+                                <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
+                                    {state.opportunities.filter(o => !o.trades?.some((t: any) => t.exchange === 'limitless')).length === 0 && (
+                                        <div className="text-center text-[8px] text-gray-600 font-mono mt-10">Scanning...</div>
+                                    )}
+                                    {[...state.opportunities]
+                                        .filter(o => !o.trades?.some((t: any) => t.exchange === 'limitless'))
+                                        .reverse()
+                                        .map((opp, idx) => (
+                                            <OpportunityCard key={idx} opp={opp} />
+                                        ))}
+                                </div>
+                            </div>
+
+                            {/* Cross-Exchange Arbitrage */}
+                            <div className="bg-charcoal/50 border border-white/5 backdrop-blur-sm flex flex-col min-h-0 relative overflow-hidden">
+                                <div className="p-2 border-b border-white/5 bg-black/40 flex justify-between items-center">
+                                    <h3 className="text-[9px] font-bold text-neon-purple uppercase tracking-widest truncate">CROSS-EXCHANGE</h3>
+                                </div>
+                                <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
+                                    {state.opportunities.filter(o => o.trades?.some((t: any) => t.exchange === 'limitless')).length === 0 && (
+                                        <div className="text-center text-[8px] text-gray-600 font-mono mt-10">Searching pairs...</div>
+                                    )}
+                                    {[...state.opportunities]
+                                        .filter(o => o.trades?.some((t: any) => t.exchange === 'limitless'))
+                                        .reverse()
+                                        .map((opp, idx) => (
+                                            <OpportunityCard key={idx} opp={opp} />
+                                        ))}
+                                </div>
                             </div>
                         </div>
-                        <div className="flex-1 overflow-y-auto p-3 custom-scrollbar">
-                            {state.opportunities.length === 0 && (
-                                <div className="text-center text-[10px] text-gray-600 font-mono mt-10">
-                                    Scanning for arbitrage...
-                                </div>
-                            )}
-                            {[...state.opportunities].reverse().map((opp, idx) => (
-                                <OpportunityCard key={idx} opp={opp} />
-                            ))}
-                        </div>
 
-                        <div className="border-t border-white/5 p-2 bg-black/20 mt-auto">
+                        <div className="shrink-0 p-1 flex justify-center border-t border-white/5 bg-black/20">
                             <button
                                 onClick={() => setShowRawData(!showRawData)}
-                                className="text-[10px] text-gray-500 hover:text-neon-cyan transition-colors flex items-center gap-1 uppercase tracking-tighter w-full justify-center"
+                                className="text-[9px] text-gray-500 hover:text-neon-cyan transition-colors flex items-center gap-1 uppercase tracking-tighter"
                             >
                                 <Layers className="w-2 h-2" />
-                                {showRawData ? 'Hide Debug' : 'Show Debug'}
+                                DEBUG_MODE
                             </button>
                         </div>
                     </div>

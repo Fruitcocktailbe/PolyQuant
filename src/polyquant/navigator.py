@@ -33,7 +33,15 @@ import json
 import time
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING, Dict, List, Set, Union, Tuple
+
+if TYPE_CHECKING:
+    from polyquant.execution.executor import TradeExecutor
+    from polyquant.execution.rust_client import RustClient
+    from polyquant.data.constraint_store import ConstraintManifest
+    from polyquant.data import OrderBook
+    from polyquant.agents.bayesian_updater import BayesianUpdater
+    from polyquant.agents.correlation import CorrelationEngine
 
 from polyquant.data import OrderBook
 from polyquant.data.constraint_store import ConstraintStore, ConstraintManifest
@@ -44,7 +52,7 @@ from polyquant.agents import MicrostructureAgent
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
 from polyquant.data.trade_store import TradeStore
-from polyquant.api.server import monitor, app, set_trade_store
+from polyquant.api.server import monitor, app, set_trade_store, setup_web_logging
 from polyquant.utils import config, get_logger
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
 import uvicorn
@@ -138,7 +146,7 @@ class ExecutionGuard:
     def __init__(self):
         """Initialize the ExecutionGuard."""
         self._manifests: dict[str, ConstraintManifest] = {}
-        self._constraint_matrix: dict[str, Any] = {}  # Pre-computed matrix
+        self._constraint_matrix: dict[str, list[dict[str, Any]]] = {}  # Pre-computed matrix
         
         logger.info("ExecutionGuard initialized")
     
@@ -158,12 +166,13 @@ class ExecutionGuard:
                     if outcome_id not in self._constraint_matrix:
                         self._constraint_matrix[outcome_id] = []
                     
-                    data_item: dict[str, Any] = {
-                        "constraint_id": constraint.constraint_id,
-                        "coefficient": coeff,
-                        "rhs": constraint.rhs,
+                    # Use local variable for data dictionary to help inference
+                    matrix_entry: dict[str, Any] = {
+                        "constraint_id": str(constraint.constraint_id),
+                        "coefficient": float(coeff),
+                        "rhs": float(constraint.rhs),
                     }
-                    self._constraint_matrix[outcome_id].append(data_item)
+                    self._constraint_matrix[outcome_id].append(matrix_entry)
         
         logger.info(
             "Loaded manifests into ExecutionGuard",
@@ -346,8 +355,10 @@ class Navigator:
         self._microstructure_agent: MicrostructureAgent | None = None
         self._trade_store: TradeStore | None = None
         self._limitless: LimitlessClient | None = None
-        self._balance_refresh_task: asyncio.Task | None = None
-        self._trade_executor: TradeExecutor | None = None
+        self._balance_refresh_task: Optional[asyncio.Task] = None
+        self._trade_executor: Optional['TradeExecutor'] = None
+        self._rust_client: Optional['RustClient'] = None
+        self._limitless_polling_task: Optional[asyncio.Task] = None
 
         # Arbitrage improvement modules
         self._bayesian_updater = None   # BayesianUpdater (phantom arb prevention)
@@ -370,6 +381,10 @@ class Navigator:
         self._mock_task: asyncio.Task | None = None
         self._ws_update_callback: Any | None = None
 
+        # Hot-reloading attributes
+        self._hot_reload_task: asyncio.Task | None = None
+        self._loaded_cluster_ids: set[str] = set()
+
         logger.info("Navigator initialized")
     
     async def __aenter__(self) -> "Navigator":
@@ -380,25 +395,29 @@ class Navigator:
         config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
         server = uvicorn.Server(config_uv)
         self._server_task = asyncio.create_task(server.serve())
+        setup_web_logging()
         await monitor.update_status(status="STARTING")
         
         # Initialize Polymarket client
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
-
-        # Initialize Limitless client
-        self._limitless = LimitlessClient()
+        # Limitless execution moved to Rust - purely Polymarket for market data now
+        # self._limitless = LimitlessClient() # Legacy removed (Phase 2 & 3)
 
         # Initialize TradeStore for persistent execution logs
         self._trade_store = TradeStore()
         set_trade_store(self._trade_store)
         
-        # Initialize TradeExecutor with dual-chain clients
+        # Initialize ZMQ IPC Client
+        from polyquant.execution.rust_client import RustClient
+        self._rust_client = RustClient()
+        
+        # Initialize TradeExecutor with Rust execution sidecar
         from polyquant.execution.executor import TradeExecutor
         self._trade_executor = TradeExecutor(
-            client=self._polymarket,
-            limitless_client=self._limitless,
-            trade_store=self._trade_store
+            rust_client=self._rust_client,
+            trade_store=self._trade_store,
+            paper_mode=(config.trading_mode == "paper")
         )
         
         # Load constraint store
@@ -462,46 +481,146 @@ class Navigator:
         """Background loop to keep internal balances fresh (Rule 1)."""
         while self._is_running:
             try:
+                executor = self._trade_executor
+                if not executor:
+                    await asyncio.sleep(5)
+                    continue
+
                 # 1. Fetch Poly balance (USDC on Polygon)
-                if self._polymarket:
-                    poly_bal = await self._polymarket.get_usdc_balance()
-                    if self._trade_executor:
-                        self._trade_executor.poly_balance = Decimal(str(poly_bal))
+                poly_client = self._polymarket
+                if poly_client:
+                    poly_bal = await poly_client.get_usdc_balance()
+                    executor.poly_balance = Decimal(str(poly_bal))
                 
                 # 2. Fetch Base balance (USDC on Base)
-                if self._limitless:
-                    base_bal = await self._limitless.get_usdc_balance()
-                    if self._trade_executor:
-                        self._trade_executor.base_balance = Decimal(str(base_bal))
+                limitless_client = self._limitless
+                if limitless_client:
+                    base_bal = await limitless_client.get_usdc_balance()
+                    executor.base_balance = Decimal(str(base_bal))
                 
                 logger.debug(
                     "Balance refreshed", 
-                    poly=self._trade_executor.poly_balance if self._trade_executor else 0,
-                    base=self._trade_executor.base_balance if self._trade_executor else 0
+                    poly=executor.poly_balance,
+                    base=executor.base_balance
                 )
             except Exception as e:
                 logger.error("Failed to refresh balances", error=str(e))
             
             await asyncio.sleep(60) # Refresh every minute
     
+    async def _hot_reload_loop(self) -> None:
+        """Background loop to dynamically load new markets from ConstraintStore."""
+        while self._is_running:
+            try:
+                await asyncio.sleep(60) # Modest polling interval
+                
+                if not self._store or not self._guard:
+                    continue
+                    
+                current_clusters = await self._store.list_clusters()
+                new_clusters = [cid for cid in current_clusters if cid not in self._loaded_cluster_ids]
+                
+                if new_clusters:
+                    logger.info(f"Hot-reloading {len(new_clusters)} new market clusters...")
+                    
+                    new_market_ids = []
+                    new_manifests = []
+                    
+                    for cid in new_clusters:
+                        manifest = await self._store.load_manifest(cid)
+                        if manifest:
+                            new_market_ids.extend(manifest.market_ids)
+                            new_manifests.append(manifest)
+                            
+                    if not new_market_ids:
+                        continue
+                        
+                    # Fetch initial books for new markets
+                    new_books = await self._fetch_order_books(new_market_ids)
+                    for token_id, book in new_books.items():
+                        if self._price_cache:
+                            await self._price_cache.update(token_id, book)
+                        
+                    # Subscribe to WebSockets
+                    token_ids = list(new_books.keys())
+                    if self._polymarket and hasattr(self._polymarket, "ws_client") and self._polymarket.ws_client:
+                        logger.info(f"Subscribing to {len(token_ids)} new tokens via WebSocket")
+                        await self._polymarket.ws_client.subscribe(
+                            token_ids,
+                            self._ws_update_callback
+                        )
+                        
+                    # Inject into guard
+                    guard = self._guard
+                    if guard is not None:
+                        guard.load_manifests(new_manifests)
+                    
+                    # Update local state
+                    self._loaded_cluster_ids.update(new_clusters)
+                    logger.info(f"Successfully hot-reloaded {len(new_clusters)} clusters.")
+                    
+            except Exception as e:
+                logger.error("Failed to hot-reload markets", error=str(e))
+
+    async def _limitless_polling_loop(self, token_ids: list[str]) -> None:
+        """
+        Background task to poll Limitless for order books, as they don't have WS.
+        """
+        if not self._limitless:
+            return
+            
+        logger.info(f"Limitless polling loop active for {len(token_ids)} tokens")
+        while self._is_running:
+            try:
+                # Fetch books sequentially to avoid hammering the beta API
+                for token_id in token_ids:
+                    if not self._is_running:
+                        break
+                        
+                    ob = await self._limitless.get_order_book(token_id)
+                    if ob:
+                        # Feed the price cache so the main event loop wakes up
+                        await self._price_cache.update(token_id, ob)
+                        
+                # Wait 1s between full passes
+                await asyncio.sleep(1.0)
+                
+            except Exception as e:
+                logger.error("Limitless polling loop encountered error", error=str(e))
+                await asyncio.sleep(5.0) # Back off on error
+
     async def __aexit__(self, *args: Any) -> None:
         """Cleanup all components."""
         logger.info("Shutting down Navigator...")
         
         self._is_running = False
 
-        if self._balance_refresh_task:
+        if self._balance_refresh_task is not None:
             self._balance_refresh_task.cancel()
             try:
                 await self._balance_refresh_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
+                pass
+                
+        if self._hot_reload_task is not None:
+            self._hot_reload_task.cancel()
+            try:
+                await self._hot_reload_task
+            except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._server_task:
+        if self._server_task is not None:
             self._server_task.cancel()
             try:
                 await self._server_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if hasattr(self, "_limitless_polling_task") and self._limitless_polling_task is not None:
+            self._limitless_polling_task.cancel()
+            try:
+                await self._limitless_polling_task
+            except (asyncio.CancelledError, Exception):
                 pass
 
         if self._trade_store:
@@ -512,6 +631,13 @@ class Navigator:
             
         if self._price_cache:
             self._price_cache.clear()
+            
+        if hasattr(self, "_limitless_polling_task") and self._limitless_polling_task:
+            self._limitless_polling_task.cancel()
+            try:
+                await self._limitless_polling_task
+            except asyncio.CancelledError:
+                pass
         
         logger.info(
             "Navigator shutdown complete",
@@ -552,6 +678,9 @@ class Navigator:
             manifest = await self._store.load_manifest(cluster_id)
             if manifest:
                 market_ids.extend(manifest.market_ids)
+                
+        # Initialize the set of loaded clusters
+        self._loaded_cluster_ids = set(cluster_ids)
         
         if not market_ids:
             logger.warning("No markets found in manifests")
@@ -559,17 +688,30 @@ class Navigator:
         
         logger.info(f"Monitoring {len(market_ids)} markets")
         
+        # Start hot-reload task
+        self._hot_reload_task = asyncio.create_task(self._hot_reload_loop())
+        
         # 1. Initial snapshot fetch (to populate cache before WS takes over)
         logger.info("Fetching initial order book snapshots...")
         initial_books = await self._fetch_order_books(market_ids)
         for token_id, book in initial_books.items():
             await self._price_cache.update(token_id, book)
             
-        # 2. Subscribe to WebSocket updates
+        # 2. Subscribe to WebSocket updates and set up polling
         # We need token IDs, not market IDs, for subscription
         token_ids = list(initial_books.keys())
-        if self._polymarket and token_ids:
-            logger.info(f"Subscribing to {len(token_ids)} tokens via WebSocket")
+        poly_tokens = []
+        limitless_tokens = []
+        
+        # Sort out tokens by exchange for proper ingestion
+        for token_id in token_ids:
+            if "_" in token_id and not token_id.startswith("0x"):
+                limitless_tokens.append(token_id)
+            else:
+                poly_tokens.append(token_id)
+                
+        if self._polymarket and poly_tokens:
+            logger.info(f"Subscribing to {len(poly_tokens)} tokens via WebSocket")
             # Create WS client if not exists (it should be in PolymarketClient)
             # For now, simplistic access
             if not getattr(self._polymarket, "ws_client", None):
@@ -579,13 +721,22 @@ class Navigator:
                  await self._polymarket.ws_client.connect()
             
             await self._polymarket.ws_client.subscribe(
-                token_ids, 
+                poly_tokens, 
                 self._ws_update_callback
             )
             
-        # 3. Main Event Loop
+        # 3. Limitless REST Polling Task (since no WS exists yet)
+        if hasattr(self, "_limitless") and self._limitless and limitless_tokens:
+             logger.info(f"Starting background REST polling for {len(limitless_tokens)} Limitless tokens")
+             self._limitless_polling_task = asyncio.create_task(
+                 self._limitless_polling_loop(limitless_tokens)
+             )
+            
+        # 4. Main Event Loop
         tick_count = 0
-        while self._is_running and (max_ticks is None or tick_count < max_ticks):
+        while self._is_running:
+            if max_ticks is not None and tick_count >= max_ticks:
+                break
             # Event-driven architecture: Wait for price updates instead of polling
             # This saves ~5ms per tick and eliminates CPU waste
             await self._price_cache.wait_for_update()
@@ -596,13 +747,11 @@ class Navigator:
             if self._polymarket and hasattr(self._polymarket, 'ws_client'):
                 # HFT LATENCY SHIELD: We cannot trade on stale data.
                 # If the websocket has not received a price update across any market
-                # within 1.0 second, we consider the internal orderbook state toxic.
-                if not ws_client.is_connection_healthy(max_age_seconds=1.0):
-                    connection_age = ws_client.get_connection_age()
+                # within the configured timeframe (default 200ms), we consider internal orderbook state toxic.
+                if not self._polymarket.is_ws_healthy(max_age_seconds=config.ws_max_age_ms / 1000.0):
                     logger.warning(
                         "Trading blocked: Stale WebSocket connection",
-                        connection_age_seconds=connection_age,
-                        reason="No price updates received for >1.0 seconds"
+                        reason=f"No price updates received for >{config.ws_max_age_ms}ms"
                     )
                     # Feed to kill switch as potential issue
                     if self._kill_switch:
@@ -644,12 +793,14 @@ class Navigator:
                 detect_elapsed = (datetime.utcnow() - detect_start).total_seconds() * 1000
                 self._latency_tracker.record_tick_to_decision(detect_elapsed)
 
-                # Execute trades
+                # Execute trades — pass detection timestamp for staleness checks
                 if opportunities:
                     exec_start = datetime.utcnow()
+                    # Stamp at price observation time, not dispatch time
+                    signal_ts_us = int(detect_start.timestamp() * 1_000_000)
 
                     for opp in opportunities:
-                        await self._execute_opportunity(opp)
+                        await self._execute_opportunity(opp, signal_timestamp_us=signal_ts_us)
 
                     # Record decision-to-execution latency
                     exec_elapsed = (datetime.utcnow() - exec_start).total_seconds() * 1000
@@ -683,6 +834,10 @@ class Navigator:
                         tick=tick_count,
                         **stats,
                     )
+
+                # Balance reconciliation heartbeat (every 500 ticks)
+                if tick_count % 500 == 0 and self._trade_executor:
+                    await self._reconcile_balances()
                 
             except Exception as e:
                 logger.error("Tick failed", error=str(e))
@@ -692,15 +847,30 @@ class Navigator:
     async def _fetch_order_books(
         self,
         market_ids: list[str],
+        market_exchanges: Optional[dict[str, str]] = None,
     ) -> dict[str, OrderBook]:
         """Fetch order books for all markets."""
         if not self._polymarket:
             return {}
+            
+        market_exchanges = market_exchanges or {}
 
         results = {}
         # Simple implementation: fetch one by one
         # In production, we'd use WebSocket updates
         for mid in market_ids:
+            exchange_info = market_exchanges.get(mid, "polymarket")
+            if exchange_info.startswith("limitless"):
+                if getattr(self, "_limitless", None):
+                    # Limitless outcome IDs are just mid_0 and mid_1
+                    ob0 = await self._limitless.get_order_book(f"{mid}_0")
+                    ob1 = await self._limitless.get_order_book(f"{mid}_1")
+                    if ob0:
+                        results[f"{mid}_0"] = ob0
+                    if ob1:
+                        results[f"{mid}_1"] = ob1
+                continue
+                
             # We need the outcomes to get token_ids
             # This is slow, but better than nothing for now
             # TODO: Cache market objects to avoid re-fetching metadata
@@ -786,14 +956,13 @@ class Navigator:
                             )
 
                 # 2. Bayesian price adjustment (phantom arb prevention)
-                if self._bayesian_updater:
+                bayesian = self._bayesian_updater
+                if bayesian is not None:
                     cluster_prices = {
                         tid: current_mid_prices.get(tid, 0.0)
                         for tid in books
                     }
-                    adjusted_prices, adjustments = (
-                        self._bayesian_updater.adjust_prices(cluster_prices)
-                    )
+                    adjusted_prices, adjustments = bayesian.adjust_prices(cluster_prices)
                     if adjustments:
                         for adj in adjustments:
                             logger.debug(adj.reason)
@@ -835,8 +1004,9 @@ class Navigator:
                     
                     # Update monitor
                     from polyquant.api.server import monitor
+                    last_opps = opportunities[-10:] if opportunities else []
                     asyncio.create_task(monitor.update_status(
-                        opportunities=opportunities[-10:]
+                        opportunities=last_opps
                     ))
 
             except Exception as e:
@@ -847,10 +1017,11 @@ class Navigator:
                 )
 
         # ── Correlation-based signals (cross-cluster, after constraint detection) ──
-        if (self._correlation_engine and
+        correlation = self._correlation_engine
+        if (correlation is not None and
             self._previous_prices and current_mid_prices):
             try:
-                corr_signals = self._correlation_engine.check_for_signals(
+                corr_signals = correlation.check_for_signals(
                     current_prices=current_mid_prices,
                     previous_prices=self._previous_prices,
                 )
@@ -872,17 +1043,80 @@ class Navigator:
 
         return opportunities
     
-    async def _execute_opportunity(self, opportunity: Any) -> None:
-        """Execute a trading opportunity."""
+    async def _reconcile_balances(self) -> None:
+        """Periodic on-chain balance check to detect drift from local state."""
+        try:
+            drift_threshold = Decimal("1.0")  # $1 drift triggers warning
+            executor = self._trade_executor
+            if not executor:
+                return
+
+            # Polymarket USDC balance
+            if hasattr(self, "_polymarket") and self._polymarket:
+                on_chain_poly = await self._polymarket.get_balance()
+                local_poly = executor.poly_balance
+                poly_drift = abs(on_chain_poly - local_poly)
+                if poly_drift > drift_threshold:
+                    logger.warning(
+                        "BALANCE DRIFT: Polymarket",
+                        on_chain=float(on_chain_poly),
+                        local=float(local_poly),
+                        drift=float(poly_drift),
+                    )
+                    # Auto-correct to on-chain truth
+                    executor.poly_balance = on_chain_poly
+
+            # Limitless USDC balance
+            if hasattr(self, "_limitless") and self._limitless:
+                on_chain_base = await self._limitless.get_usdc_balance()
+                local_base = executor.base_balance
+                base_drift = abs(on_chain_base - local_base)
+                if base_drift > drift_threshold:
+                    logger.warning(
+                        "BALANCE DRIFT: Limitless",
+                        on_chain=float(on_chain_base),
+                        local=float(local_base),
+                        drift=float(base_drift),
+                    )
+                    executor.base_balance = on_chain_base
+
+        except Exception as e:
+            logger.debug("Balance reconciliation skipped", error=str(e))
+
+    async def _execute_opportunity(self, opportunity: Any, signal_timestamp_us: int = 0) -> None:
+        """Execute a trading opportunity.
+
+        Args:
+            opportunity: The detected arbitrage opportunity.
+            signal_timestamp_us: Microsecond timestamp of when the price signal
+                was first observed (for Rust-side staleness rejection).
+        """
         # TODO: Implement trade execution
         self._opportunities_found += 1
         logger.info("Would execute opportunity", opportunity=opportunity)
     
     def _on_kill_switch_trigger(self, event: Any) -> None:
-        """Handle kill switch trigger."""
-        logger.critical("KILL SWITCH TRIGGERED")
+        """Handle kill switch trigger — halt Rust sidecar and block until ACK."""
+        logger.critical("KILL SWITCH TRIGGERED — halting Rust OMS")
         monitor.trigger_kill_switch()
         self._is_running = False
+
+        # Send halt to Rust sidecar and BLOCK until acknowledged
+        rust_client = self._rust_client
+        if rust_client is not None:
+            reason = f"kill_switch: {event.reason.value}" if hasattr(event, "reason") else "kill_switch: unknown"
+            resp = None
+            for attempt in range(3):
+                try:
+                    resp = rust_client.send_halt(reason=reason)
+                    if resp and resp.get("status") == "halted":
+                        logger.info("Rust OMS confirmed HALTED", attempt=attempt + 1)
+                        break
+                    logger.warning(f"Halt ACK unexpected: {resp}, retrying...")
+                except Exception as e:
+                    logger.error(f"Halt attempt {attempt + 1} failed: {e}")
+            if not resp or resp.get("status") != "halted":
+                logger.critical("RUST OMS DID NOT ACK HALT after 3 attempts — sidecar may still be executing!")
 
 
 async def main() -> None:

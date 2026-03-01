@@ -12,13 +12,22 @@ PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage oppo
 
 ## 🏗️ Architecture
 
+PolyQuant 2.0 uses a **hybrid architecture** combining Python's high-level reasoning with Rust's low-level execution speed.
+
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Discovery  │ -> │  Map Maker  │ -> │  Validator  │ -> │ Navigator   │ -> │  Execution  │
-│   Agent     │    │(Correlation)│    │ (Reasoning) │    │ (Micro-     │    │  (SCIP/HFT) │
-│(Gemini 2.0) │    │(Logic Arch) │    │(Thinking)   │    │  structure) │    │             │
+│  Discovery  │ -> │  Map Maker  │ -> │  Validator  │ -> │ Navigator   │ -> │  OMS Sidecar│
+│   Agent     │    │(Correlation)│    │ (Reasoning) │    │ (Fast Brain)│    │   (Rust)    │
+│(Gemini 2.0) │    │(Logic Arch) │    │(Thinking)   │    │  (Python)   │    │(Execution)  │
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+       ^                                                        |                  |
+       └─────────────────────────── manifests ──────────────────┘                  v
+                                                                            Polymarket/Limitless
 ```
+
+- **Python (Intelligence)**: Handles market discovery, LLM-based reasoning, and real-time arbitrage detection.
+- **Rust (Execution)**: A dedicated Order Management System (OMS) sidecar that handles signing, submission, and multi-exchange connectivity with <10ms overhead.
+- **Web UI (Monitoring)**: A React/Vite dashboard for real-time monitoring and manual overrides (KillSwitch).
 
 ## 📁 Project Structure
 
@@ -26,38 +35,18 @@ PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage oppo
 polyquant/
 ├── src/
 │   ├── agents/              # AI Agent implementations
-│   │   ├── discovery.py     # Phase 1: Market scanner (Gemini 2.0 Flash)
-│   │   ├── logic_architect.py # Phase 2: Dependency detection (Thinking)
-│   │   ├── validator.py     # Phase 3: Constraint verification (Thinking)
-│   │   ├── correlation.py   # NEW: Statistical relationship mapping
-│   │   └── microstructure.py # NEW: Real-time order book analysis
-│   ├── solver/              # Optimization engine
-│   │   ├── __init__.py
-│   │   ├── bregman.py       # Bregman projection algorithm
-│   │   └── scip_solver.py   # SCIP integer programming
-│   ├── executor/            # Trade execution (Rust)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── main.rs
-│   │       ├── websocket.rs
-│   │       └── order_manager.rs
+│   ├── solver/              # Optimization engine (SCIP/FW)
+│   ├── api/                 # Monitoring API (FastAPI)
 │   ├── data/                # Data layer
-│   │   ├── __init__.py
-│   │   ├── polymarket_client.py
-│   │   └── market_models.py
-│   ├── risk/                # Risk management
-│   │   ├── __init__.py
-│   │   ├── position_sizing.py
-│   │   └── kill_switch.py
-│   └── utils/               # Shared utilities
-│       ├── __init__.py
-│       ├── config.py
-│       └── logging_config.py
-├── tests/                   # Test suite
-├── docs/                    # Documentation
-├── .env.example             # Environment variables template
-├── pyproject.toml           # Python dependencies
-├── requirements.txt         # Pip requirements
+│   ├── risk/                # Risk (KillSwitch/PositionSizer)
+│   └── utils/               # Config/Logging
+├── oms-sidecar/             # [NEW] Rust Execution Engine
+│   ├── src/                 # Multi-exchange execution logic
+│   └── Cargo.toml           # Optimized binary build
+├── web/                     # [NEW] React/Vite Dashboard
+│   └── src/components/      # PipelineMonitor, KillSwitch, LogTerminal
+├── manifests/               # Pre-computed market logic files
+├── .env                     # Centralized configuration
 └── README.md
 ```
 
@@ -83,9 +72,13 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Build Rust executor
-cd src/executor
+# Build Rust OMS sidecar
+cd oms-sidecar
 cargo build --release
+
+# Install Web dependencies
+cd ../web
+npm install
 ```
 
 ### Configuration
@@ -100,12 +93,25 @@ cp .env.example .env
 # - ALCHEMY_API_KEY
 ```
 
-### Running
+### Running the System
 
-```bash
-# Start the agent swarm
-python -m polyquant.main
+1. **Start the OMS Sidecar**:
+   ```bash
+   cd oms-sidecar
+   cargo run --release
+   ```
 
+2. **Run the Agent Swarm**:
+   ```bash
+   # In a new terminal
+   python -m polyquant.main trade
+   ```
+
+3. **Launch the Dashboard**:
+   ```bash
+   cd web
+   npm run dev
+   ```
 # Or run individual agents
 python -m polyquant.agents.discovery
 ```
@@ -114,10 +120,11 @@ python -m polyquant.agents.discovery
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `EXTRACTION_ALPHA` | Target extraction efficiency | 0.9 (90%) |
-| `MAX_DRAWDOWN` | Kill switch threshold | 0.15 (15%) |
-| `ORDERBOOK_DEPTH_CAP` | Position size limit | 0.5 (50%) |
-| `LATENCY_TARGET_MS` | Max decision-to-mempool | 30 |
+| `MIN_LIQUIDITY` | Minimum market liquidity (USD) | 1000.0 |
+| `LLM_TEMPERATURE` | Global agent reasoning temp | 0.0 |
+| `SCIP_GAP` | Solver optimality precision | 0.001 |
+| `MIN_PROFIT_THRESHOLD` | Execute if profit > X | 0.05 |
+| `MAX_DRAWDOWN` | Emergency kill switch | 0.15 |
 
 ## 📊 Success Metrics
 

@@ -32,9 +32,13 @@ from typing import Any
 
 from polyquant.data import ProposedTrade, OrderSide
 from polyquant.solver.scip_solver import OptimizationResult
-from polyquant.utils import get_logger
+from polyquant.utils import get_logger, config
 
 logger = get_logger(__name__)
+
+# Unwind retry parameters
+UNWIND_MAX_RETRIES = 3
+UNWIND_SPREAD_WIDENING = [Decimal("0.03"), Decimal("0.06"), Decimal("0.09")]  # 3% → 6% → 9%
 
 
 @dataclass
@@ -76,20 +80,18 @@ class TradeExecutor:
     3. If any leg fails, unwind all previous fills
     4. Use IOC to prevent hanging orders
     """
-    
-    def __init__(self, client: Any = None, limitless_client: Any = None, trade_store: Any = None):
+    def __init__(self, rust_client: Any, trade_store: Any = None, paper_mode: bool = False):
         """
         Initialize executor.
         
         Args:
-            client: PolymarketClient for order submission (None for paper mode)
-            limitless_client: LimitlessClient for Base execution (None for paper mode)
+            rust_client: RustClient for ZMQ ultra-low latency execution sidecar
             trade_store: TradeStore for persistent storage
+            paper_mode: If True, simulate fills locally without dispatching to Rust
         """
-        self._client = client
-        self._limitless_client = limitless_client
+        self._rust_client = rust_client
         self._trade_store = trade_store
-        self._paper_mode = client is None
+        self._paper_mode = paper_mode
 
         # Dual Balance Tracking
         self.poly_balance: Decimal = Decimal("0")
@@ -126,40 +128,45 @@ class TradeExecutor:
                 reason="No trades to execute",
             )
 
-        # Rule 1: Pre-flight Balance Check
-        required_poly = sum((t.notional_value for t in result.trades if t.exchange == "polymarket"), Decimal("0"))
-        required_base = sum((t.notional_value for t in result.trades if t.exchange == "limitless"), Decimal("0"))
-        
+        # Single-pass pre-flight checks: balance, in-flight capital, VWAP slippage
         if not self._paper_mode:
-            if self.poly_balance < required_poly:
+            poly_buy_cost = Decimal("0")
+            base_buy_cost = Decimal("0")
+            for t in result.trades:
+                if t.side.value == "BUY":
+                    if t.exchange == "polymarket":
+                        poly_buy_cost += t.notional_value
+                    elif t.exchange == "limitless":
+                        base_buy_cost += t.notional_value
+
+            if poly_buy_cost > self.poly_balance:
                 return ExecutionResult(
-                    success=False, 
-                    reason=f"Insufficient Poly balance: {self.poly_balance} < {required_poly}"
+                    success=False,
+                    reason=f"Insufficient Polymarket balance: {self.poly_balance} < {poly_buy_cost}",
                 )
-            if self.base_balance < required_base:
+            if base_buy_cost > self.base_balance:
                 return ExecutionResult(
-                    success=False, 
-                    reason=f"Insufficient Base balance: {self.base_balance} < {required_base}"
+                    success=False,
+                    reason=f"Insufficient Limitless balance: {self.base_balance} < {base_buy_cost}",
                 )
 
-        # 1. Dual Balance Checks
-        poly_cost = sum(float(t.notional_value) for t in result.trades if t.exchange == "polymarket" and t.side.value == "BUY")
-        base_cost = sum(float(t.notional_value) for t in result.trades if t.exchange == "limitless" and t.side.value == "BUY")
-        
-        if not self._paper_mode:
-            if poly_cost > self.poly_balance:
-                return ExecutionResult(success=False, reason=f"Insufficient Polymarket balance: Need {poly_cost}, have {self.poly_balance}")
-            if base_cost > self.base_balance:
-                return ExecutionResult(success=False, reason=f"Insufficient Limitless balance: Need {base_cost}, have {self.base_balance}")
-            
-            # 2. In-Flight Capital Check
-            total_in_flight = poly_cost + base_cost
-            from polyquant.utils import config
-            if float(total_in_flight) > config.max_in_flight_capital:
+            total_in_flight = poly_buy_cost + base_buy_cost
+            if total_in_flight > Decimal(str(config.max_in_flight_capital)):
                 return ExecutionResult(
-                    success=False, 
-                    reason=f"Exceeds max in-flight capital limit: {total_in_flight} > {config.max_in_flight_capital}"
+                    success=False,
+                    reason=f"Exceeds max in-flight capital: {total_in_flight} > {config.max_in_flight_capital}",
                 )
+
+            # P0: VWAP slippage enforcement — reject if any trade exceeds limit
+            slippage_limit = Decimal(str(config.vwap_slippage_limit))
+            if slippage_limit > 0:
+                for t in result.trades:
+                    if hasattr(t, "vwap_slippage") and t.vwap_slippage is not None:
+                        if t.vwap_slippage > slippage_limit:
+                            return ExecutionResult(
+                                success=False,
+                                reason=f"VWAP slippage {t.vwap_slippage} exceeds limit {slippage_limit} on {t.outcome_id}",
+                            )
 
         # Sort by priority (lower = first = illiquid)
         sorted_trades = sorted(result.trades, key=lambda t: t.priority)
@@ -203,10 +210,13 @@ class TradeExecutor:
                     failed_count=len(failed_trades),
                     fills_to_unwind=len(filled),
                 )
-                await self._unwind(filled)
+                unwind_ok = await self._unwind(filled)
+                reason = f"Group {group_idx} failed: {failed_trades[0].outcome_id if failed_trades else 'unknown'}"
+                if not unwind_ok:
+                    reason += " | UNWIND FAILED — positions may be unhedged"
                 return ExecutionResult(
                     success=False,
-                    reason=f"Group {group_idx} failed: {failed_trades[0].outcome_id if failed_trades else 'unknown'}",
+                    reason=reason,
                     fills=filled,
                     total_filled=total_filled_notional,
                     total_failed=total_failed_notional,
@@ -233,10 +243,31 @@ class TradeExecutor:
         )
         
         # Record fills to persistent storage
-        if self._trade_store and filled:
-            asyncio.create_task(self._trade_store.record_fills(filled))
+        # Record fills to persistent storage (awaited for durability) and UI
+        if filled:
+            if self._trade_store:
+                try:
+                    await self._trade_store.record_fills(filled)
+                except Exception as e:
+                    logger.error("Failed to persist fills to trade store", error=str(e))
 
-        # Update local balances for immediate consistency
+            # UI Monitor Broadcast (best-effort, non-blocking)
+            from polyquant.api.server import monitor
+            for f in filled:
+                fill_data = {
+                    "order_id": f.order_id,
+                    "filled_size": float(f.filled_size),
+                    "filled_price": float(f.filled_price),
+                    "fill_time": f.fill_time.isoformat(),
+                    "trade": {
+                        "outcome_id": f.trade.outcome_id,
+                        "side": f.trade.side.value,
+                        "exchange": f.trade.exchange,
+                    }
+                }
+                asyncio.create_task(monitor.record_trade(fill_data))
+
+        # Update local balances — only deduct confirmed fills
         self.poly_balance -= sum((f.notional for f in filled if f.trade.exchange == "polymarket"), Decimal("0"))
         self.base_balance -= sum((f.notional for f in filled if f.trade.exchange == "limitless"), Decimal("0"))
 
@@ -316,175 +347,217 @@ class TradeExecutor:
         start_leg_idx: int = 0,
     ) -> list[Fill]:
         """
-        Execute a batch of trades in parallel.
-
-        Week 4: Parallel execution for independent trades (~10ms improvement).
+        Execute a batch of trades via the Rust OMS Sidecar.
 
         Args:
-            trades: List of trades to execute (assumed independent)
+            trades: List of trades to execute
             start_leg_idx: Starting leg index for logging
 
         Returns:
             List of successful fills (may be shorter than trades if some failed)
         """
-        if len(trades) == 1:
-            # Single trade - no need for parallelism
-            fill = await self._submit_order(trades[0])
-            if fill:
-                logger.debug(
-                    "Single trade filled",
-                    leg=start_leg_idx,
-                    outcome_id=trades[0].outcome_id,
-                    size=fill.filled_size,
-                    price=fill.filled_price,
+        if self._paper_mode:
+            logger.debug("Simulating batch execution in paper mode")
+            return [
+                Fill(
+                    trade=t,
+                    filled_size=t.size,
+                    filled_price=t.limit_price,
+                    order_id=f"paper_sim_{start_leg_idx}_{i}"
                 )
-                return [fill]
+                for i, t in enumerate(trades)
+            ]
+
+        if not getattr(self, "_rust_client", None):
+            raise RuntimeError("CRITICAL: RustClient is required for live execution.")
+
+        logger.info("Dispatching to Rust OMS Sidecar", trades=len(trades))
+
+        resp = self._rust_client.dispatch_trades(trades)
+
+        if not resp:
+            logger.error("No response from Rust OMS (timeout or connection error)")
             return []
 
-        # Week 4: Execute multiple trades in parallel
-        logger.debug(
-            f"Executing {len(trades)} trades in parallel",
-            start_leg=start_leg_idx,
-        )
+        status = resp.get("status", "")
 
-        # Submit all orders concurrently
-        fill_tasks = [self._submit_order(trade) for trade in trades]
-        fill_results = await asyncio.gather(*fill_tasks, return_exceptions=True)
+        if status == "halted":
+            logger.critical("Rust OMS is HALTED — cannot execute trades")
+            return []
 
-        # Collect successful fills
-        successful_fills = []
-        for i, (trade, fill_result) in enumerate(zip(trades, fill_results)):
-            if isinstance(fill_result, Exception):
-                logger.error(
-                    "Trade execution raised exception",
-                    leg=start_leg_idx + i,
-                    outcome_id=trade.outcome_id,
-                    error=str(fill_result),
-                )
-                # Exception = failure, stop here
-                break
-            elif fill_result is None:
+        if status == "rejected":
+            rust_errors = resp.get("errors", [])
+            for err in rust_errors:
                 logger.warning(
-                    "Trade execution failed",
-                    leg=start_leg_idx + i,
-                    outcome_id=trade.outcome_id,
+                    "Trade rejected by Rust OMS",
+                    outcome_id=err.get("trade", {}).get("outcome_id"),
+                    error=err.get("error"),
                 )
-                # None = failure, stop here
-                break
-            else:
-                # Success!
-                logger.debug(
-                    "Parallel trade filled",
-                    leg=start_leg_idx + i,
-                    outcome_id=trade.outcome_id,
-                    size=fill_result.filled_size,
-                    price=fill_result.filled_price,
-                )
-                successful_fills.append(fill_result)
-                
-                if fill_result.filled_size < trade.size: # Compare Decimal with Decimal
-                    logger.warning(
-                        "Partial fill detected. Breaking delta neutrality. Halting batch to trigger unwind.",
-                        filled=fill_result.filled_size,
-                        requested=trade.size
-                    )
-                    break
+            return []
 
-        return successful_fills
-    
-    async def _submit_order(self, trade: ProposedTrade) -> Fill | None:
-        """
-        Submit a single order via API or simulate in paper mode.
-        
-        Returns:
-            Fill if successful, None if failed/rejected
-        """
-        if self._paper_mode:
-            # Simulate fill in paper mode
-            return Fill(
-                trade=trade,
-                filled_size=trade.size,
-                filled_price=trade.limit_price,
+        # Log any errors from partial failures
+        rust_errors = resp.get("errors", [])
+        for err in rust_errors:
+            err_trade = err.get("trade", {})
+            logger.error(
+                "Trade failed in Rust OMS",
+                outcome_id=err_trade.get("outcome_id"),
+                exchange=err_trade.get("exchange"),
+                error=err.get("error"),
             )
-        
-        # Real execution via API
-        try:
-            filled_amount = Decimal("0")
-            price = Decimal("0")
-            order_id = ""
-            fill_quality = 0.0
 
-            if trade.exchange == "limitless":
-                if not self._limitless_client:
-                    return None
-                # Call Limitless API
-                is_buy = trade.side == OrderSide.BUY
-                market_slug = trade.reason.split("slug:")[1] if "slug:" in trade.reason else trade.outcome_id # Fallback
-                
-                # We need the market to get exchangeContract. We fetch it here, but in production, 
-                # we'd inject it during optimization to save latency.
-                market_info = await self._limitless_client.get_market(market_slug)
-                res = await self._limitless_client.place_order(
-                    market=market_info,
-                    token_id=trade.outcome_id,
-                    price=trade.limit_price,
-                    size=trade.size,
-                    is_buy=is_buy
-                )
-                if res and res.get("id"):
-                    actual_filled_size = float(res.get("filledAmount", res.get("filledSize", 0.0)))
-                    # Fallback if API omitted explicit size but status states complete
-                    if actual_filled_size == 0.0 and res.get("status", "open") in ["filled", "closed", "matched"]:
-                         actual_filled_size = float(trade.size)
-                    return Fill(trade=trade, filled_size=actual_filled_size, filled_price=float(trade.limit_price), order_id=res["id"])
-                return None
-                
-            else:
-                if not self._client:
-                    return None
-                # Polymarket execution (Placeholder)
-                logger.warning("Real Polymarket execution not implemented yet")
-                return None
-            
-        except Exception as e:
-            logger.error("Order submission failed", error=str(e), exchange=trade.exchange)
-            return None
+        # Parse actual fills from Rust response
+        fills = []
+        for rust_fill in resp.get("fills", []):
+            rust_trade = rust_fill.get("trade", {})
+            outcome_id = rust_trade.get("outcome_id", "")
+
+            # Match back to original ProposedTrade by outcome_id
+            matching_trade = next(
+                (t for t in trades if t.outcome_id == outcome_id), None
+            )
+            if matching_trade is None:
+                logger.warning("Rust returned fill for unknown outcome_id", outcome_id=outcome_id)
+                continue
+
+            filled_size = Decimal(rust_fill.get("filled_size", "0"))
+            filled_price = Decimal(rust_fill.get("filled_price", "0"))
+            order_id = rust_fill.get("order_id", "")
+
+            if filled_size <= 0:
+                logger.warning("Zero-fill from Rust OMS", outcome_id=outcome_id)
+                continue
+
+            fills.append(Fill(
+                trade=matching_trade,
+                filled_size=filled_size,
+                filled_price=filled_price,
+                order_id=order_id,
+            ))
+
+        if len(fills) != len(trades):
+            logger.warning(
+                "Partial fill from Rust OMS",
+                expected=len(trades),
+                actual=len(fills),
+                errors=len(rust_errors),
+            )
+
+        return fills
     
-    async def _unwind(self, fills: list[Fill]) -> None:
+    async def _unwind(self, fills: list[Fill]) -> bool:
         """
         Reverse all filled trades to return to neutral.
-        
+
+        Retries up to UNWIND_MAX_RETRIES times with widening spread
+        (3% → 6% → 9%). If all retries fail, triggers kill switch.
+
         Args:
             fills: List of fills to unwind
+
+        Returns:
+            True if all fills were successfully unwound, False otherwise.
         """
         if not fills:
-            return
-            
-        logger.warning("Leg Risk: Starting unwind of all previously filled legs", fills_to_reverse=len(fills))
-        
-        for fill in reversed(fills):
-            # Reverse the side
-            reverse_side = OrderSide.SELL if fill.trade.side == OrderSide.BUY else OrderSide.BUY
-            
-            if self._paper_mode:
-                logger.debug(
-                    "Paper unwind",
-                    outcome_id=fill.trade.outcome_id,
-                    side=reverse_side.value,
-                    size=fill.filled_size,
-                )
-            else:
-                logger.info(f"Unwinding {fill.filled_size} shares on {fill.trade.exchange}")
-                from decimal import Decimal
-                trade_to_unwind = ProposedTrade(
+            return True
+
+        logger.warning(
+            "HANGING LEG: Starting unwind with retry logic",
+            fills_to_reverse=len(fills),
+        )
+
+        if self._paper_mode:
+            for fill in reversed(fills):
+                reverse_side = OrderSide.SELL if fill.trade.side == OrderSide.BUY else OrderSide.BUY
+                logger.debug("Paper unwind", outcome_id=fill.trade.outcome_id, side=reverse_side.value)
+            return True
+
+        if not (hasattr(self, "_rust_client") and self._rust_client):
+            logger.error("CRITICAL: Cannot unwind — RustClient not available")
+            return False
+
+        remaining_fills = list(fills)
+
+        for attempt in range(UNWIND_MAX_RETRIES):
+            spread_widen = UNWIND_SPREAD_WIDENING[attempt]
+            logger.warning(
+                f"Unwind attempt {attempt + 1}/{UNWIND_MAX_RETRIES}",
+                spread_widen=float(spread_widen),
+                remaining=len(remaining_fills),
+            )
+
+            unwind_trades = []
+            for fill in reversed(remaining_fills):
+                reverse_side = OrderSide.SELL if fill.trade.side == OrderSide.BUY else OrderSide.BUY
+
+                # Widen limit price to improve fill probability
+                original_price = fill.filled_price
+                if reverse_side == OrderSide.SELL:
+                    # Selling: lower the limit price to be more aggressive
+                    widened_price = original_price * (Decimal("1") - spread_widen)
+                else:
+                    # Buying back: raise the limit price
+                    widened_price = original_price * (Decimal("1") + spread_widen)
+
+                unwind_trades.append(ProposedTrade(
                     outcome_id=fill.trade.outcome_id,
                     side=reverse_side,
                     size=Decimal(str(fill.filled_size)),
-                    limit_price=fill.trade.limit_price, 
+                    limit_price=widened_price,
                     exchange=fill.trade.exchange,
-                    reason=fill.trade.reason
-                )
-                # Attempt to submit the unwind order
-                await self._submit_order(trade_to_unwind)
-        
-        logger.info("Unwind complete")
+                    reason=f"unwind_attempt_{attempt + 1}",
+                ))
+
+            resp = self._rust_client.dispatch_trades(unwind_trades)
+
+            if not resp:
+                logger.error(f"Unwind attempt {attempt + 1}: no response from Rust OMS")
+                await asyncio.sleep(0.1 * (attempt + 1))
+                continue
+
+            status = resp.get("status", "")
+            unwind_fills = resp.get("fills", [])
+            unwind_errors = resp.get("errors", [])
+
+            # Determine which fills were successfully unwound
+            unwound_ids = {f.get("trade", {}).get("outcome_id") for f in unwind_fills}
+            remaining_fills = [f for f in remaining_fills if f.trade.outcome_id not in unwound_ids]
+
+            # Restore balances for successful unwinds
+            for uf in unwind_fills:
+                filled_size = Decimal(uf.get("filled_size", "0"))
+                filled_price = Decimal(uf.get("filled_price", "0"))
+                notional = filled_size * filled_price
+                exchange = uf.get("trade", {}).get("exchange", "")
+                if exchange == "polymarket":
+                    self.poly_balance += notional
+                elif exchange == "limitless":
+                    self.base_balance += notional
+
+            if not remaining_fills:
+                logger.info(f"Unwind complete on attempt {attempt + 1}")
+                return True
+
+            logger.warning(
+                f"Unwind attempt {attempt + 1} partial",
+                unwound=len(unwound_ids),
+                remaining=len(remaining_fills),
+                errors=len(unwind_errors),
+            )
+
+            if attempt < UNWIND_MAX_RETRIES - 1:
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+        # All retries exhausted — trigger kill switch
+        logger.critical(
+            "UNWIND FAILED after all retries — triggering kill switch",
+            remaining_positions=len(remaining_fills),
+            positions=[f.trade.outcome_id for f in remaining_fills],
+        )
+
+        if hasattr(self, "_kill_switch") and self._kill_switch:
+            await self._kill_switch.trigger(reason="unwind_failure")
+        elif hasattr(self, "_rust_client") and self._rust_client:
+            self._rust_client.send_halt(reason="unwind_failure_all_retries_exhausted")
+
+        return False

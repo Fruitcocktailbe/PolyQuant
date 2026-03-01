@@ -606,8 +606,8 @@ class FWSolver:
         market_prices = {}
         for o, ob in order_books.items():
             # Use mid-price as proxy for theta
-            best_bid = ob.best_bid or 0.0
-            best_ask = ob.best_ask or 1.0
+            best_bid = float(ob.best_bid) if ob.best_bid is not None else 0.0
+            best_ask = float(ob.best_ask) if ob.best_ask is not None else 1.0
             market_prices[o] = (best_bid + best_ask) / 2.0
 
         # 1. InitFW - identifies settled securities (Week 3: now async with Redis cache)
@@ -698,17 +698,17 @@ class ArbitrageDetector:
                 continue
                 
             # Buy opportunity: Ask < Target
-            if ob.best_ask and ob.best_ask < target_p:
-                price_diff = target_p - ob.best_ask
+            if ob.best_ask and float(ob.best_ask) < target_p:
+                price_diff = target_p - float(ob.best_ask)
                 
                 # Calculate odds and depth for PositionSizer
                 # Buy side: Odds = (1/Ask) - 1
-                price = ob.best_ask
+                price = float(ob.best_ask)
                 odds = (1.0 / price) - 1.0 if price > 0 else 0.0
                 
                 depth = 0.0
-                if ob.asks and abs(ob.asks[0].price - price) < 1e-6:
-                    depth = ob.asks[0].size * price # Liquidity in USD
+                if ob.asks and abs(float(ob.asks[0].price) - price) < 1e-6:
+                    depth = float(ob.asks[0].size) * price # Liquidity in USD
                 if depth == 0:
                     depth = 1000.0
                 
@@ -719,17 +719,30 @@ class ArbitrageDetector:
                 )
                 
                 if size_result.recommended_size > 0:
-                    vwap = ob.get_vwap(OrderSide.BUY, size_result.recommended_size)
+                    vwap = ob.get_vwap(OrderSide.BUY, Decimal(str(size_result.recommended_size)))
                     if vwap is not None and vwap < target_p:
                         price_diff = target_p - float(vwap)
                         profit = Decimal(str(price_diff * float(size_result.recommended_size)))
                         
+                        exchange_info = validated.market_exchanges.get(extract_market_id(outcome_id), "polymarket")
+                        exchange_name = "polymarket"
+                        reason = ""
+                        
+                        if exchange_info.startswith("limitless:"):
+                            exchange_name = "limitless"
+                            slug = exchange_info.split(":")[1]
+                            reason = f"slug:{slug}"
+                        elif exchange_info == "limitless":
+                            exchange_name = "limitless"
+                            
                         trades.append(ProposedTrade(
                             market_id=extract_market_id(outcome_id),
                             outcome_id=outcome_id,
                             side=OrderSide.BUY,
                             size=size_result.recommended_size,
-                            limit_price=vwap
+                            limit_price=vwap,
+                            exchange=exchange_name,
+                            reason=reason
                         ))
                         total_expected_profit += profit
                 
@@ -760,32 +773,55 @@ class ArbitrageDetector:
                 )
                 
                 if size_result.recommended_size > 0:
-                    vwap = ob.get_vwap(OrderSide.SELL, size_result.recommended_size)
+                    vwap = ob.get_vwap(OrderSide.SELL, Decimal(str(size_result.recommended_size)))
                     if vwap is not None and vwap > target_p:
                         price_diff = float(vwap) - target_p
                         profit = Decimal(str(price_diff * float(size_result.recommended_size)))
                         
+                        exchange_info = validated.market_exchanges.get(extract_market_id(outcome_id), "polymarket")
+                        exchange_name = "polymarket"
+                        reason = ""
+                        
+                        if exchange_info.startswith("limitless:"):
+                            exchange_name = "limitless"
+                            slug = exchange_info.split(":")[1]
+                            reason = f"slug:{slug}"
+                        elif exchange_info == "limitless":
+                            exchange_name = "limitless"
+                            
                         trades.append(ProposedTrade(
                             market_id=extract_market_id(outcome_id),
                             outcome_id=outcome_id,
                             side=OrderSide.SELL,
                             size=size_result.recommended_size,
-                            limit_price=vwap
+                            limit_price=vwap,
+                            exchange=exchange_name,
+                            reason=reason
                         ))
                         total_expected_profit += profit
                 
         if not trades:
             return None
             
-        # Deduct Fees and Gas
-        total_gas = Decimal(str(config.polygon_gas_per_tx)) * len(trades)
-        total_fees = sum((t.size * t.limit_price * Decimal(str(config.polymarket_taker_fee_pct))) for t in trades)
+        # Deduct Fees and Gas — per-exchange rates
+        total_gas = Decimal("0")
+        total_fees = Decimal("0")
+        poly_gas = Decimal(str(config.polygon_gas_per_tx))
+        base_gas = Decimal(str(config.base_gas_per_tx))
+        poly_fee_pct = Decimal(str(config.polymarket_taker_fee_pct))
+        limitless_fee_pct = Decimal(str(config.limitless_taker_fee_pct))
+        for t in trades:
+            exchange = getattr(t, "exchange", "polymarket")
+            if exchange == "limitless":
+                total_gas += base_gas
+                total_fees += t.size * t.limit_price * limitless_fee_pct
+            else:
+                total_gas += poly_gas
+                total_fees += t.size * t.limit_price * poly_fee_pct
         total_expected_profit -= (total_gas + total_fees)
         
         if total_expected_profit <= 0:
             return None
-
-        from polyquant.utils import config
             
         return ArbitrageOpportunity(
             markets=list(set(t.market_id for t in trades)),

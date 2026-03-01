@@ -6,7 +6,10 @@ export interface SystemState {
     kill_switch_active: boolean;
     active_positions: any[];
     clusters: any[];
+    mapped_pairs: any[];
     opportunities: any[];
+    trades_executed: any[];
+    pipeline_stage: string;
     logs: string[];
 }
 
@@ -27,7 +30,10 @@ class ApiService {
         kill_switch_active: false,
         active_positions: [],
         clusters: [],
+        mapped_pairs: [],
         opportunities: [],
+        trades_executed: [],
+        pipeline_stage: "IDLE",
         logs: [],
     };
 
@@ -94,7 +100,10 @@ class ApiService {
             newState.kill_switch_active !== this.state.kill_switch_active ||
             newState.logs.length !== this.state.logs.length ||
             newState.clusters.length !== this.state.clusters.length ||
-            newState.opportunities.length !== this.state.opportunities.length
+            newState.mapped_pairs.length !== this.state.mapped_pairs.length ||
+            newState.opportunities.length !== this.state.opportunities.length ||
+            newState.trades_executed.length !== this.state.trades_executed.length ||
+            newState.pipeline_stage !== this.state.pipeline_stage
         );
     }
 

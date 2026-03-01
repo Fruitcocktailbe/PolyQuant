@@ -116,13 +116,15 @@ class PositionSizer:
         print(f"Limited by: {result.limited_by}")
     """
     
-    # Default conservative limits
-    DEFAULT_LIMITS = PositionLimits(
-        max_single_trade_pct=0.05,  # 5% per trade
-        max_total_exposure_pct=0.25,  # 25% total
-        max_orderbook_depth_pct=0.5,  # 50% of order book
-        kelly_fraction=0.5,  # Half Kelly
-    )
+    # Default conservative limits now mapped to centralized config
+    @property
+    def DEFAULT_LIMITS(self) -> PositionLimits:
+        return PositionLimits(
+            max_single_trade_pct=config.max_single_trade_pct,
+            max_total_exposure_pct=config.max_total_exposure_pct,
+            max_orderbook_depth_pct=config.orderbook_depth_cap,
+            kelly_fraction=config.kelly_fraction,
+        )
     
     def __init__(
         self,
@@ -145,15 +147,7 @@ class PositionSizer:
         # Empirical Kelly: track edge estimates to compute CV
         self._edge_history: deque[float] = deque(maxlen=50)
         self._cv_edge: float = 0.0  # Coefficient of variation of edge
-        
-        # Use config for orderbook depth cap if available
-        if hasattr(config, 'orderbook_depth_cap'):
-            self.limits = PositionLimits(
-                max_single_trade_pct=self.limits.max_single_trade_pct,
-                max_total_exposure_pct=self.limits.max_total_exposure_pct,
-                max_orderbook_depth_pct=config.orderbook_depth_cap,
-                kelly_fraction=self.limits.kelly_fraction,
-            )
+
         
         logger.info(
             "PositionSizer initialized",
@@ -190,8 +184,8 @@ class PositionSizer:
         order_book_depth = max(0, order_book_depth)
         
         # Price band validation - reject trades at extreme prices
-        # Price = 1 / odds for fair odds approximation
-        implied_price = 1.0 / odds if odds > 0 else 0.5
+        # Price = 1 / (odds + 1) for fair odds approximation
+        implied_price = 1.0 / (odds + 1.0) if odds > 0 else 0.5
         if implied_price < 0.02 or implied_price > 0.98:
             logger.warning(
                 "Price band rejection",

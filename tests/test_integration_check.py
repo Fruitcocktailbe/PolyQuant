@@ -164,7 +164,7 @@ section("4. Fill Quality Tracking")
 # ─────────────────────────────────────────────────────────────
 
 try:
-    executor = TradeExecutor(client=None)  # Paper mode
+    executor = TradeExecutor(rust_client=None, paper_mode=True)  # Paper mode
     check("Executor has fill quality window",
           hasattr(executor, '_fill_quality_window'))
     check("Executor has alert threshold",
@@ -322,5 +322,5 @@ if failed == 0:
 else:
     print(f"  \033[91m{failed} CHECK(S) FAILED — Review needed\033[0m")
 print(f"{'─'*60}\n")
-
-sys.exit(0 if failed == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if failed == 0 else 1)

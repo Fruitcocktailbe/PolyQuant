@@ -33,7 +33,9 @@
    - 7.4 [Profiling & Watchdog](#74-profiling--watchdog)
 8. [Complete Data Flow Diagrams](#8-complete-data-flow-diagrams)
 9. [Latency & Performance Budget](#9-latency--performance-budget)
-10. [File Index](#10-file-index)
+10. [OMS Sidecar (Rust)](#10-oms-sidecar-rust)
+11. [Web Dashboard (React)](#11-web-dashboard-react)
+12. [File Index](#12-file-index)
 
 ---
 
@@ -111,12 +113,11 @@ All configuration is loaded from environment variables via **Pydantic Settings**
 
 | Group | Variables | Purpose |
 |-------|-----------|---------|
+| **Global Defaults** | `MIN_LIQUIDITY` (1000.0) | Filter for market scanning |
+| **Solver Tuning** | `SCIP_GAP` (0.001), `MIN_TRADE_SIZE` (10.0), `MIN_PROFIT_THRESHOLD` (0.05) | Precision and execution triggers |
+| **Agent Logic** | `LLM_TEMPERATURE` (0.0), `VALIDATOR_CONFIDENCE_THRESHOLD` (0.7) | Reasoning behavior |
 | **API Keys** | `GEMINI_API_KEY`, `ALCHEMY_API_KEY`, `POLYGON_PRIVATE_KEY` | All stored as `SecretStr` — never printed in logs |
-| **Polymarket URLs** | `POLYMARKET_GAMMA_URL`, `POLYMARKET_CLOB_URL`, `POLYMARKET_DATA_URL`, `POLYMARKET_WS_URL` | 4 separate API endpoints |
-| **Redis** | `REDIS_URL` | Default: `redis://localhost:6379/0` |
-| **Trading** | `EXTRACTION_ALPHA` (0.9), `MAX_DRAWDOWN` (0.15), `ORDERBOOK_DEPTH_CAP` (0.5), `VWAP_SLIPPAGE_LIMIT` (0.05) | Risk parameters |
-| **Frank-Wolfe** | `INITIAL_EPSILON` (0.1), `MIN_PROFIT_THRESHOLD` ($0.05), `FW_MAX_ITERATIONS` (150) | Solver tuning |
-| **Execution** | `TRADING_MODE` (`paper` / `live`), `PRIVATE_RPC_URL` | Mode selection |
+| **Risk** | `MAX_DRAWDOWN` (0.15), `ORDERBOOK_DEPTH_CAP` (0.5), `VWAP_SLIPPAGE_LIMIT` (0.05) | Safety guardrails |
 
 **How it works**: Pydantic reads `.env` → validates types → creates `PolyQuantConfig` instance → cached globally as `config`.
 
@@ -1011,7 +1012,37 @@ ArbitrageOpportunity                                │
 
 ---
 
-## 10. File Index
+## 10. OMS Sidecar (Rust)
+
+**File**: [`oms-sidecar/src/main.rs`](file:///d:/GithubLocal/PolyQuant/oms-sidecar/src/main.rs)
+
+The **Order Management System (OMS)** is a high-performance Rust service that separates trade execution from Python's reasoning logic.
+
+### Key Features:
+- **ZeroMQ Interface**: Listens on `tcp://127.0.0.1:5555` for trade batches from Python.
+- **Micro-Latency Signing**: Handles EIP-712 signing and transaction submission with <1ms overhead.
+- **Staleness Protection**: Rejects orders if the signal age (timestamped in Python) exceeds `max_signal_age_us`.
+- **Multi-Exchange Logic**: Native support for Polymarket CLOB and Limitless (via `alloy`).
+- **Halt Mechanism**: Can be globally halted via a control command, stopping all execution immediately.
+
+---
+
+## 11. Web Dashboard (React)
+
+**Directory**: [`web/src/components/`](file:///d:/GithubLocal/PolyQuant/web/src/components)
+
+A modern monitoring interface built with React, Vite, and Tailwind CSS.
+
+### Modules:
+- **PipelineMonitor**: Visualizes the flow from Discovery to Execution, highlighting bottlenecks.
+- **KillSwitch**: A massive "Emergency Stop" button that communicates directly with the Python API.
+- **LogTerminal**: Real-time websocket stream of system logs.
+- **MarketList**: Live view of clustered markets and detected constraints.
+- **TradeLog**: Historical list of executed and unwound trades.
+
+---
+
+## 12. File Index
 
 ### Core Modules
 

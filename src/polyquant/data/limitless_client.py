@@ -51,10 +51,19 @@ class LimitlessClient:
             
         self._rest_client = httpx.AsyncClient(
             base_url=self.api_url,
-            timeout=config.clob_timeout_seconds,
+            timeout=5.0, # Using explicit timeout as clob_timeout may not be in config
             headers=headers,
             verify=True
         )
+        
+        # Pre-warm nonce to avoid execution latency
+        try:
+            self._base_nonce = await self.get_base_network_nonce()
+            logger.info("Limitless base nonce pre-warmed", nonce=self._base_nonce)
+        except Exception as e:
+            logger.error(f"Failed to pre-warm Limitless nonce: {e}")
+            self._base_nonce = None
+            
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -92,10 +101,30 @@ class LimitlessClient:
         raise last_error # type: ignore
 
     async def get_markets(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Fetch active markets from Limitless."""
-        res = await self._retry_request("GET", "/markets", params={"limit": limit, "status": "active"})
-        data = res.json()
-        return data.get("data", []) or data.get("markets", [])
+        """Fetch all active markets from Limitless via pagination."""
+        all_markets = []
+        offset = 0
+        
+        while True:
+            res = await self._retry_request("GET", "/markets", params={
+                "limit": limit,
+                "offset": offset, 
+                "status": "active"
+            })
+            data = res.json()
+            batch = data.get("data", []) or data.get("markets", [])
+            
+            if not batch:
+                break
+                
+            all_markets.extend(batch)
+            offset += len(batch)
+            
+            if len(batch) < limit:
+                break
+                
+        logger.info(f"Fetched {len(all_markets)} active markets from Limitless.")
+        return all_markets
 
     async def get_market(self, slug: str) -> Dict[str, Any]:
         """Fetch a specific market."""
@@ -103,13 +132,12 @@ class LimitlessClient:
         return res.json()
         
     async def get_usdc_balance(self) -> Decimal:
-        """Fetch USDC balance on Base via public RPC, scaled by 1e6."""
+        """Fetch USDC balance on Base via RPC with failover, scaled by 1e6."""
         if not self.address or self.address == ZERO_ADDRESS:
             return Decimal("0.0")
-            
-        rpc_url = config.base_rpc_url
+
         usdc_address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-        
+
         # Minimal ERC20 balanceOf ABI call: 0x70a08231 + padded address
         data = f"0x70a08231000000000000000000000000{self.address[2:]}"
         payload = {
@@ -118,44 +146,56 @@ class LimitlessClient:
             "params": [{"to": usdc_address, "data": data}, "latest"],
             "id": 1
         }
-        
+
+        try:
+            resp = await self._rpc_call(payload)
+            result = resp.get("result", "0x0")
+            if result == "0x":
+                result = "0x0"
+            return Decimal(int(result, 16)) / Decimal(1e6)
+        except Exception as e:
+            logger.error(f"Failed to fetch Base USDC balance: {e}")
+            return Decimal("0.0")
+
+    async def _rpc_call(self, payload: dict) -> dict:
+        """Execute an RPC call with failover across configured providers."""
+        urls = [config.base_rpc_url] + list(config.base_rpc_fallback_urls)
+        last_error = None
+
         async with httpx.AsyncClient() as client:
-            try:
-                res = await client.post(rpc_url, json=payload, timeout=5.0)
-                res.raise_for_status()
-                result = res.json().get("result", "0x0")
-                if result == "0x":
-                    result = "0x0"
-                # Decimal with 6 places (USDC standard)
-                return Decimal(int(result, 16)) / Decimal(1e6)
-            except Exception as e:
-                logger.error(f"Failed to fetch Base USDC balance: {e}")
-                return Decimal("0.0")
+            for url in urls:
+                try:
+                    res = await client.post(url, json=payload, timeout=5.0)
+                    res.raise_for_status()
+                    return res.json()
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"RPC call failed on {url}: {e}")
+                    continue
+
+        raise RuntimeError(f"All RPC providers failed. Last error: {last_error}")
 
     async def get_base_network_nonce(self) -> int:
-        """Fetch the current transaction count (nonce) from Base RPC."""
+        """Fetch the current transaction count (nonce) from Base RPC with failover."""
         if not self.address or self.address == ZERO_ADDRESS:
             return int(time.time())
-            
-        rpc_url = config.base_rpc_url
+
         payload = {
             "jsonrpc": "2.0",
             "method": "eth_getTransactionCount",
-            "params": [self.address, "latest"],
+            "params": [self.address, "finalized"],
             "id": 1
         }
-        
-        async with httpx.AsyncClient() as client:
-            try:
-                res = await client.post(rpc_url, json=payload, timeout=5.0)
-                res.raise_for_status()
-                result = res.json().get("result", "0x0")
-                if result == "0x":
-                    result = "0x0"
-                return int(result, 16)
-            except Exception as e:
-                logger.error(f"Failed to fetch Base network nonce: {e}")
-                return int(time.time())
+
+        try:
+            data = await self._rpc_call(payload)
+            result = data.get("result", "0x0")
+            if result == "0x":
+                result = "0x0"
+            return int(result, 16)
+        except Exception as e:
+            logger.error(f"Failed to fetch Base network nonce: {e}")
+            return int(time.time())
                 
     def sign_order(self, order_data: Dict[str, Any], verifying_contract: str) -> str:
         """Sign an order using EIP-712 for Limitless CTF Exchange."""
@@ -226,21 +266,19 @@ class LimitlessClient:
         if self._base_nonce is None:
             self._base_nonce = await self.get_base_network_nonce()
             
+        assert self._base_nonce is not None
         current_nonce = self._base_nonce
         self._base_nonce += 1
-        
-        num_shares = float(size)
-        price_float = float(price)
         
         # BUY (side 0): maker pays USDC, receives shares
         # SELL (side 1): maker pays shares, receives USDC
         if is_buy:
-            maker_amount = int(price_float * num_shares * 1e6)
-            taker_amount = int(num_shares * 1e6)
+            maker_amount = int((price * size * Decimal(10**6)).to_integral_value())
+            taker_amount = int((size * Decimal(10**6)).to_integral_value())
             side = 0
         else:
-            maker_amount = int(num_shares * 1e6)
-            taker_amount = int(price_float * num_shares * 1e6)
+            maker_amount = int((size * Decimal(10**6)).to_integral_value())
+            taker_amount = int((price * size * Decimal(10**6)).to_integral_value())
             side = 1
             
         order_payload = {
@@ -252,7 +290,7 @@ class LimitlessClient:
             "takerAmount": taker_amount,
             "side": side,
             "salt": time.time_ns(),
-            "expiration": int(time.time()) + 60,
+            "expiration": int(time.time()) + config.order_expiration_seconds,
             "nonce": current_nonce,
             "feeRateBps": 0,
             "signatureType": 0,

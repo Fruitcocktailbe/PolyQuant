@@ -69,6 +69,7 @@ class TriggerReason(str, Enum):
     API_ERRORS = "api_error_rate_exceeded"
     MANUAL = "manual_trigger"
     LATENCY = "latency_exceeded"
+    VELOCITY = "toxic_velocity_exceeded"
     UNKNOWN = "unknown"
 
 
@@ -138,6 +139,8 @@ class KillSwitch:
         solver_timeout_threshold: float = 30.0,
         max_solver_timeout_rate: float = 0.5,
         latency_threshold_ms: int | None = None,
+        toxic_flow_fill_count: int = 3,
+        toxic_flow_time_window_ms: int = 500,
         on_trigger: Callable[[TriggerEvent], None] | None = None,
     ):
         """
@@ -160,6 +163,8 @@ class KillSwitch:
         self.solver_timeout_threshold = solver_timeout_threshold
         self.max_solver_timeout_rate = max_solver_timeout_rate
         self.latency_threshold_ms = latency_threshold_ms or config.latency_target_ms
+        self.toxic_flow_fill_count = toxic_flow_fill_count
+        self.toxic_flow_time_window_ms = toxic_flow_time_window_ms
         
         # State
         self._is_triggered = False
@@ -170,6 +175,7 @@ class KillSwitch:
         self._solver_times: list[tuple[datetime, float]] = []
         self._api_errors: list[datetime] = []
         self._trade_latencies: list[tuple[datetime, float]] = []
+        self._fill_timestamps: list[datetime] = []
         
         # Callback
         self._on_trigger = on_trigger
@@ -326,6 +332,37 @@ class KillSwitch:
         ]
         
         await self._check_latency()
+        
+    async def record_fill(self) -> None:
+        """
+        Record a trade execution fill.
+        
+        Monitors fill velocity to detect toxic flow. If too many fills occur
+        in a very short time window, it indicates faster actors are sweeping
+        our limit orders at stale prices.
+        """
+        now = datetime.utcnow()
+        self._fill_timestamps.append(now)
+        
+        # Prune entries older than the time window
+        cutoff = now - timedelta(milliseconds=self.toxic_flow_time_window_ms)
+        self._fill_timestamps = [t for t in self._fill_timestamps if t > cutoff]
+        
+        if len(self._fill_timestamps) >= self.toxic_flow_fill_count:
+            logger.critical(
+                "TOXIC FLOW DETECTED - Velocity threshold breached",
+                fills=len(self._fill_timestamps),
+                window_ms=self.toxic_flow_time_window_ms,
+            )
+            await self._trigger(
+                reason=TriggerReason.VELOCITY,
+                details=f"Toxic flow detected: {len(self._fill_timestamps)} fills in <{self.toxic_flow_time_window_ms}ms",
+                metric_value=len(self._fill_timestamps),
+                threshold=self.toxic_flow_fill_count,
+            )
+            await self.save_state()
+            if self._on_trigger:
+                 self._on_trigger(self._trigger_event) # type: ignore
     
     async def trigger(self, reason: str, trigger_type: TriggerReason = TriggerReason.MANUAL) -> None:
         """

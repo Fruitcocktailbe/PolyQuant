@@ -11,16 +11,17 @@ This matched schema is cached to avoid repeated LLM API costs.
 
 import os
 import json
+import asyncio
 from typing import Any, Dict, List
 from pathlib import Path
+from polyquant.api.server import monitor
 
 import numpy as np
 try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
+    from sentence_transformers import SentenceTransformer, util
 except ImportError:
-    TfidfVectorizer = None
-    cosine_similarity = None
+    SentenceTransformer = None
+    util = None
 
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
@@ -70,8 +71,8 @@ class ExchangeMatcher:
 
     async def run_matching_pipeline(self) -> Dict[str, str]:
         """Runs the 3-stage funnel to find new cross-exchange arb pairs."""
-        if TfidfVectorizer is None:
-            logger.error("scikit-learn is not installed. Run `pip install scikit-learn`")
+        if SentenceTransformer is None:
+            logger.error("sentence-transformers is not installed. Run `pip install sentence-transformers`")
             return self.mapped_pairs
 
         # Stage 1: Liquidity Pre-filtering
@@ -83,10 +84,10 @@ class ExchangeMatcher:
             
         limit_markets_raw = []
         async with LimitlessClient() as l_client:
-            # We fetch up to 1000 active markets
-            limit_markets_raw = await l_client.get_markets(limit=1000)
+            # Fetch all active markets via pagination
+            limit_markets_raw = await l_client.get_markets()
             
-        # Filter Limitless for decent liquidity/volume (e.g., > 5000 volume)
+        # Filter Limitless for decent liquidity/volume (e.g., > 1000 volume)
         limit_markets = [
             m for m in limit_markets_raw 
             if float(m.get("volume", 0)) > 5000.0 or float(m.get("liquidity", 0)) > 5000.0
@@ -101,22 +102,24 @@ class ExchangeMatcher:
         p_docs = [f"{m.question} {m.description}" for m in poly_markets]
         l_docs = [f"{m.get('title', '')} {m.get('description', '')}" for m in limit_markets]
 
-        # Stage 2: Vector Embeddings (TF-IDF Cosine Similarity)
-        logger.info("Stage 2: Running TF-IDF Vector Embeddings to find Top-3 neighbors...")
-        vectorizer = TfidfVectorizer(stop_words='english')
+        # Stage 2: Vector Embeddings (Dense Semantic Embeddings)
+        logger.info("Stage 2: Running Semantic Vector Embeddings (all-MiniLM-L6-v2) to find Top-3 neighbors...")
+        model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Fit on both corpuses combined, then transform
-        all_docs = p_docs + l_docs
-        vectorizer.fit(all_docs)
+        # Encode corpuses into semantic vectors
+        p_embeddings = model.encode(p_docs, convert_to_tensor=True)
+        l_embeddings = model.encode(l_docs, convert_to_tensor=True)
         
-        p_matrix = vectorizer.transform(p_docs)
-        l_matrix = vectorizer.transform(l_docs)
-        
-        similarity_matrix = cosine_similarity(p_matrix, l_matrix)
+        # Compute cosine similarity
+        similarity_matrix = util.cos_sim(p_embeddings, l_embeddings).cpu().numpy()
         
         # Stage 3: LLM Semantic Verification
-        logger.info("Stage 3: Verifying Top-N neighbors using LLM Semantic Matching...")
+        logger.info("Stage 3: Verifying Top-N neighbors using LLM Semantic Matching (Concurrent Async)...")
         new_matches = 0
+        
+        # Prepare all LLM evaluation tasks
+        eval_tasks = []
+        task_meta = []
         
         for p_idx, p_market in enumerate(poly_markets):
             if p_market.condition_id in self.mapped_pairs:
@@ -125,10 +128,10 @@ class ExchangeMatcher:
             # Get top 3 indices for this Polymarket market
             top_3_indices = np.argsort(similarity_matrix[p_idx])[-3:][::-1]
             
-            # Require at least a 0.5 similarity score to even test with LLM (saves API costs)
+            # Require at least a 0.6 semantic similarity score to test with LLM (saves API costs)
             for l_idx in top_3_indices:
-                sim_score = similarity_matrix[p_idx][l_idx]
-                if sim_score < 0.5:
+                sim_score = float(similarity_matrix[p_idx][l_idx])
+                if sim_score < 0.6:
                     continue
                     
                 l_market = limit_markets[l_idx]
@@ -136,7 +139,7 @@ class ExchangeMatcher:
                 if not l_id:
                     continue
                     
-                # Call LLM Verify
+                # Format Verify Prompt
                 prompt = LLM_VERIFY_PROMPT.format(
                     p_q=p_market.question,
                     p_d=p_market.description,
@@ -144,12 +147,63 @@ class ExchangeMatcher:
                     l_d=l_market.get('description', '')
                 )
                 
-                resp = call_llm_json(prompt=prompt, system_prompt="Answer JSON only.", temperature=0.1)
-                if resp and resp.get("is_match") is True:
-                    logger.info(f"MATCH FOUND [{sim_score:.2f}]: {p_market.question[:30]}... == LIMITLESS {l_market.get('title', '')[:30]}...")
-                    self.mapped_pairs[p_market.condition_id] = l_id
-                    new_matches += 1
-                    break # Stop looking for this market once matched
+                # Append to batch
+                eval_tasks.append(
+                    asyncio.to_thread(
+                        call_llm_json,
+                        prompt=prompt,
+                        system_prompt="Answer JSON only.",
+                        temperature=0.1
+                    )
+                )
+                
+                # Save metadata for matching back the result
+                task_meta.append({
+                    "p_market": p_market,
+                    "sim_score": sim_score,
+                    "l_id": l_id,
+                    "l_title": l_market.get('title', '')
+                })
+                
+        if not eval_tasks:
+            logger.info("No new pairs met the semantic similarity threshold for LLM verification.")
+            return self.mapped_pairs
+            
+        logger.info(f"Firing {len(eval_tasks)} LLM verification requests concurrently...")
+        results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+        
+        # Process results, grouping by Polymarket condition_id so we only map the first true match
+        processed_p_market_ids = set()
+        
+        for meta, resp in zip(task_meta, results):
+            p_market = meta["p_market"]
+            
+            if p_market.condition_id in processed_p_market_ids:
+                continue # We already mapped this Polymarket event from a different Limitless suggestion
+                
+            if isinstance(resp, Exception):
+                logger.error(f"LLM evaluation failed for market matching: {resp}")
+                continue
+                
+            if resp and resp.get("is_match") is True:
+                logger.info(f"MATCH FOUND [{meta['sim_score']:.2f}]: {p_market.question[:30]}... == LIMITLESS {meta['l_title'][:30]}...")
+                self.mapped_pairs[p_market.condition_id] = meta["l_id"]
+                processed_p_market_ids.add(p_market.condition_id)
+                new_matches += 1
+                
+                # Update UI Monitor with UI-friendly list
+                ui_pair = {
+                    "polymarket_question": p_market.question,
+                    "limitless_title": meta["l_title"],
+                    "polymarket_id": p_market.condition_id,
+                    "limitless_id": meta["l_id"],
+                    "similarity": round(meta["sim_score"], 2)
+                }
+                
+                # Add to existing list in state safely
+                current_pairs = list(monitor.state.mapped_pairs)
+                current_pairs.append(ui_pair)
+                asyncio.create_task(monitor.update_status(mapped_pairs=current_pairs))
                     
         if new_matches > 0:
             self.save_cache()

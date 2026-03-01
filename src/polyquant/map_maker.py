@@ -41,7 +41,9 @@ from polyquant.data.constraint_store import (
     StoredConstraint,
     StoredDependency,
 )
+from polyquant.agents.exchange_matcher import ExchangeMatcher
 from polyquant.utils import config, get_logger
+from polyquant.api.server import monitor
 from polyquant.utils.cache import cache
 
 logger = get_logger(__name__)
@@ -73,6 +75,7 @@ class MapMaker:
         self._correlation_agent: CorrelationEngine | None = None
         self._polymarket: PolymarketClient | None = None
         self._store: ConstraintStore | None = None
+        self._exchange_matcher: ExchangeMatcher | None = None
         
         logger.info("MapMaker initialized")
     
@@ -98,6 +101,9 @@ class MapMaker:
         # Initialize Polymarket client (for market data)
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
+
+        # Initialize Cross-Exchange Matcher
+        self._exchange_matcher = ExchangeMatcher()
 
         # Initialize constraint store
         self._store = ConstraintStore()
@@ -168,6 +174,7 @@ class MapMaker:
             # PHASE 1: DISCOVERY
             # ================================================================
             logger.info("Phase 1: Discovery - Scanning markets...")
+            await monitor.update_status(pipeline_stage="DISCOVERY", mapped_pairs=[])
             
             if not self._discovery:
                 raise RuntimeError("Discovery agent not initialized")
@@ -179,15 +186,14 @@ class MapMaker:
             )
             
             # Record in monitor for UI
-            from polyquant.api.server import monitor
-            asyncio.create_task(monitor.update_status(
+            await monitor.update_status(
                 clusters=[{
                     "id": c.cluster_id,
                     "topic": c.topic,
                     "count": len(c.markets),
                     "status": "pending_analysis"
                 } for c in clusters]
-            ))
+            )
 
             logger.info(f"Discovered {len(clusters)} clusters")
             results["discovery"] = {
@@ -198,55 +204,74 @@ class MapMaker:
             if not clusters:
                 results["status"] = "complete"
                 results["outcome"] = "no_clusters"
+                await monitor.update_status(pipeline_stage="IDLE")
                 return results
             
             # ================================================================
-            # PHASE 2 & 3: REASONING + VALIDATION (per cluster)
+            # PHASE 2, 3 & 4: CONCURRENT REASONING AND CROSS-EXCHANGE MAPPING
             # ================================================================
-            logger.info("Phase 2-3: Reasoning & Validation...")
-
-            manifests_saved = 0
-            total_constraints = 0
-            total_dependencies = 0
-            cache_hits = 0
-
-            total_clusters = len(clusters)
-            for idx, cluster in enumerate(clusters, 1):
-                # Progress logging
-                logger.info(
-                    f"Processing cluster {idx}/{total_clusters}",
-                    cluster_id=cluster.cluster_id,
-                    topic=cluster.topic,
-                )
-
-                manifest = await self._analyze_cluster(cluster)
-
-                if manifest:
-                    # Check if this was a cache hit
-                    if hasattr(manifest, '_from_cache') and manifest._from_cache:
-                        cache_hits += 1
-
-                    if manifest.constraint_count > 0:
-                        if self._store:
-                            await self._store.save_manifest(manifest)
-                        manifests_saved += 1
-                        total_constraints += manifest.constraint_count
-                        total_dependencies += manifest.dependency_count
-
-                # Progress percentage
-                progress_pct = (idx / total_clusters) * 100
-                logger.info(f"Progress: {progress_pct:.1f}% complete")
+            logger.info("Starting concurrent Reasoning Phase (Intra-market) and Matching Phase (Cross-exchange)...")
             
-            results["analysis"] = {
-                "manifests_saved": manifests_saved,
-                "total_constraints": total_constraints,
-                "total_dependencies": total_dependencies,
-                "cache_hits": cache_hits,
-                "cache_hit_rate": f"{(cache_hits / total_clusters * 100):.1f}%" if total_clusters > 0 else "0%",
-            }
+            async def run_reasoning_pipeline() -> dict[str, Any]:
+                await monitor.update_status(pipeline_stage="LOGIC")
+                manifests_saved = 0
+                total_constraints = 0
+                total_dependencies = 0
+                cache_hits = 0
+
+                total_clusters = len(clusters)
+                for idx, cluster in enumerate(clusters, 1):
+                    # Progress logging
+                    logger.info(
+                        f"Processing cluster {idx}/{total_clusters}",
+                        cluster_id=cluster.cluster_id,
+                        topic=cluster.topic,
+                    )
+
+                    manifest = await self._analyze_cluster(cluster)
+
+                    if manifest:
+                        # Check if this was a cache hit
+                        if hasattr(manifest, '_from_cache') and manifest._from_cache:
+                            cache_hits += 1
+
+                        if manifest.constraint_count > 0:
+                            if self._store:
+                                await self._store.save_manifest(manifest)
+                            manifests_saved += 1
+                            total_constraints += manifest.constraint_count
+                            total_dependencies += manifest.dependency_count
+
+                    # Progress percentage
+                    progress_pct = (idx / total_clusters) * 100
+                    logger.info(f"Progress: {progress_pct:.1f}% complete")
+                
+                return {
+                    "manifests_saved": manifests_saved,
+                    "total_constraints": total_constraints,
+                    "total_dependencies": total_dependencies,
+                    "cache_hits": cache_hits,
+                    "cache_hit_rate": f"{(cache_hits / total_clusters * 100):.1f}%" if total_clusters > 0 else "0%",
+                }
+
+            async def run_cross_exchange_pipeline() -> int:
+                await monitor.update_status(pipeline_stage="MATCHING")
+                if self._exchange_matcher:
+                    new_mappings = await self._exchange_matcher.run_matching_pipeline()
+                    return len(new_mappings)
+                return 0
+
+            # Run cross exchange matching first so reasoning pipeline can use the newly discovered Limitless pairs
+            new_cross_pairs = await run_cross_exchange_pipeline()
+            analysis_data = await run_reasoning_pipeline()
+            
+            results["analysis"] = analysis_data
+            results["cross_exchange_pairs"] = new_cross_pairs
             
             results["status"] = "complete"
             results["outcome"] = "success"
+            
+            await monitor.update_status(pipeline_stage="COMPLETE")
             
         except Exception as e:
             logger.error("Map building failed", error=str(e))
@@ -418,11 +443,56 @@ class MapMaker:
                 )
                 correlations = [s.model_dump(mode="json") for s in signals]
 
+            # Create limitless equivalencies
+            market_ids = [m.market_id for m in cluster.markets]
+            market_exchanges = {m.market_id: "polymarket" for m in cluster.markets}
+            
+            if self._exchange_matcher:
+                mapped = self._exchange_matcher.mapped_pairs
+                for m in cluster.markets:
+                    l_val = mapped.get(m.condition_id)
+                    if l_val:
+                        # Value might be "l_id|slug" or just "l_id"
+                        if "|" in l_val:
+                            l_id, l_slug = l_val.split("|", 1)
+                        else:
+                            l_id = l_val
+                            l_slug = ""
+                            
+                        if l_id not in market_ids:
+                            market_ids.append(l_id)
+                        
+                        # Add slug to market exchanges for downstream
+                        if l_slug:
+                            market_exchanges[l_id] = f"limitless:{l_slug}"
+                        else:
+                            market_exchanges[l_id] = "limitless"
+                            
+                        # Find YES and NO token ids for Polymarket
+                        pm_yes = None
+                        pm_no = None
+                        for out in m.outcomes:
+                            if "yes" in out.name.lower():
+                                pm_yes = out.token_id or out.outcome_id
+                            elif "no" in out.name.lower():
+                                pm_no = out.token_id or out.outcome_id
+                        
+                        l_yes = f"{l_id}_0"
+                        l_no = f"{l_id}_1"
+                        
+                        # Append to coefficients for all constraints so solver treats them as perfect substitutes
+                        for c in stored_constraints:
+                            if pm_yes and pm_yes in c.coefficients:
+                                c.coefficients[l_yes] = c.coefficients[pm_yes]
+                            if pm_no and pm_no in c.coefficients:
+                                c.coefficients[l_no] = c.coefficients[pm_no]
+
             # Create manifest
             manifest = ConstraintManifest(
                 cluster_id=cluster.cluster_id,
                 topic=cluster.topic,
-                market_ids=[m.market_id for m in cluster.markets],
+                market_ids=market_ids,
+                market_exchanges=market_exchanges,
                 constraints=stored_constraints,
                 dependencies=stored_dependencies,
                 correlations=correlations,

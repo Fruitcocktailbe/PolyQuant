@@ -324,6 +324,18 @@ class SCIPSolver:
                     # Priority: lower depth = lower priority number = execute first
                     depth = ob.total_ask_depth() if ob.asks else Decimal("1.0")
                     priority = int(10000 / max(float(depth), 1.0))  # Illiquid first
+                    
+                    exchange_info = validated.market_exchanges.get(extract_market_id(outcome_id), "polymarket")
+                    exchange_name = "polymarket"
+                    reason = ""
+                    
+                    if exchange_info.startswith("limitless:"):
+                        exchange_name = "limitless"
+                        slug = exchange_info.split(":")[1]
+                        reason = f"slug:{slug}"
+                    elif exchange_info == "limitless":
+                        exchange_name = "limitless"
+                        
                     trades.append(
                         ProposedTrade(
                             market_id=extract_market_id(outcome_id),
@@ -332,6 +344,8 @@ class SCIPSolver:
                             size=buy_size,
                             limit_price=ob.best_ask or Decimal("0.5"),
                             priority=priority,
+                            exchange=exchange_name,
+                            reason=reason
                         )
                     )
                 
@@ -339,6 +353,18 @@ class SCIPSolver:
                     ob = order_books[outcome_id]
                     depth = ob.total_bid_depth() if ob.bids else Decimal("1.0")
                     priority = int(10000 / max(float(depth), 1.0))
+                    
+                    exchange_info = validated.market_exchanges.get(extract_market_id(outcome_id), "polymarket")
+                    exchange_name = "polymarket"
+                    reason = ""
+                    
+                    if exchange_info.startswith("limitless:"):
+                        exchange_name = "limitless"
+                        slug = exchange_info.split(":")[1]
+                        reason = f"slug:{slug}"
+                    elif exchange_info == "limitless":
+                        exchange_name = "limitless"
+                        
                     trades.append(
                         ProposedTrade(
                             market_id=extract_market_id(outcome_id),
@@ -347,6 +373,8 @@ class SCIPSolver:
                             size=sell_size,
                             limit_price=ob.best_bid or Decimal("0.5"),
                             priority=priority,
+                            exchange=exchange_name,
+                            reason=reason
                         )
                     )
             
@@ -375,8 +403,21 @@ class SCIPSolver:
                         break
 
             from polyquant.utils import config
-            total_gas = Decimal(str(config.polygon_gas_per_tx)) * len(trades)
-            total_fees = sum((t.size * t.limit_price * Decimal(str(config.polymarket_taker_fee_pct))) for t in trades)
+            # Per-exchange gas and fee rates
+            total_gas = Decimal("0")
+            total_fees = Decimal("0")
+            poly_gas = Decimal(str(config.polygon_gas_per_tx))
+            base_gas = Decimal(str(config.base_gas_per_tx))
+            poly_fee_pct = Decimal(str(config.polymarket_taker_fee_pct))
+            limitless_fee_pct = Decimal(str(config.limitless_taker_fee_pct))
+            for t in trades:
+                exchange = getattr(t, "exchange", "polymarket")
+                if exchange == "limitless":
+                    total_gas += base_gas
+                    total_fees += t.size * t.limit_price * limitless_fee_pct
+                else:
+                    total_gas += poly_gas
+                    total_fees += t.size * t.limit_price * poly_fee_pct
             final_profit = obj_val - slippage_loss - total_gas - total_fees
             
             if final_profit <= Decimal("0"):

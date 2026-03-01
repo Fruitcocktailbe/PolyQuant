@@ -1,0 +1,88 @@
+# OMS Rust Upgrade Plan
+
+## Why a Rust Restructure?
+As identified in the Execution Stress Test, Python's Global Interpreter Lock (GIL) and threaded pseudo-async architecture add ~50-80ms of execution jitter. When atomic arbs execute across independent orders, this jitter can lead to "leg-outs" (one side fills, the other side matches late and fails). 
+
+A bare-metal Rust/Tokio architecture provides deterministic sub-millisecond execution jitter by running non-blocking asynchronous event loops without GIL bottlenecks.
+
+### Rust vs. Tokio: Understanding the Performance Leap
+While often mentioned together, Rust and Tokio solve two different latency problems that Python struggles with:
+
+**1. Rust (The Language - Eliminating Overhead & GC Pauses)**
+- **Predictability:** Python relies on a Garbage Collector (GC) that can unpredictably pause execution to free memory, causing sudden latency spikes (execution jitter). Rust uses compile-time memory ownership, meaning there are **no GC pauses** and memory management is completely deterministic.
+- **Raw Speed:** Python is an interpreted language; Rust is compiled to highly optimized machine code. Cryptographic operations like EIP-712 payload hashing and ECDSA signing take milliseconds in Python but only nanoseconds in Rust.
+
+**2. Tokio (The Async Runtime - Defeating the GIL)**
+- **True Concurrency:** Python's `asyncio` is concurrent but not truly parallel. Due to the Global Interpreter Lock (GIL), Python's event loop runs on a single thread. If one async task slightly blocks the CPU, the entire loop stalls.
+- **Work-Stealing Scheduler:** Tokio is a robust, multi-threaded async runtime. If one thread is busy signing a transaction, Tokio's scheduler automatically "steals" pending asynchronous HTTP requests and routes them to other idle CPU cores. This enables massive-throughput HTTP/2 multiplexing without a single-thread bottleneck.
+
+**The Combined Benefit:** We gain the raw cryptographic speed of a bare-metal language combined with true multi-core concurrent networking. This guarantees that our P99 trade execution time stays locked under ~2ms regardless of system load.
+
+---
+
+## 1. Architecture Shift: The "Sidecar" Pattern
+
+Fully rewriting the bot in Rust is a massive undertaking because the Pyomo/SCIP solvers and Bayesian logic are native to Python. **Therefore, we are proceeding with the Sidecar Pattern.**
+
+- **Python Strategy Container:** Continues to handle ML, Frank-Wolfe optimization, and high-level routing.
+- **Rust OMS Sidecar:** Runs as an ultra-low-latency gRPC or ZeroMQ server attached to the Python process.
+- **Workflow:** Python says `Execute(TradeBatch)`; Rust handles EIP-712 scaling, signing, and multiplexed HTTP/2 outbound requests in <2ms.
+
+## 2. Full Rewrite vs. The Sidecar Approach
+
+A frequent question is: **Why not rewrite the entire bot in Rust?** 
+
+### Advantages of a Full Rewrite
+- **Zero IPC Overhead:** Eliminates the serialization (Protobuf/JSON) and latency overhead of communicating between a Python process and a Rust sidecar.
+- **Single Ecosystem:** Simplifies CI/CD, dependency management, and deployment by removing the need to manage a polyglot environment.
+- **Global Memory Safety:** Every component, from data ingestion to math modeling to execution, benefits from Rust's strictly enforced memory safety and fearless concurrency.
+
+### Disadvantages & The Timeline Reality
+While a full rewrite is technically superior, it poses a severe business risk due to the sheer volume of numeric and statistical logic native to Python:
+- **Solver Porting:** The Strategy Container currently relies on `Pyomo` and `SCIP` for complex non-linear and integer programming (e.g., the Frank-Wolfe optimizer). Porting this to a Rust equivalent (like `good_lp`) requires translating intricate mathematical models, which is highly error-prone.
+- **ML & Data Ecosystem:** Python's dominance in Data Science means integrating ML models, Bayesian updates, and deep historical backtesting is frictionless. Rebuilding this scaffolding in Rust (e.g., using `linfa` or bridging to `candle`) drastically slows down research velocity.
+
+**Estimated Timeline for a Full Rewrite:** **6 to 9 Months**
+- *Months 1-3:* Porting core execution, networking, and data stream components.
+- *Months 4-7:* Translating mathematical solvers, strategy logic, and ML model inference into Rust.
+- *Months 8-9:* Extensive QA, shadowing, and parity testing against the legacy Python system to ensure no edge-case logic was lost.
+
+**Estimated Timeline for the Sidecar Approach:** **4 to 6 Weeks**
+By keeping the complex math in Python and only rewriting the latency-sensitive execution pipeline (crypto signing & HTTP/2 dispatch) in Rust, we achieve 95% of the performance benefits in a fraction of the time.
+
+---
+
+## 3. Core Components to Port
+
+### A. EIP-712 Signing Engine (`ethers-rs` / `alloy`)
+Move all `eth_account.messages.encode_typed_data` out of Python. Rust's `alloy` (the modern rewrite of `ethers-rs`) can sign EIP-712 payloads in nanoseconds.
+
+### B. Multiplexed HTTP/2 Dispatch Sender (`reqwest` & `hyper`)
+Replace `py-clob-client` and `httpx` with Rust's `reqwest` maintaining a persistent HTTP/2 `Keep-Alive` connection to Polymarket and Limitless endpoints. This eliminates SSL handshake latency on new orders.
+
+### C. Nonce & Expiration Streamer
+The Rust OMS will maintain an in-memory replica of the EVM Nonce synced directly from Alchemy via `alloy_providers`, bypassing the need to ever fetch nonces at execution time.
+
+## 3. Implementation Phases
+
+| Phase | Component | Est. Complexity |
+| --- | --- | --- |
+| **Phase 1: Rust IPC (Inter-Process Communication)** | Set up a ZeroMQ `REQ/REP` socket or local gRPC linking `polyquant-python` to `polyquant-rust-oms`. | Medium |
+| **Phase 2: Port Limitless Client** | Write a Rust struct that handles Limitless FOK order signing and submission. Verify `Decimal` scaling purely in Rust's `rust_decimal` crate. | Hard |
+| **Phase 3: Port Polymarket Client** | Reverse-engineer the `py-clob-client` API requests and implement them as pure Rust `reqwest` calls. | Hard |
+| **Phase 4: OMS Router** | Update `executor.py` so `_submit_order` just fires a protobuf payload to the Rust Sidecar. | Medium |
+
+## 5. Added Requirements & Complexity
+Moving to a polyglot architecture (Python + Rust) introduces new operational and development requirements:
+
+### A. Infrastructure & DevOps
+- **Dual Build Pipelines:** The CI/CD pipeline must now compile a Rust binary (requiring `cargo` and Rust toolchains) alongside the Python environment build.
+- **Dependency Management:** We must manage two separate ecosystems: `requirements.txt` / `pyproject.toml` for Python, and `Cargo.toml` for Rust. Security audits and dependency updates must be performed on both.
+
+### B. Inter-Process Communication (IPC) Overhead
+- **Serialization Costs:** Data (like order details) must be serialized in Python (e.g., to Protobuf or JSON), sent over the IPC channel (gRPC/ZeroMQ), and deserialized in Rust. While fast, this schema must be strictly maintained across both codebases.
+- **Lifecycle Management:** The Python parent process must reliably start, monitor, and gracefully shut down the Rust sidecar child process. If the sidecar crashes, the Python bot must detect it and halt trading to prevent unmanaged exposure.
+
+### C. Developer Experience 
+- **Skillset Expansion:** Maintainers must be proficient in both Python (for quantitative logic) and asynchronous Rust (for execution logic).
+- **Debugging Complexity:** Tracing a failed trade now spans two isolated processes. Correlated logging (sharing a `trace_id` between Python and Rust) becomes a mandatory requirement for effective debugging.

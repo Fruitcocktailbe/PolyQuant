@@ -32,23 +32,24 @@ class TestSolvers(unittest.IsolatedAsyncioTestCase):
                     id="c1",
                     constraint_id="c1",
                     description="test",
-                    coefficients={"m1_yes": 1.0, "m1_no": 1.0},
-                    rhs=1.0,
+                    coefficients={"m1_yes": Decimal("1.0"), "m1_no": Decimal("1.0")},
+                    rhs=Decimal("1.0"),
                     operator=">="
                 )
             ],
-            issues=[]
+            issues=[],
+            market_exchanges={"m1": "polymarket"}
         )
         self.order_books = {
             "m1_yes": OrderBook(
                 outcome_id="m1_yes",
-                asks=[OrderLevel(price=0.6, size=100.0)],
-                bids=[OrderLevel(price=0.55, size=100.0)]
+                asks=[OrderLevel(price=Decimal("0.6"), size=Decimal("10000.0"))],
+                bids=[OrderLevel(price=Decimal("0.55"), size=Decimal("10000.0"))]
             ),
             "m1_no": OrderBook(
                 outcome_id="m1_no",
-                asks=[OrderLevel(price=0.3, size=100.0)],
-                bids=[OrderLevel(price=0.25, size=100.0)]
+                asks=[OrderLevel(price=Decimal("0.3"), size=Decimal("10000.0"))],
+                bids=[OrderLevel(price=Decimal("0.25"), size=Decimal("10000.0"))]
             ),
         }
 
@@ -78,7 +79,7 @@ class TestSolvers(unittest.IsolatedAsyncioTestCase):
         detector = ArbitrageDetector(scip_solver=scip, position_sizer=sizer)
         
         # Mock fw_solver.find_opportunity
-        detector.fw_solver.find_opportunity = MagicMock(return_value={
+        detector.fw_solver.find_opportunity = AsyncMock(return_value={
             "m1_yes": 0.7,
             "m1_no": 0.35,
         })
@@ -90,13 +91,14 @@ class TestSolvers(unittest.IsolatedAsyncioTestCase):
         detector.fw_solver.find_opportunity.assert_called_once()
         
         trades = {t.outcome_id: t for t in opp.trades}
+        print(f"TRADES FOUND: {trades}")
         self.assertIn("m1_yes", trades)
         self.assertEqual(trades["m1_yes"].side, OrderSide.BUY)
-        self.assertEqual(trades["m1_yes"].limit_price, 0.6)
+        self.assertEqual(trades["m1_yes"].limit_price, Decimal("0.6"))
         
         self.assertIn("m1_no", trades)
         self.assertEqual(trades["m1_no"].side, OrderSide.BUY)
-        self.assertEqual(trades["m1_no"].limit_price, 0.3)
+        self.assertEqual(trades["m1_no"].limit_price, Decimal("0.3"))
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,7 @@ class ValidatedResult(BaseModel):
     validated_dependencies: list[MarketDependency] = Field(default_factory=list)
     validated_constraints: list[LogicalConstraint] = Field(default_factory=list)
     adjusted_confidences: dict[str, float] = Field(default_factory=dict)
+    market_exchanges: dict[str, str] = Field(default_factory=dict)
     validation_notes: str = ""
     validated_at: datetime = Field(default_factory=datetime.utcnow)
     

@@ -127,7 +127,12 @@ class PolyQuantConfig(BaseSettings):
         default="https://mainnet.base.org",
         description="Base RPC URL for fetching Limitless USDC balances"
     )
-    
+
+    base_rpc_fallback_urls: list[str] = Field(
+        default_factory=list,
+        description="Backup Base RPC URLs for failover (comma-separated in env: BASE_RPC_FALLBACK_URLS)"
+    )
+
     # =========================================================================
     # Redis Cache Configuration
     # =========================================================================
@@ -193,6 +198,18 @@ class PolyQuantConfig(BaseSettings):
         description="Target decision-to-mempool latency in milliseconds"
     )
     
+    ws_max_age_ms: int = Field(
+        default=200,
+        ge=10,
+        description="Dead Man's Switch: max age of websocket messages before halting"
+    )
+
+    order_expiration_seconds: int = Field(
+        default=6,
+        ge=1,
+        description="Limitless order expiration deadline (approx 3 Polygon blocks)"
+    )
+    
     vwap_slippage_limit: float = Field(
         default=0.05,
         ge=0.0,
@@ -228,7 +245,82 @@ class PolyQuantConfig(BaseSettings):
         description="Maximum Frank-Wolfe iterations before stopping"
     )
 
-    
+    # =========================================================================
+    # Risk & Position Sizing
+    # =========================================================================
+
+    kelly_fraction: float = Field(
+        default=0.5,
+        ge=0.01, le=1.0,
+        description="Fraction of full Kelly to use (0.5 = Half Kelly)"
+    )
+
+    max_single_trade_pct: float = Field(
+        default=0.05,
+        ge=0.01, le=1.0,
+        description="Max fraction of capital per single trade (0.05 = 5%)"
+    )
+
+    max_total_exposure_pct: float = Field(
+        default=0.25,
+        ge=0.01, le=1.0,
+        description="Max fraction of capital for total open exposure (0.25 = 25%)"
+    )
+
+    # =========================================================================
+    # Market Discovery & Filtering
+    # =========================================================================
+
+    min_liquidity: float = Field(
+        default=1000.0,
+        ge=0.0,
+        description="Minimum event liquidity in USD for Map Maker scanning"
+    )
+
+    zombie_low_threshold: float = Field(
+        default=0.02,
+        ge=0.0, le=0.5,
+        description="Lower zombie price threshold (reject extreme prices)"
+    )
+
+    zombie_high_threshold: float = Field(
+        default=0.98,
+        ge=0.5, le=1.0,
+        description="Upper zombie price threshold (reject extreme prices)"
+    )
+
+    # =========================================================================
+    # LLM Configuration
+    # =========================================================================
+
+    llm_temperature: float = Field(
+        default=0.3,
+        ge=0.0, le=2.0,
+        description="LLM Temperature for generation"
+    )
+
+    validator_confidence_threshold: float = Field(
+        default=0.8,
+        ge=0.0, le=1.0,
+        description="Minimum confidence score from Validator Agent to proceed"
+    )
+
+    # =========================================================================
+    # Solver Fine-tuning
+    # =========================================================================
+
+    scip_gap: float = Field(
+        default=0.01,
+        ge=0.0, le=1.0,
+        description="SCIP Optimality Gap limit"
+    )
+
+    min_trade_size: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Minimum trade size in USD to execute"
+    )
+
     # =========================================================================
     # Logging Configuration
     # =========================================================================

@@ -1,0 +1,260 @@
+﻿
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  1. Module Imports
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [92mÔ£ô PASS[0m  BayesianUpdater imports
+  [92mÔ£ô PASS[0m  CorrelationEngine imports
+  [92mÔ£ô PASS[0m  BayesianUpdater in agents/__init__
+  [92mÔ£ô PASS[0m  TradeExecutor imports (fill quality)
+  [92mÔ£ô PASS[0m  PositionSizer imports (empirical kelly)
+  [92mÔ£ô PASS[0m  PolymarketWSClient imports (sequence tracking)
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  2. BayesianUpdater Logic
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [92mÔ£ô PASS[0m  BayesianUpdater instantiates
+2026-03-01T15:22:02.716286Z [info     ] Bayesian dependency graph loaded [polyquant.agents.bayesian_updater] manifests=1 outcomes_tracked=2 total_links=2
+  [92mÔ£ô PASS[0m  Dependency graph loaded ÔÇö 2 outcomes tracked
+  [92mÔ£ô PASS[0m  First tick: no adjustments (no delta)
+2026-03-01T15:22:02.716644Z [debug    ] Phantom prevention: outcome_a dropped -0.100, outcome_b hasn't reacted. Adjusting from 0.550 ÔåÆ 0.505 [polyquant.agents.bayesian_updater]
+2026-03-01T15:22:02.716837Z [info     ] Bayesian price adjustments applied [polyquant.agents.bayesian_updater] adjustments=1 movers=1 phantoms_prevented=1 total_adjustments=1
+  [92mÔ£ô PASS[0m  Second tick: adjustment triggered ÔÇö 1 adjustment(s)
+  [92mÔ£ô PASS[0m  Adjustment has correct outcome_id
+  [92mÔ£ô PASS[0m  Adjusted price < raw price (implies, A dropped) ÔÇö 0.550 ÔåÆ 0.505
+  [92mÔ£ô PASS[0m  Phantom prevention counted ÔÇö 1 phantoms prevented
+  [92mÔ£ô PASS[0m  Stats method works
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  3. WebSocket Sequence Tracking
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [92mÔ£ô PASS[0m  WSClient has _last_sequence
+  [92mÔ£ô PASS[0m  WSClient has _sequence_gaps
+  [92mÔ£ô PASS[0m  WSClient has _stale_assets
+  [92mÔ£ô PASS[0m  Sequence tracking fields initialized
+  [92mÔ£ô PASS[0m  Stale assets starts empty
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  4. Fill Quality Tracking
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [91mÔ£ù FAIL[0m  Fill Quality Tracking ÔÇö TradeExecutor.__init__() got an unexpected keyword argument 'client'
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  5. Correlation Engine Safeguards
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [92mÔ£ô PASS[0m  CorrelationEngine instantiates
+  [92mÔ£ô PASS[0m  Pearson correlation works ÔÇö r=0.9954
+  [92mÔ£ô PASS[0m  Uncorrelated pair detected ÔÇö r=0.3000
+  [92mÔ£ô PASS[0m  MIN_HISTORY_POINTS = 50
+  [92mÔ£ô PASS[0m  MIN_STABLE_CORRELATION = 0.7
+  [92mÔ£ô PASS[0m  ACCURACY_KILL_THRESHOLD = 0.55
+  [92mÔ£ô PASS[0m  MAX_PAIRS_TO_TEST = 200
+  [92mÔ£ô PASS[0m  Pair accuracy below threshold ÔÇö accuracy=40%
+  [92mÔ£ô PASS[0m  Pair is_stable works
+  [92mÔ£ô PASS[0m  Pair is_significant works
+  [92mÔ£ô PASS[0m  check_for_signals returns list
+  [92mÔ£ô PASS[0m  Stats method works
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  6. Empirical Kelly MC
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+2026-03-01T15:22:02.717559Z [info     ] PositionSizer initialized      [polyquant.risk.position_sizing] capital=10000 limits={'max_single_trade_pct': 0.05, 'max_total_exposure_pct': 0.25, 'max_orderbook_depth_pct': 0.5, 'kelly_fraction': 0.5}
+  [92mÔ£ô PASS[0m  PositionSizer has edge_history
+  [92mÔ£ô PASS[0m  PositionSizer has cv_edge
+  [92mÔ£ô PASS[0m  PositionSizer has edge_uncertainty property
+2026-03-01T15:22:02.717846Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.718169Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.718503Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.718822Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.719141Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.719454Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.719774Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.720086Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.720395Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+2026-03-01T15:22:02.720727Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2083.3333333333335 limited_by=single_trade_limit odds=1.5 probability=0.65 recommended_size=500.0
+  [92mÔ£ô PASS[0m  Consistent edges ÔåÆ low CV ÔÇö CV=0.000
+2026-03-01T15:22:02.721055Z [info     ] PositionSizer initialized      [polyquant.risk.position_sizing] capital=10000 limits={'max_single_trade_pct': 0.05, 'max_total_exposure_pct': 0.25, 'max_orderbook_depth_pct': 0.5, 'kelly_fraction': 0.5}
+2026-03-01T15:22:02.721279Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=4166.666666666667 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.721585Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=1250.0000000000002 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.721903Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=4166.666666666667 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.722213Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=1250.0000000000002 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.722581Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.476 factor=0.524 kelly_after=2182.13 kelly_before=4166.67
+2026-03-01T15:22:02.722852Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2182.1263658006665 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.723162Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.723427Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.9230769230772 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.723734Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.495 factor=0.505 kelly_after=2104.70 kelly_before=4166.67
+2026-03-01T15:22:02.724005Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2104.701419560861 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.724312Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.724580Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.923076923077 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.725037Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.505 factor=0.495 kelly_after=2062.84 kelly_before=4166.67
+2026-03-01T15:22:02.725436Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2062.839268481381 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.725908Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.726193Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.923076923077 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.726504Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.511 factor=0.489 kelly_after=2036.63 kelly_before=4166.67
+2026-03-01T15:22:02.726770Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2036.6344985910212 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.727081Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.727348Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.9230769230772 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.727656Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.516 factor=0.484 kelly_after=2018.69 kelly_before=4166.67
+2026-03-01T15:22:02.727936Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2018.6938973080014 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.728247Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.728511Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.923076923077 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.728819Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.519 factor=0.481 kelly_after=2005.64 kelly_before=4166.67
+2026-03-01T15:22:02.729089Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=2005.6434234803971 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.729396Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.729661Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.923076923077 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.729974Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.521 factor=0.479 kelly_after=1995.72 kelly_before=4166.67
+2026-03-01T15:22:02.730236Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=1995.7247946027057 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.730541Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.730803Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.9230769230772 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+2026-03-01T15:22:02.731112Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.523 factor=0.477 kelly_after=1987.93 kelly_before=4166.67
+2026-03-01T15:22:02.731375Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=1987.9320582829416 limited_by=single_trade_limit odds=1.5 probability=0.9 recommended_size=500.0
+2026-03-01T15:22:02.731684Z [debug    ] Empirical Kelly adjustment applied [polyquant.risk.position_sizing] cv_edge=0.538 factor=0.462 kelly_after=576.92 kelly_before=1250.00
+2026-03-01T15:22:02.731955Z [debug    ] Position size calculated       [polyquant.risk.position_sizing] kelly_size=576.923076923077 limited_by=single_trade_limit odds=1.5 probability=0.55 recommended_size=500.0
+  [92mÔ£ô PASS[0m  Volatile edges ÔåÆ higher CV ÔÇö CV=0.538
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  7. Navigator Integration Fields
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [92mÔ£ô PASS[0m  Navigator has _bayesian_updater
+  [92mÔ£ô PASS[0m  Navigator has _correlation_engine
+  [92mÔ£ô PASS[0m  Navigator has _previous_prices
+  [92mÔ£ô PASS[0m  __aenter__ creates BayesianUpdater
+  [92mÔ£ô PASS[0m  __aenter__ loads dependencies
+  [92mÔ£ô PASS[0m  __aenter__ creates CorrelationEngine
+  [92mÔ£ô PASS[0m  _detect uses stale_tokens filter
+  [92mÔ£ô PASS[0m  _detect uses bayesian_updater
+  [92mÔ£ô PASS[0m  _detect uses adjust_prices
+  [92mÔ£ô PASS[0m  _detect uses correlation signals
+  [92mÔ£ô PASS[0m  _detect updates previous_prices
+  [92mÔ£ô PASS[0m  run() collects stale_tokens
+  [92mÔ£ô PASS[0m  run() passes stale_tokens to detect
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  SUMMARY
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
+  Total: 50  |  Passed: 49  |  Failed: 1
+
+  Failed tests:
+    Ô£ù Fill Quality Tracking
+
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+  [91m1 CHECK(S) FAILED ÔÇö Review needed[0m
+ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
+============================= test session starts =============================
+platform win32 -- Python 3.14.3, pytest-9.0.2, pluggy-1.6.0
+rootdir: D:\GithubLocal\PolyQuant
+configfile: pyproject.toml
+plugins: anyio-4.12.1, langsmith-0.6.9
+collected 3 items
+INTERNALERROR> Traceback (most recent call last):
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 318, in wrap_session
+INTERNALERROR>     session.exitstatus = doit(config, session) or 0
+INTERNALERROR>                          ~~~~^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 371, in _main
+INTERNALERROR>     config.hook.pytest_collection(session=session)
+INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_hooks.py", line 512, in __call__
+INTERNALERROR>     return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+INTERNALERROR>            ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_manager.py", line 120, in _hookexec
+INTERNALERROR>     return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+INTERNALERROR>            ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 167, in _multicall
+INTERNALERROR>     raise exception
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 139, in _multicall
+INTERNALERROR>     teardown.throw(exception)
+INTERNALERROR>     ~~~~~~~~~~~~~~^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\logging.py", line 788, in pytest_collection
+INTERNALERROR>     return (yield)
+INTERNALERROR>             ^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 139, in _multicall
+INTERNALERROR>     teardown.throw(exception)
+INTERNALERROR>     ~~~~~~~~~~~~~~^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\warnings.py", line 98, in pytest_collection
+INTERNALERROR>     return (yield)
+INTERNALERROR>             ^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 139, in _multicall
+INTERNALERROR>     teardown.throw(exception)
+INTERNALERROR>     ~~~~~~~~~~~~~~^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\config\__init__.py", line 1403, in pytest_collection
+INTERNALERROR>     return (yield)
+INTERNALERROR>             ^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 121, in _multicall
+INTERNALERROR>     res = hook_impl.function(*args)
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 382, in pytest_collection
+INTERNALERROR>     session.perform_collect()
+INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~~^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 857, in perform_collect
+INTERNALERROR>     self.items.extend(self.genitems(node))
+INTERNALERROR>     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 1020, in genitems
+INTERNALERROR>     rep, duplicate = self._collect_one_node(node, handle_dupes)
+INTERNALERROR>                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\main.py", line 883, in _collect_one_node
+INTERNALERROR>     rep = collect_one_node(node)
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\runner.py", line 576, in collect_one_node
+INTERNALERROR>     rep: CollectReport = ihook.pytest_make_collect_report(collector=collector)
+INTERNALERROR>                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_hooks.py", line 512, in __call__
+INTERNALERROR>     return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+INTERNALERROR>            ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_manager.py", line 120, in _hookexec
+INTERNALERROR>     return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+INTERNALERROR>            ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 167, in _multicall
+INTERNALERROR>     raise exception
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 139, in _multicall
+INTERNALERROR>     teardown.throw(exception)
+INTERNALERROR>     ~~~~~~~~~~~~~~^^^^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\capture.py", line 880, in pytest_make_collect_report
+INTERNALERROR>     rep = yield
+INTERNALERROR>           ^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\pluggy\_callers.py", line 121, in _multicall
+INTERNALERROR>     res = hook_impl.function(*args)
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\runner.py", line 400, in pytest_make_collect_report
+INTERNALERROR>     call = CallInfo.from_call(
+INTERNALERROR>         collect, "collect", reraise=(KeyboardInterrupt, SystemExit)
+INTERNALERROR>     )
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\runner.py", line 353, in from_call
+INTERNALERROR>     result: TResult | None = func()
+INTERNALERROR>                              ~~~~^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\runner.py", line 398, in collect
+INTERNALERROR>     return list(collector.collect())
+INTERNALERROR>                 ~~~~~~~~~~~~~~~~~^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\python.py", line 563, in collect
+INTERNALERROR>     self._register_setup_module_fixture()
+INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\python.py", line 576, in _register_setup_module_fixture
+INTERNALERROR>     self.obj, ("setUpModule", "setup_module")
+INTERNALERROR>     ^^^^^^^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\python.py", line 289, in obj
+INTERNALERROR>     self._obj = obj = self._getobj()
+INTERNALERROR>                       ~~~~~~~~~~~~^^
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\python.py", line 560, in _getobj
+INTERNALERROR>     return importtestmodule(self.path, self.config)
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\python.py", line 507, in importtestmodule
+INTERNALERROR>     mod = import_path(
+INTERNALERROR>         path,
+INTERNALERROR>     ...<2 lines>...
+INTERNALERROR>         consider_namespace_packages=config.getini("consider_namespace_packages"),
+INTERNALERROR>     )
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\pathlib.py", line 587, in import_path
+INTERNALERROR>     importlib.import_module(module_name)
+INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+INTERNALERROR>   File "C:\Python314\Lib\importlib\__init__.py", line 88, in import_module
+INTERNALERROR>     return _bootstrap._gcd_import(name[level:], package, level)
+INTERNALERROR>            ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "<frozen importlib._bootstrap>", line 1398, in _gcd_import
+INTERNALERROR>   File "<frozen importlib._bootstrap>", line 1371, in _find_and_load
+INTERNALERROR>   File "<frozen importlib._bootstrap>", line 1342, in _find_and_load_unlocked
+INTERNALERROR>   File "<frozen importlib._bootstrap>", line 938, in _load_unlocked
+INTERNALERROR>   File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\_pytest\assertion\rewrite.py", line 197, in exec_module
+INTERNALERROR>     exec(co, module.__dict__)
+INTERNALERROR>     ~~~~^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR>   File "D:\GithubLocal\PolyQuant\tests\test_integration_check.py", line 326, in <module>
+INTERNALERROR>     sys.exit(0 if failed == 0 else 1)
+INTERNALERROR>     ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+INTERNALERROR> SystemExit: 1
+
+============================= 3 warnings in 1.40s =============================

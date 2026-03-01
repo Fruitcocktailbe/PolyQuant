@@ -189,10 +189,10 @@ The YES Price is the current market probability (0.00 to 1.00).
         if not market.outcomes:
             return True  # No outcomes = invalid market
 
-        # Count extreme outcomes
+        # Count extreme outcomes using config thresholds
         extreme_count = sum(
             1 for o in market.outcomes
-            if o.price < 0.02 or o.price > 0.98
+            if o.price < config.zombie_low_threshold or o.price > config.zombie_high_threshold
         )
 
         # Only filter if ALL outcomes are extreme
@@ -223,7 +223,7 @@ The YES Price is the current market probability (0.00 to 1.00).
     async def scan_markets(
         self,
         limit: int = 100,
-        min_liquidity: float = 1000.0,
+        min_liquidity: float | None = None,  # Defaults to config
         skip_processed: bool = True,
         start_offset: int = 0,
     ) -> list[MarketCluster]:
@@ -247,15 +247,17 @@ The YES Price is the current market probability (0.00 to 1.00).
         if not self._polymarket:
             raise RuntimeError("DiscoveryAgent not initialized. Use 'async with discovery:'")
         
+        min_liquidity_val = min_liquidity if min_liquidity is not None else config.min_liquidity
+
         logger.info(
             "Scanning markets (event-based pipeline)",
-            min_liquidity=min_liquidity,
+            min_liquidity=min_liquidity_val,
             skip_processed=skip_processed,
         )
         
         # ── Phase 1: Fetch events from API (sorted by liquidity desc) ──
         events = await self._polymarket.get_active_events(
-            min_liquidity=min_liquidity,
+            min_liquidity=min_liquidity_val,
             max_events=limit,
         )
         
@@ -564,7 +566,7 @@ The YES Price is the current market probability (0.00 to 1.00).
 # Convenience function for simple usage
 async def discover_markets(
     limit: int = 100,
-    min_liquidity: float = 1000.0,
+    min_liquidity: float | None = None,
 ) -> list[MarketCluster]:
     """
     Convenience function to discover and cluster markets.
