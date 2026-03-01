@@ -394,6 +394,7 @@ class Navigator:
         # Start Sidecar UI Server
         config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
         server = uvicorn.Server(config_uv)
+        self._uvicorn_server = server  # Store reference for graceful shutdown
         self._server_task = asyncio.create_task(server.serve())
         setup_web_logging()
         await monitor.update_status(status="STARTING")
@@ -609,11 +610,22 @@ class Navigator:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if self._server_task is not None:
+        if getattr(self, "_uvicorn_server", None) is not None:
+            # Tell uvicorn to shut down gracefully instead of hard canceling
+            self._uvicorn_server.should_exit = True
+            
+            # Wait for the task to finish gracefully
+            if self._server_task is not None:
+                try:
+                    await asyncio.wait_for(self._server_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+        elif self._server_task is not None:
+            # Fallback to hard cancel if we don't have the server object
             self._server_task.cancel()
             try:
-                await self._server_task
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(self._server_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
 
         if hasattr(self, "_limitless_polling_task") and self._limitless_polling_task is not None:
