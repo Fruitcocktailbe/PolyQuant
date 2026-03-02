@@ -28,9 +28,6 @@ logger = get_logger(__name__)
 # OpenRouter base URL (OpenAI-compatible)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Default model: free router picks from available free models
-DEFAULT_MODEL = "openrouter/free"
-
 
 @lru_cache(maxsize=1)
 def get_llm_client() -> OpenAI | None:
@@ -68,8 +65,8 @@ def get_llm_client() -> OpenAI | None:
 def call_llm_json(
     prompt: str,
     system_prompt: str = "",
-    model: str = DEFAULT_MODEL,
-    temperature: float = 0.3,
+    model: str | None = None,
+    temperature: float | None = None,
 ) -> dict[str, Any] | None:
     """
     Call the LLM and parse a JSON response.
@@ -77,8 +74,8 @@ def call_llm_json(
     Args:
         prompt: User message content
         system_prompt: System instruction (optional)
-        model: Model identifier (default: openrouter/free)
-        temperature: Sampling temperature
+        model: Model identifier (defaults to config.llm_model)
+        temperature: Sampling temperature (defaults to config.llm_temperature)
 
     Returns:
         Parsed JSON dict, or None on failure
@@ -86,6 +83,10 @@ def call_llm_json(
     client = get_llm_client()
     if not client:
         return None
+
+    # Use configuration defaults if not provided
+    model = model or config.llm_model
+    temperature = temperature if temperature is not None else config.llm_temperature
 
     messages = []
     # FIX: Some free models (Gemma via Google AI Studio) reject the 'system' role

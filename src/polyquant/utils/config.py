@@ -356,6 +356,11 @@ class PolyQuantConfig(BaseSettings):
     # LLM Configuration
     # =========================================================================
 
+    llm_model: str = Field(
+        default="openrouter/free",
+        description="LLM Model identifier (e.g., 'openrouter/free', 'google/gemini-2.0-flash-exp:free')"
+    )
+
     llm_temperature: float = Field(
         default=0.3,
         ge=0.0, le=2.0,
