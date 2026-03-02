@@ -316,6 +316,88 @@ class PositionSizer:
         
         return self.calculate_size(probability, odds, dollar_depth)
     
+    def calculate_dutching_sizes(
+        self,
+        odds_list: list[float],
+        depth_list: list[float],
+    ) -> list[PositionSize]:
+        """
+        Calculate risk-free arbitrage sizes across a group of mutually exclusive outcomes.
+        
+        This uses the Dutching method: staking optimally across all legs such that
+        a guaranteed profit is locked in, regardless of the event's outcome.
+        
+        Args:
+            odds_list: Decimal odds for each leg.
+            depth_list: Available liquidity (in dollars) for each leg.
+            
+        Returns:
+            A list of PositionSize objects, one for each leg in order.
+            If no risk-free arbitrage exists (implied probability sum >= 1.0),
+            returns sizes of 0.
+        """
+        if not odds_list or len(odds_list) != len(depth_list):
+            logger.warning("Invalid inputs to dutching sizing", count_odds=len(odds_list), count_depth=len(depth_list))
+            return [PositionSize(recommended_size=0, kelly_size=0, limited_by="invalid_input", probability=0, expected_value=0)] * len(odds_list)
+            
+        # Calculate implied probabilities: p = 1 / (odds + 1)
+        implied_probs = [1.0 / (odds + 1.0) if odds > 0 else 0.5 for odds in odds_list]
+        sum_implied = sum(implied_probs)
+        
+        # If sum >= 1.0, there is no risk-free arbitrage
+        if sum_implied >= 1.0:
+            logger.debug("No Dutching arbitrage exists", sum_implied=sum_implied)
+            return [
+                PositionSize(recommended_size=0, kelly_size=0, limited_by="no_arb", probability=p, expected_value=0)
+                for p in implied_probs
+            ]
+            
+        # Expected percentage profit on total capital staked across all legs
+        percent_profit = (1.0 / sum_implied) - 1.0
+        
+        # Calculate maximum possible total stake T across the entire ring
+        # 1. Capital constraints
+        max_total_exposure = self.capital * self.limits.max_total_exposure_pct - self.current_exposure
+        max_single_trade_exposure = self.capital * self.limits.max_single_trade_pct # Treating the entire ring as one synthetic 'trade'
+        max_t = min(max_total_exposure, max_single_trade_exposure)
+        
+        # 2. Liquidity constraints (bottleneck detection)
+        # stake_i = T * (p_i / sum_implied)
+        # We require stake_i <= depth_i * limit  =>  T <= (depth_i * limit * sum_implied) / p_i
+        limiting_constraint = "capital_limits"
+        for i, (p_i, depth_i) in enumerate(zip(implied_probs, depth_list)):
+            leg_max_stake = depth_i * self.limits.max_orderbook_depth_pct
+            max_t_for_leg = (leg_max_stake * sum_implied) / p_i
+            
+            if max_t_for_leg < max_t:
+                max_t = max_t_for_leg
+                limiting_constraint = f"leg_{i}_liquidity"
+                
+        # Generate final sizes
+        final_sizes = []
+        for p_i in implied_probs:
+            stake_i = max_t * (p_i / sum_implied)
+            # number of shares = stake / price
+            # Since p_i = 1 / (odds + 1), and price = 1 / (odds + 1), p_i is exactly the price
+            shares_i = stake_i / p_i if p_i > 0 else 0.0
+            
+            final_sizes.append(PositionSize(
+                recommended_size=max(0.0, shares_i),
+                kelly_size=0.0, # N/A for Dutching
+                limited_by=limiting_constraint,
+                probability=p_i,
+                expected_value=percent_profit # Expected percentage margin
+            ))
+            
+        logger.debug(
+            "Dutching position size calculated",
+            sum_implied=f"{sum_implied:.4f}",
+            guaranteed_margin=f"{percent_profit*100:.2f}%",
+            total_stake=max_t,
+            limited_by=limiting_constraint
+        )
+        return final_sizes
+    
     def update_exposure(self, amount: float) -> None:
         """Update current exposure after a trade."""
         self.current_exposure += amount

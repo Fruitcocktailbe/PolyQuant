@@ -26,7 +26,7 @@ except ImportError:
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
 from polyquant.utils.llm_client import call_llm_json
-from polyquant.utils import get_logger
+from polyquant.utils import get_logger, config
 
 logger = get_logger(__name__)
 
@@ -203,12 +203,29 @@ class ExchangeMatcher:
             if p_market.market_id in processed_p_market_ids:
                 continue # We already mapped this Polymarket event from a different Limitless suggestion
                 
-            if isinstance(resp, Exception):
-                logger.error(f"LLM evaluation failed for market matching: {resp}")
-                continue
-                
-            if resp and resp.get("is_match") is True:
-                logger.info(f"MATCH FOUND [{meta['sim_score']:.2f}]: {p_market.question[:30]}... == LIMITLESS {meta['l_title'][:30]}...")
+            is_match = False
+            match_reason = "LLM Verified"
+
+            if isinstance(resp, Exception) or resp is None:
+                # LLM FAILED (400 error or timeout) - Check for vector fallback
+                if meta["sim_score"] > 0.92:
+                    logger.warning(
+                        "LLM FAILED - Using High-Confidence Vector Fallback (>0.92)",
+                        p_question=p_market.question[:30],
+                        l_title=meta['l_title'][:30],
+                        score=meta['sim_score']
+                    )
+                    is_match = True
+                    match_reason = "Vector Fallback (LLM Failed)"
+                else:
+                    logger.error(f"LLM evaluation failed and score ({meta['sim_score']:.2f}) too low for fallback: {resp}")
+                    continue
+            else:
+                is_match = resp.get("is_match") is True
+                match_reason = resp.get("reasoning", "LLM Verified")
+
+            if is_match:
+                logger.info(f"MATCH FOUND [{meta['sim_score']:.2f}] ({match_reason}): {p_market.question[:30]}... == LIMITLESS {meta['l_title'][:30]}...")
                 self.mapped_pairs[p_market.market_id] = meta["l_id"]
                 processed_p_market_ids.add(p_market.market_id)
                 new_matches += 1

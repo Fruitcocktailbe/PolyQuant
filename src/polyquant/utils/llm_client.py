@@ -88,9 +88,13 @@ def call_llm_json(
         return None
 
     messages = []
+    # FIX: Some free models (Gemma via Google AI Studio) reject the 'system' role
+    # with "Developer instruction is not enabled". We merge it into the user prompt.
+    full_prompt = prompt
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
+        full_prompt = f"[SYSTEM_INSTRUCTION]\n{system_prompt}\n\n[USER_PROMPT]\n{prompt}"
+    
+    messages.append({"role": "user", "content": full_prompt})
 
     try:
         response = client.chat.completions.create(

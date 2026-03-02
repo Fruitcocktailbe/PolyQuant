@@ -109,30 +109,22 @@ class LimitlessClient:
                     
         raise last_error # type: ignore
 
-    async def get_markets(self, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_markets(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Fetch all active markets from Limitless via pagination."""
         all_markets = []
-        offset = 0
+        page = 1
         
         while True:
-            # Try /v1/markets first as it's common for v1/v2 transitions
-            path = "/v1/markets" if offset == 0 else "/v1/markets" 
+            path = "/markets/active"
             try:
                 res = await self._retry_request("GET", path, params={
                     "limit": limit,
-                    "offset": offset, 
-                    "status": "active"
+                    "page": page
                 })
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404 and path == "/v1/markets":
-                    # Fallback to base /markets
-                    res = await self._retry_request("GET", "/markets", params={
-                        "limit": limit,
-                        "offset": offset, 
-                        "status": "active"
-                    })
-                else:
-                    raise e
+                logger.error(f"Failed to fetch Limitless markets: {e}")
+                break
+                
             data = res.json()
             batch = data.get("data", []) or data.get("markets", [])
             
@@ -140,7 +132,7 @@ class LimitlessClient:
                 break
                 
             all_markets.extend(batch)
-            offset += len(batch)
+            page += 1
             
             if len(batch) < limit:
                 break

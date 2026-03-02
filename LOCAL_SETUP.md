@@ -1,90 +1,114 @@
+# 🚀 PolyQuant 2.0: Local Setup Guide (Windows)
 
-# Local Setup Guide for PolyQuant 2.0
-
-Follow these steps to get PolyQuant running on your local machine for paper trading.
-
-## 1. System Dependencies
-Since you've already installed SCIP and Redis, ensure they are correctly configured:
-
-### SCIP Optimization Suite
-*   **Verification**: Run `python -c "import pyscipopt; print('SCIP successfully imported. Tech version:', pyscipopt.Model().getTechVersion())"`
-*   **Success**: The fact that your previous command didn't fail on `import pyscipopt` means SCIP is correctly installed and linked!
-*   **Issue?**: If `import pyscipopt` fails, ensure `SCIP_HOME` points to your installation.
-
-### Redis
-*   **Verification**: Run `.\redis\redis-cli.exe ping`. You should get `PONG`.
-*   **Startup**: If Redis isn't running, start it with `.\redis\redis-server.exe .\redis\redis.windows.conf`.
+This document is designed to get you from "zero to trading" on your local Windows machine. 
 
 ---
 
-## 2. Python Environment Setup
+## 🏁 Phase 0: System Prerequisites
 
+Before we touch any code, you need two main tools installed on your Windows system.
+
+### 1. Redis (The Database Cache)
+PolyQuant uses Redis to store market prices in real-time.
+*   **How to install**: Open PowerShell and run:
+    `winget install Redis.Redis`
+*   **Important**: After it installs, **Close your terminal and open a new one**.
+*   **Verification**: Type `redis-cli ping`. You should see **`PONG`**.
+
+### 2. SCIP (The Optimization Solver)
+PolyQuant uses SCIP to solve complex arbitrage math in milliseconds.
+*   **Verification**: If you already installed the SCIP Optimization Suite, you are good to go. We will verify the Python link in the next step.
+
+---
+
+## 🛠️ Phase 1: Python Environment Setup
+
+We use a "Virtual Environment" (venv) to keep PolyQuant's libraries separate from the rest of your computer.
+
+### 1. Create the Environment
+Open a terminal in the `PolyQuant` folder and run:
 ```powershell
-# 1. Create a virtual environment
 python -m venv venv
+```
+*(This creates a folder named `venv` in your project.)*
 
-# 2. Activate it
+### 2. Activate the Environment
+You must do this **every time** you open a new terminal to work on the bot.
+```powershell
 .\venv\Scripts\Activate.ps1
-
-# 3. Install dependencies
-pip install -r requirements.txt
 ```
+> [!TIP]
+> **If you get a red "Scripts restricted" error**, run this once:
+> `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+> Then try the activation command again.
 
----
-
-## 3. Environment Configuration (`.env`)
-Create/Update your `.env` file with the following keys. 
-
-> [!IMPORTANT]
-> Since we moved to OpenRouter, you only need **one key** for all AI agents.
-
-```env
-# AI Agents (OpenRouter)
-GEMINI_API_KEY=your_openrouter_api_key_here
-
-# Polymarket API (Optional for discovery, but recommended)
-POLYGON_PRIVATE_KEY=your_wallet_private_key
-ALCHEMY_API_KEY=your_alchemy_rpc_key
-
-# Solver Settings
-FW_MIN_PROFIT=0.01  # Target $0.01 profit per cluster
-MAX_CONCURRENT_LLM=3
-```
-
----
-
-## 4. Running PolyQuant
-
-PolyQuant operates in two phases: **Map Making** and **Trading**.
-
-### 1. Build the Market Map
-The "Map Maker" analyzes Polymarket to find related markets and build logical constraints.
-
+### 3. Install All Dependencies
+This command reads the project files and installs everything (including `pyscipopt`, `openai`, `web3`, etc.):
 ```powershell
-# Basic run (scans for high-liquidity markets)
-python -m polyquant.main map
-
-# Advanced: Lower liquidity threshold to find more markets (e.g., $100)
-python -m polyquant.main map --min-liquidity 100
-
-# Advanced: Re-scan markets even if they were analyzed before
-python -m polyquant.main map --force
+pip install -e .
 ```
-*   **Output**: JSON manifests stored in `.polyquant/manifests/`.
-*   **Note**: This takes 5-10 minutes depending on cluster size.
-
-### Phase 2: The Navigator (Execution/Trading)
-The Navigator loads the manifests and starts a low-latency loop waiting for order book updates via WebSocket.
-
-```powershell
-# Start real-time arbitrage detector in Paper Mode
-python -m polyquant.main trade --mode paper
-```
-*   **UI**: Open `http://localhost:8000` in your browser to see the live dashboard, latency, and detected opportunities.
+*(The `-e` means "editable" – if we change a file, the bot sees it immediately.)*
 
 ---
 
-## 5. Troubleshooting
-*   **Import Errors**: If you see `ModuleNotFoundError`, ensure you are in the `venv` and the `src` directory is in your PYTHONPATH: `$env:PYTHONPATH = "src"`.
-*   **Redis Connection**: If the app crashes on start, check if Redis is running on port 6379.
-*   **Empty Dashboard**: If the Navigator starts but shows no markets, ensure you have ran the `map` command first to generate manifests.
+## ⚙️ Phase 2: Configuration
+
+You need to tell the bot your API keys.
+
+1.  Find the file named `.env.example` in the root folder.
+2.  **Duplicate it** and rename the copy to exactly `.env`.
+3.  Open `.env` in a text editor (Notepad, VS Code, etc.).
+4.  Fill in your keys (at minimum: `ALCHEMY_API_KEY`, `OPENROUTER_API_KEY`, and your `POLYGON_PRIVATE_KEY`).
+5.  **Save the file.**
+
+---
+
+## 🧠 Phase 3: The Market Map (Step 1)
+
+Before trading, the bot needs to "understand" the markets. This uses LLMs to find connections.
+
+1.  **Terminal**: Ensure your `venv` is active (`(venv)` should show in green on the left).
+2.  **Run logic**: 
+    ```powershell
+    python -m polyquant.main map --limit 50
+    ```
+3.  **What happens?**: The bot scans Polymarket, finds 50 liquid markets, and builds "Constraint Manifests" in the `.polyquant/` folder.
+4.  **How often?**: Run this once to start, and then maybe once a week or whenever new big events (like elections or sports) happen.
+
+---
+
+## 💹 Phase 4: Ready to Trade (Step 2)
+
+This is the main "Fast Brain" that watches prices and clicks "Buy/Sell".
+
+1.  **Terminal**: Keep your environment active.
+2.  **Command**:
+    ```powershell
+    python -m polyquant.main trade --mode paper
+    ```
+3.  **Monitor the UI**: While the bot is running, open your web browser to:
+    **`http://localhost:8000`**
+    (The dashboard is built-in! To enable it, you must first build the UI:
+    ```powershell
+    cd web
+    npm install
+    npm run build
+    cd ..
+    ```
+    )
+
+---
+
+## ❓ FAQ: Do I need multiple terminals?
+
+*   **Normally, NO**: One terminal can run the `trade` command, and that command automatically starts the Web UI server on port 8000.
+*   **However**: If you want to run a "Map Scan" *while* the trader is running, you would open a **second terminal**, activate the `venv` again, and run the `map` command there.
+
+---
+
+## 🚨 Troubleshooting "Dummy Proof" Checklist
+
+1.  **"ModuleNotFoundError: No module named..."**: Run `pip install -e .` again.
+2.  **"redis-cli: command not found"**: Restart your computer or terminal. Redis was probably just installed.
+3.  **"import pyscipopt failed"**: Ensure `SCIP_HOME` is in your Windows Environment Variables pointing to your SCIP folder.
+4.  **"KeyboardInterrupt"**: This just means you pressed `Ctrl+C` to stop the bot. It's normal!

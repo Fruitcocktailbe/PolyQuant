@@ -297,16 +297,18 @@ class ProposedTrade(BaseModel):
 class ArbitrageOpportunity(BaseModel):
     """
     A detected arbitrage opportunity.
-    
+
     Represents a set of trades that together guarantee a profit
     regardless of market outcomes.
-    
+
     Attributes:
         markets: List of market IDs involved
         trades: Proposed trades to execute
         expected_profit: Expected profit in dollars
         guaranteed_profit: Minimum guaranteed profit (from formula)
         confidence: Overall confidence score
+        roi: Return on investment (expected_profit / capital_deployed)
+        capital_efficiency: Profit per second (for ranking by capital turnover)
         detected_at: When this was detected
     """
     markets: list[str] = Field(default_factory=list)
@@ -314,6 +316,8 @@ class ArbitrageOpportunity(BaseModel):
     expected_profit: Decimal = Field(default=Decimal("0"))
     guaranteed_profit: Decimal = Field(default=Decimal("0"))
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    roi: float = Field(default=0.0, description="Return on investment as fraction")
+    capital_efficiency: float = Field(default=0.0, description="Profit per second (estimated)")
     detected_at: datetime = Field(default_factory=datetime.utcnow)
     
     @property

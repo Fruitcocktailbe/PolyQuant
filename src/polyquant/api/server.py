@@ -7,9 +7,13 @@ user commands (like the Kill Switch).
 """
 
 import asyncio
+import os
+import pathlib
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import logging
 
@@ -226,3 +230,40 @@ async def get_trade_summary():
     if _trade_store:
         return await _trade_store.get_trade_summary()
     return {"total_trades": 0, "total_notional": 0.0}
+
+# -----------------------------------------------------------------------------
+# Static File Serving (Built-in UI)
+# -----------------------------------------------------------------------------
+
+# Discover web/dist directory relative to this file
+# src/polyquant/api/server.py -> 4 levels up to root
+BASE_DIR = pathlib.Path(__file__).parent.parent.parent.parent
+STATIC_DIR = BASE_DIR / "web" / "dist"
+
+if STATIC_DIR.exists():
+    logger.info(f"Serving built-in UI from {STATIC_DIR}")
+    # Mount assets if they exist
+    assets_dir = STATIC_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+    
+    @app.get("/")
+    async def serve_index():
+        return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/{rest_of_path:path}")
+    async def serve_spa_fallback(rest_of_path: str):
+        """Fallback for React SPA routing."""
+        # Don't intercept API or WS calls
+        if rest_of_path.startswith("api") or rest_of_path == "ws" or rest_of_path == "status" or rest_of_path == "kill":
+             return None
+             
+        # Check if file exists in dist (e.g. favicon.ico)
+        file_path = STATIC_DIR / rest_of_path
+        if file_path.is_file():
+            return FileResponse(file_path)
+            
+        # Otherwise serve index.html for SPA
+        return FileResponse(STATIC_DIR / "index.html")
+else:
+    logger.warning(f"UI build directory not found at {STATIC_DIR}. Run 'npm run build' in the web folder to enable built-in UI.")

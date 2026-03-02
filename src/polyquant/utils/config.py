@@ -209,6 +209,41 @@ class PolyQuantConfig(BaseSettings):
         le=1.0,
         description="Max position size as fraction of order book depth (0.5 = 50%)"
     )
+
+    # ===== Dutching Strategy Enhancements =====
+    max_partition_size: int = Field(
+        default=5,
+        ge=2,
+        description="Maximum number of outcomes in a partition for dutching (prevents O(N²) blowup)"
+    )
+
+    orderbook_depth_cap_liquid: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Depth cap for liquid markets (>$10k total depth)"
+    )
+
+    orderbook_depth_cap_illiquid: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Depth cap for illiquid markets (<$1k total depth)"
+    )
+
+    partial_fill_probability: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Expected probability of partial fill (for unwind cost model)"
+    )
+
+    unwind_spread_estimate: float = Field(
+        default=0.06,
+        ge=0.0,
+        le=0.5,
+        description="Expected average unwind spread (3%→6%→9% average = 6%)"
+    )
     
     latency_target_ms: int = Field(
         default=30,
@@ -266,6 +301,11 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
     # Risk & Position Sizing
     # =========================================================================
+
+    sizing_strategy: Literal["kelly", "dutching"] = Field(
+        default="dutching",
+        description="Position sizing strategy: 'kelly' (directional EV bets) or 'dutching' (risk-free arbitrage)"
+    )
 
     kelly_fraction: float = Field(
         default=0.5,
