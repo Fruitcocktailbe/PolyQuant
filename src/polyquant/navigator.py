@@ -402,8 +402,10 @@ class Navigator:
         # Initialize Polymarket client
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
-        # Limitless execution moved to Rust - purely Polymarket for market data now
-        # self._limitless = LimitlessClient() # Legacy removed (Phase 2 & 3)
+        
+        # Initialize Limitless client
+        self._limitless = LimitlessClient()
+        await self._limitless.__aenter__()
 
         # Initialize TradeStore for persistent execution logs
         self._trade_store = TradeStore()
@@ -652,6 +654,9 @@ class Navigator:
         
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
+            
+        if self._limitless:
+            await self._limitless.__aexit__(*args)
             
         if self._price_cache:
             self._price_cache.clear()
