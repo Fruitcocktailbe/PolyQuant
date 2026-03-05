@@ -144,6 +144,61 @@ class LimitlessClient:
         """Fetch a specific market."""
         res = await self._retry_request("GET", f"/markets/{slug}")
         return res.json()
+
+    async def get_order_book(self, token_id: str) -> Optional[Any]:
+        """
+        Fetch the order book for a given Limitless market outcome.
+        
+        Args:
+            token_id: Expected format is "{market_slug}_{side}" where side is 0 (YES) or 1 (NO)
+        """
+        from polyquant.data.market_models import OrderBook, OrderLevel
+        
+        try:
+            slug, side_str = token_id.rsplit("_", 1)
+            side = int(side_str)
+        except ValueError:
+            logger.error(f"Invalid Limitless token_id format: {token_id}")
+            return None
+            
+        try:
+            res = await self._retry_request("GET", f"/markets/{slug}/orderbook")
+            data = res.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch orderbook for {slug}: {e}")
+            return None
+        
+        book = OrderBook(outcome_id=token_id)
+        
+        # Limitless returns prices for the YES (0) token.
+        raw_bids = data.get("bids", [])
+        raw_asks = data.get("asks", [])
+        
+        if side == 0:
+            # YES Outcome - use as is
+            for b in raw_bids:
+                book.bids.append(OrderLevel(price=Decimal(str(b["price"])), size=Decimal(str(b["size"]))))
+            for a in raw_asks:
+                book.asks.append(OrderLevel(price=Decimal(str(a["price"])), size=Decimal(str(a["size"]))))
+        else:
+            # NO Outcome - invert
+            # YES Ask -> NO Bid
+            for a in raw_asks:
+                inv_price = Decimal("1.0") - Decimal(str(a["price"]))
+                if inv_price > 0:
+                    book.bids.append(OrderLevel(price=inv_price, size=Decimal(str(a["size"]))))
+            
+            # YES Bid -> NO Ask
+            for b in raw_bids:
+                inv_price = Decimal("1.0") - Decimal(str(b["price"]))
+                if inv_price < 1:
+                    book.asks.append(OrderLevel(price=inv_price, size=Decimal(str(b["size"]))))
+        
+        # Sort properly: Bids descending, Asks ascending
+        book.bids.sort(key=lambda x: x.price, reverse=True)
+        book.asks.sort(key=lambda x: x.price)
+        
+        return book
         
     async def get_usdc_balance(self) -> Decimal:
         """Fetch USDC balance on Base via RPC with failover, scaled by 1e6."""

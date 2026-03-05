@@ -885,11 +885,26 @@ class Navigator:
         poly_mids = [mid for mid in market_ids if mid not in limitless_mids]
         
         if getattr(self, "_limitless", None) and limitless_mids:
-            for mid in limitless_mids:
-                ob0 = await self._limitless.get_order_book(f"{mid}_0")
-                ob1 = await self._limitless.get_order_book(f"{mid}_1")
-                if ob0: results[f"{mid}_0"] = ob0
-                if ob1: results[f"{mid}_1"] = ob1
+            async def safe_fetch_limitless(mid: str):
+                try:
+                    # In case LimitlessClient doesn't fully support this yet
+                    ob0 = await getattr(self._limitless, "get_order_book", lambda x: asyncio.sleep(0))(f"{mid}_0")
+                    ob1 = await getattr(self._limitless, "get_order_book", lambda x: asyncio.sleep(0))(f"{mid}_1")
+                    res = {}
+                    if ob0: res[f"{mid}_0"] = ob0
+                    if ob1: res[f"{mid}_1"] = ob1
+                    return res
+                except Exception as e:
+                    logger.warning(f"Failed to fetch Limitless book for {mid}: {e}")
+                    return {}
+
+            limitless_results = await asyncio.gather(
+                *[safe_fetch_limitless(mid) for mid in limitless_mids],
+                return_exceptions=True
+            )
+            for res in limitless_results:
+                if not isinstance(res, Exception):
+                    results.update(res)
                 
         # Polymarket fetches - Concurrent with Semaphore to avoid rate limits
         if poly_mids:
