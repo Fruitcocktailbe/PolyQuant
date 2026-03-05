@@ -58,35 +58,70 @@ python -m polyquant.map_maker
 
 ```
 
-## 4. Running the Services
+## 4. Running the Services (with tmux)
 
-You will need 3 terminal sessions (or use `screen`/`tmux`):
+Use `tmux` so your services **keep running** after you disconnect from SSH.
 
-### Session 1: The Execution Engine (Rust)
-The OMS Sidecar must be running for orders to be submitted.
 ```bash
-cd oms-sidecar
+# Start a named tmux session
+tmux new -s polyquant
+
+# Activate venv (do this once per session)
+cd ~/PolyQuant
+source venv/bin/activate
+```
+
+### Window 0: Redis + Map Maker
+```bash
+redis-server --daemonize yes
+python -m polyquant.map_maker   # Run once to generate constraints
+```
+
+### Window 1: The Execution Engine (Rust)
+Press `Ctrl+B`, then `C` to create a new window.
+```bash
+cd ~/PolyQuant/oms-sidecar
 cargo run --release
 ```
 
-### Session 2: The Agent Swarm (Python)
-The "Fast Brain" Navigator.
+### Window 2: The Agent Swarm (Python)
+Press `Ctrl+B`, then `C` to create a new window.
 ```bash
-# In root directory
+cd ~/PolyQuant
 source venv/bin/activate
 python -m polyquant.main trade
 ```
 
-### Session 3: The Web Dashboard
+### Window 3: The Web Dashboard (optional)
+Press `Ctrl+B`, then `C` to create a new window.
 ```bash
-cd web
+cd ~/PolyQuant/web
 npm install
-# Fix Vite permissions
 chmod +x node_modules/.bin/vite
 npm run dev -- --host
 ```
 
-## 5. Network & Firewall
+Once everything is running, press `Ctrl+B`, then `D` to **detach**. You can now safely close SSH — everything keeps running on the server.
+
+## 5. Tmux Basics
+
+Tmux is a terminal multiplexer that keeps your programs alive on the server even when you disconnect.
+
+| Action | Command / Shortcut |
+|---|---|
+| **Create a session** | `tmux new -s polyquant` |
+| **Detach** (leave but keep running) | `Ctrl+B`, then `D` |
+| **Reattach** (reconnect later) | `tmux attach` or `tmux attach -t polyquant` |
+| **New window** (like a new tab) | `Ctrl+B`, then `C` |
+| **Next / Previous window** | `Ctrl+B`, then `N` / `P` |
+| **List windows** | `Ctrl+B`, then `W` |
+| **Kill current window** | Type `exit` or `Ctrl+D` |
+| **List all sessions** | `tmux ls` |
+
+> [!TIP]
+> **Daily workflow**: SSH in → `tmux attach` → check your windows → `Ctrl+B, D` to detach → close SSH. Done!
+
+## 6. Network & Firewall
 
 In the Lightsail Console, open the following **Inbound Ports**:
 - **8000**: Python API (Internal/Monitoring)
@@ -96,7 +131,7 @@ In the Lightsail Console, open the following **Inbound Ports**:
 > **Security Alternative**: Instead of opening ports publicly, use an SSH tunnel from your local machine:
 > `ssh -L 5173:localhost:5173 -L 8000:localhost:8000 ubuntu@your-lightsail-ip`
 
-## 6. Maintenance Commands
+## 7. Maintenance Commands
 
 - **Stop All**: `CTRL+C` in all sessions.
 - **Restart Redis**: `sudo systemctl restart redis-server`
@@ -106,7 +141,7 @@ In the Lightsail Console, open the following **Inbound Ports**:
 > [!NOTE]
 > `sentence-transformers` is used for cross-exchange matching. The first time the Map Maker runs, it will download a small model (~80MB). This is normal.
 
-## 7. Troubleshooting: "Connection Refused"
+## 8. Troubleshooting: "Connection Refused"
 
 If you can't connect to the dashboard (localhost:5173):
 

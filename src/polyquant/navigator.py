@@ -527,19 +527,21 @@ class Navigator:
                     logger.info(f"Hot-reloading {len(new_clusters)} new market clusters...")
                     
                     new_market_ids = []
+                    new_market_exchanges: dict[str, str] = {}
                     new_manifests = []
                     
                     for cid in new_clusters:
                         manifest = await self._store.load_manifest(cid)
                         if manifest:
                             new_market_ids.extend(manifest.market_ids)
+                            new_market_exchanges.update(manifest.market_exchanges)
                             new_manifests.append(manifest)
                             
                     if not new_market_ids:
                         continue
                         
                     # Fetch initial books for new markets
-                    new_books = await self._fetch_order_books(new_market_ids)
+                    new_books = await self._fetch_order_books(new_market_ids, new_market_exchanges)
                     for token_id, book in new_books.items():
                         if self._price_cache:
                             await self._price_cache.update(token_id, book)
@@ -701,12 +703,14 @@ class Navigator:
             await monitor.update_status(status="NO_CONSTRAINTS")
             return
         
-        # Load all market IDs from manifests
+        # Load all market IDs and exchange mappings from manifests
         market_ids = []
+        market_exchanges: dict[str, str] = {}
         for cluster_id in cluster_ids:
             manifest = await self._store.load_manifest(cluster_id)
             if manifest:
                 market_ids.extend(manifest.market_ids)
+                market_exchanges.update(manifest.market_exchanges)
                 
         # Initialize the set of loaded clusters
         self._loaded_cluster_ids = set(cluster_ids)
@@ -722,7 +726,17 @@ class Navigator:
         
         # 1. Initial snapshot fetch (to populate cache before WS takes over)
         logger.info("Fetching initial order book snapshots...")
-        initial_books = await self._fetch_order_books(market_ids)
+        try:
+            initial_books = await asyncio.wait_for(
+                self._fetch_order_books(market_ids, market_exchanges),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "⚠️  Initial order book fetch TIMED OUT after 30s. "
+                "Continuing with partial data — books will populate via WebSocket/polling."
+            )
+            initial_books = {}
         for token_id, book in initial_books.items():
             await self._price_cache.update(token_id, book)
             
@@ -888,6 +902,10 @@ class Navigator:
         # Limitless fetches
         limitless_mids = [mid for mid in market_ids if market_exchanges.get(mid, "polymarket").startswith("limitless")]
         poly_mids = [mid for mid in market_ids if mid not in limitless_mids]
+        
+        logger.info(
+            f"Order book fetch: {len(poly_mids)} Polymarket, {len(limitless_mids)} Limitless"
+        )
         
         if getattr(self, "_limitless", None) and limitless_mids:
             async def safe_fetch_limitless(mid: str):
