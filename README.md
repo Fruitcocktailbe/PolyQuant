@@ -71,6 +71,7 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Install Python dependencies
 pip install -r requirements.txt
+pip install -e .
 
 # Build Rust OMS sidecar
 cd oms-sidecar

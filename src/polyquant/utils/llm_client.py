@@ -51,7 +51,7 @@ def get_llm_client() -> OpenAI | None:
     client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
-        timeout=10.0,  # CRITICAL: Prevent 2GB RAM instances from hanging on network wait
+        timeout=45.0,  # CRITICAL: Allow enough time for LLM JSON generation
         default_headers={
             "HTTP-Referer": "https://github.com/polyquant",
             "X-OpenRouter-Title": "PolyQuant",

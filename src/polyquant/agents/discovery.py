@@ -428,6 +428,34 @@ The YES Price is the current market probability (0.00 to 1.00).
                 )
             ]
 
+        # Prevent massive prompts that break the LLM API / Context window
+        MAX_BATCH_SIZE = 150
+        if len(markets) > MAX_BATCH_SIZE:
+            logger.info(f"Chunking {len(markets)} markets into batches of {MAX_BATCH_SIZE}...")
+            batches = [markets[i:i + MAX_BATCH_SIZE] for i in range(0, len(markets), MAX_BATCH_SIZE)]
+            all_clusters = []
+            
+            # Limit concurrency to avoid rate limits
+            sem = asyncio.Semaphore(3)
+            
+            async def process_batch(b: list[Market]) -> list[MarketCluster]:
+                async with sem:
+                    return await self._cluster_markets(b)
+            
+            results = await asyncio.gather(*(process_batch(b) for b in batches), return_exceptions=True)
+            for r in results:
+                if isinstance(r, list):
+                    all_clusters.extend(r)
+                elif isinstance(r, Exception):
+                    logger.warning(f"LLM batch failed, skipping that chunk: {r}")
+                    # Fallback for this chunk so we don't lose the markets
+                    all_clusters.append(MarketCluster(
+                        topic="Uncategorized (Batch Failed)",
+                        markets=batches[results.index(r)],
+                        potential_dependencies=[],
+                    ))
+            return all_clusters
+
         # Format markets for the prompt - include prices and liquidity
         market_lines = []
         for m in markets:

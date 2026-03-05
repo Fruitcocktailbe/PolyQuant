@@ -41,15 +41,19 @@ cd PolyQuant
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 
 # Create .env
 cp .env.example .env
-nano .env  # Add your API keys. 
-# LOW-RAM TIP: If Map Maker hangs, add: ENABLE_SEMANTIC_MATCHING=false
+nano .env  # Add your API keys (Polymarket, Limitless, OpenRouter, etc.)
 
 # Generate Market Map (REQUIRED before trading)
-# This scans for arbitrage clusters and local constraints.
+# This scans for arbitrage clusters, local constraints, and cross-exchange mappings.
 python -m polyquant.map_maker
+
+
+# LOW-RAM TIP: If Map Maker hangs, add: ENABLE_SEMANTIC_MATCHING=false
+
 ```
 
 ## 4. Running the Services

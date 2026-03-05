@@ -204,6 +204,7 @@ pip install --upgrade pip
 
 # Install dependencies
 pip install -r requirements.txt
+pip install -e .
 
 # Verify installation
 python -c "import pyscipopt; print('SCIP OK')"
