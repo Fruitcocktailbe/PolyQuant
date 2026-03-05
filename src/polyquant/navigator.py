@@ -696,6 +696,7 @@ class Navigator:
         
         if not cluster_ids:
             logger.warning("No constraint manifests found. Run Map Maker first.")
+            from polyquant.api.server import monitor
             await monitor.update_status(status="NO_CONSTRAINTS")
             return
         
@@ -735,7 +736,7 @@ class Navigator:
             if manifest:
                 ui_clusters.append({
                     "id": cid,
-                    "topic": manifest.description or f"Cluster {cid[:8]}",
+                    "topic": getattr(manifest, "topic", "") or f"Cluster {cid[:8]}",
                     "count": len(manifest.constraints),
                     "status": "active"
                 })
