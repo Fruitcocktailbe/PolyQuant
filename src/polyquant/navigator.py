@@ -528,22 +528,22 @@ class Navigator:
                 if new_clusters:
                     logger.info(f"Hot-reloading {len(new_clusters)} new market clusters...")
                     
-                    new_market_ids = []
-                    new_market_exchanges: dict[str, str] = {}
+                    new_token_ids: set[str] = set()
                     new_manifests = []
                     
                     for cid in new_clusters:
                         manifest = await self._store.load_manifest(cid)
                         if manifest:
-                            new_market_ids.extend(manifest.market_ids)
-                            new_market_exchanges.update(manifest.market_exchanges)
+                            # Extract token IDs from constraint coefficients
+                            for constraint in manifest.constraints:
+                                new_token_ids.update(constraint.coefficients.keys())
                             new_manifests.append(manifest)
                             
-                    if not new_market_ids:
+                    if not new_token_ids:
                         continue
                         
-                    # Fetch initial books for new markets
-                    new_books = await self._fetch_order_books(new_market_ids, new_market_exchanges)
+                    # Fetch initial books for new tokens via CLOB API
+                    new_books = await self._fetch_order_books_by_token(list(new_token_ids))
                     for token_id, book in new_books.items():
                         if self._price_cache:
                             await self._price_cache.update(token_id, book)
@@ -705,37 +705,46 @@ class Navigator:
             await monitor.update_status(status="NO_CONSTRAINTS")
             return
         
-        # Load all market IDs and exchange mappings from manifests
-        market_ids = []
+        # Load all manifests and extract unique token IDs from constraint coefficients.
+        # NOTE: market_ids in manifests are often empty for NegRisk markets.
+        # The token IDs in constraint coefficients are the REAL identifiers we need.
+        all_token_ids: set[str] = set()
         market_exchanges: dict[str, str] = {}
         for cluster_id in cluster_ids:
             manifest = await self._store.load_manifest(cluster_id)
             if manifest:
-                market_ids.extend(manifest.market_ids)
+                # Extract token IDs from constraint coefficients (the authoritative source)
+                for constraint in manifest.constraints:
+                    all_token_ids.update(constraint.coefficients.keys())
+                # Also grab any valid (non-empty) market IDs for exchange routing
+                for mid in manifest.market_ids:
+                    if mid:
+                        all_token_ids.add(mid)
                 market_exchanges.update(manifest.market_exchanges)
                 
         # Initialize the set of loaded clusters
         self._loaded_cluster_ids = set(cluster_ids)
         
-        if not market_ids:
-            logger.warning("No markets found in manifests")
+        token_id_list = list(all_token_ids)
+        if not token_id_list:
+            logger.warning("No token IDs found in constraint manifests")
             return
         
-        logger.info(f"Monitoring {len(market_ids)} markets")
+        logger.info(f"Monitoring {len(token_id_list)} unique tokens across {len(cluster_ids)} clusters")
         
         # Start hot-reload task
         self._hot_reload_task = asyncio.create_task(self._hot_reload_loop())
         
-        # 1. Initial snapshot fetch (to populate cache before WS takes over)
-        logger.info("Fetching initial order book snapshots...")
+        # 1. Initial snapshot fetch — direct CLOB API (fastest path, no Gamma round-trip)
+        logger.info("Fetching initial order book snapshots via CLOB API...")
         try:
             initial_books = await asyncio.wait_for(
-                self._fetch_order_books(market_ids, market_exchanges),
-                timeout=30.0
+                self._fetch_order_books_by_token(token_id_list),
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "⚠️  Initial order book fetch TIMED OUT after 30s. "
+                "⚠️  Initial order book fetch TIMED OUT after 60s. "
                 "Continuing with partial data — books will populate via WebSocket/polling."
             )
             initial_books = {}
@@ -928,85 +937,62 @@ class Navigator:
 
             # No sleep needed - event-driven architecture handles timing
     
-    async def _fetch_order_books(
+    async def _fetch_order_books_by_token(
         self,
-        market_ids: list[str],
-        market_exchanges: Optional[dict[str, str]] = None,
+        token_ids: list[str],
     ) -> dict[str, OrderBook]:
-        """Fetch order books for all markets concurrently."""
+        """
+        Fetch order books directly by token ID via the CLOB API.
+        
+        This is the FASTEST path — one HTTP call per token,
+        no intermediate Gamma API lookup needed.
+        
+        Used at startup and hot-reload to populate the PriceCache.
+        NOT on the hot trading path (that uses WebSocket/cache).
+        """
         if not self._polymarket:
             return {}
-            
-        market_exchanges = market_exchanges or {}
-        results = {}
         
-        # Limitless fetches
-        limitless_mids = [mid for mid in market_ids if market_exchanges.get(mid, "polymarket").startswith("limitless")]
-        poly_mids = [mid for mid in market_ids if mid not in limitless_mids]
+        results: dict[str, OrderBook] = {}
+        semaphore = asyncio.Semaphore(25)  # Rate limit concurrent CLOB requests
+        fetched = 0
+        failed = 0
         
-        logger.info(
-            f"Order book fetch: {len(poly_mids)} Polymarket, {len(limitless_mids)} Limitless"
+        async def fetch_one(token_id: str) -> tuple[str, OrderBook | None]:
+            nonlocal fetched, failed
+            async with semaphore:
+                try:
+                    book = await self._polymarket.get_order_book(token_id)
+                    if book:
+                        fetched += 1
+                    else:
+                        failed += 1
+                    return (token_id, book)
+                except Exception as e:
+                    failed += 1
+                    logger.debug(f"Failed to fetch book for {token_id[:20]}...: {e}")
+                    return (token_id, None)
+        
+        logger.info(f"Fetching {len(token_ids)} order books via CLOB API...")
+        
+        all_results = await asyncio.gather(
+            *[fetch_one(tid) for tid in token_ids],
+            return_exceptions=True
         )
         
-        if getattr(self, "_limitless", None) and limitless_mids:
-            async def safe_fetch_limitless(mid: str):
-                try:
-                    # In case LimitlessClient doesn't fully support this yet
-                    ob0 = await getattr(self._limitless, "get_order_book", lambda x: asyncio.sleep(0))(f"{mid}_0")
-                    ob1 = await getattr(self._limitless, "get_order_book", lambda x: asyncio.sleep(0))(f"{mid}_1")
-                    res = {}
-                    if ob0: res[f"{mid}_0"] = ob0
-                    if ob1: res[f"{mid}_1"] = ob1
-                    return res
-                except Exception as e:
-                    logger.warning(f"Failed to fetch Limitless book for {mid}: {e}")
-                    return {}
-
-            limitless_results = await asyncio.gather(
-                *[safe_fetch_limitless(mid) for mid in limitless_mids],
-                return_exceptions=True
-            )
-            for res in limitless_results:
-                if not isinstance(res, Exception):
-                    results.update(res)
-                
-        # Polymarket fetches - Concurrent with Semaphore to avoid rate limits
-        if poly_mids:
-            semaphore = asyncio.Semaphore(20)
-            
-            async def fetch_poly_market(mid: str):
-                async with semaphore:
-                    try:
-                        market = await self._polymarket._gamma_client.get(f"/markets/{mid}")
-                        if market.status_code == 200:
-                            data = market.json()
-                            tokens = [t.get("token_id") for t in data.get("tokens", []) if t.get("token_id")]
-                            
-                            # Fetch books for tokens concurrently
-                            books = await asyncio.gather(
-                                *[self._polymarket.get_order_book(tid) for tid in tokens],
-                                return_exceptions=True
-                            )
-                            
-                            # Store successful results
-                            local_results = {}
-                            for tid, book in zip(tokens, books):
-                                if book and not isinstance(book, Exception):
-                                    local_results[tid] = book
-                            return local_results
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch initial book for {mid}: {e}")
-                    return {}
-            
-            # Run all market fetches concurrently
-            market_results = await asyncio.gather(
-                *[fetch_poly_market(mid) for mid in poly_mids]
-            )
-            
-            # Merge results
-            for res in market_results:
-                results.update(res)
-
+        for item in all_results:
+            if isinstance(item, Exception):
+                failed += 1
+                continue
+            token_id, book = item
+            if book is not None:
+                results[token_id] = book
+        
+        logger.info(
+            f"Order book fetch complete: {fetched} success, {failed} failed "
+            f"out of {len(token_ids)} tokens"
+        )
+        
         return results
     
     async def _detect_opportunities(
