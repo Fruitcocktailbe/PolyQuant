@@ -756,35 +756,24 @@ class Navigator:
             f"({self._price_cache.fresh_count} fresh)"
         )
             
-        # 2. Subscribe to WebSocket updates and set up polling
-        # We need token IDs, not market IDs, for subscription
-        token_ids = list(initial_books.keys())
-        poly_tokens = []
-        limitless_tokens = []
-        
-        # Sort out tokens by exchange for proper ingestion
-        for token_id in token_ids:
-            if "_" in token_id and not token_id.startswith("0x"):
-                limitless_tokens.append(token_id)
-            else:
-                poly_tokens.append(token_id)
-                
-        if self._polymarket and poly_tokens:
-            logger.info(f"Subscribing to {len(poly_tokens)} tokens via WebSocket")
-            # Create WS client if not exists (it should be in PolymarketClient)
-            # For now, simplistic access
+        # 2. Subscribe to WebSocket updates for ALL tokens
+        # WS is the PRIMARY data source — subscribe all tokens from constraints,
+        # not just those that succeeded via REST. Resolved tokens are silently ignored.
+        if self._polymarket:
+            logger.info(f"Subscribing to {len(token_id_list)} tokens via WebSocket")
+            # Create WS client if not exists
             if not getattr(self._polymarket, "ws_client", None):
-                 # Initialize WS client if missing (add to PolymarketClient later)
                  from polyquant.data.polymarket_client import PolymarketWSClient
                  self._polymarket.ws_client = PolymarketWSClient()
                  await self._polymarket.ws_client.connect()
             
             await self._polymarket.ws_client.subscribe(
-                poly_tokens, 
+                token_id_list, 
                 self._ws_update_callback
             )
             
         # 3. Limitless REST Polling Task (since no WS exists yet)
+        limitless_tokens = [tid for tid in token_id_list if "_" in tid and not tid.startswith("0x")]
         if hasattr(self, "_limitless") and self._limitless and limitless_tokens:
              logger.info(f"Starting background REST polling for {len(limitless_tokens)} Limitless tokens")
              self._limitless_polling_task = asyncio.create_task(
@@ -830,17 +819,28 @@ class Navigator:
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 cache_size = self._price_cache.size
                 fresh = self._price_cache.fresh_count
+                # HEARTBEAT threshold: 5s — for log visibility only, NOT for trading decisions
+                ws_healthy = (
+                    self._polymarket.is_ws_healthy(max_age_seconds=5.0) 
+                    if self._polymarket else False
+                )
+                stale_count = (
+                    len(self._polymarket.ws_stale_assets)
+                    if self._polymarket else 0
+                )
                 logger.info(
                     f"💓 Heartbeat | ticks={tick_count} | cache={fresh}/{cache_size} fresh "
+                    f"| WS={'🟢' if ws_healthy else '🔴'} "
+                    f"| stale_tokens={stale_count} "
                     f"| {'LIVE' if fresh > 0 else 'WAITING FOR DATA'}"
                 )
                 last_heartbeat = now
 
             tick_start = datetime.utcnow()
 
-            # Check connection health
+            # TRADING GUARD threshold: 200ms (config.ws_max_age_ms) — blocks ALL trades
+            # This is deliberately aggressive: we NEVER trade on data older than 200ms.
             if self._polymarket and hasattr(self._polymarket, 'ws_client'):
-                # HFT LATENCY SHIELD: We cannot trade on stale data.
                 if not self._polymarket.is_ws_healthy(max_age_seconds=config.ws_max_age_ms / 1000.0):
                     logger.warning(
                         "Trading blocked: Stale WebSocket connection",
@@ -860,11 +860,9 @@ class Navigator:
                 continue
 
             # Collect stale tokens (WS sequence gaps detected)
-            stale_tokens: set[str] = set()
-            if self._polymarket and hasattr(self._polymarket, 'ws_client'):
-                stale_tokens = getattr(
-                    self._polymarket.ws_client, '_stale_assets', set()
-                )
+            stale_tokens: set[str] = (
+                self._polymarket.ws_stale_assets if self._polymarket else set()
+            )
 
             try:
                 # Get fresh order books from cache (O(1) access)

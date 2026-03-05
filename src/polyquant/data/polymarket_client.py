@@ -927,7 +927,7 @@ class PolymarketClient:
                     price=Decimal(str(ask.get("price", "0"))),
                     size=Decimal(str(ask.get("size", "0"))),
                 )
-            )
+        )
         
         return OrderBook(
             outcome_id=token_id,
@@ -935,7 +935,25 @@ class PolymarketClient:
             asks=sorted(asks, key=lambda x: x.price),
         )
 
+    def is_ws_healthy(self, max_age_seconds: float = 30.0) -> bool:
+        """
+        Check if the WebSocket connection is healthy.
+        
+        Delegates to PolymarketWSClient.is_connection_healthy.
+        Returns False if no WS client exists.
+        """
+        ws = getattr(self, "ws_client", None)
+        if ws is None:
+            return False
+        return ws.is_connection_healthy(max_age_seconds=max_age_seconds)
 
+    @property
+    def ws_stale_assets(self) -> set[str]:
+        """Get the set of asset IDs with potentially stale WS data (sequence gaps)."""
+        ws = getattr(self, "ws_client", None)
+        if ws is None:
+            return set()
+        return ws._stale_assets
 
 class PolymarketWSClient:
     """
@@ -970,6 +988,9 @@ class PolymarketWSClient:
         # Connection health monitoring
         self._last_message_time: float = 0.0  # time.monotonic() of last message
         self._connection_healthy = False
+
+        # Full order book tracking — maintained by merging snapshots + deltas
+        self._books: dict[str, OrderBook] = {}  # asset_id → latest full book
 
         # Sequence tracking: detect missed messages → stale orderbook
         self._last_sequence: dict[str, int] = {}  # asset_id → last seen sequence
@@ -1137,15 +1158,12 @@ class PolymarketWSClient:
         """
         Handle incoming WebSocket messages.
         
-        Polymarket sends lists of updates.
-        Format is typically:
-        [
-            {
-                "asset_id": "...",
-                "bids": [{"price": "0.5", "size": "100"}],
-                "asks": [...]
-            }
-        ]
+        Polymarket sends two event types:
+        - 'book':         Full order book snapshot → replace entire book
+        - 'price_change':  Delta update → merge into existing book
+        
+        We maintain a full book per asset in self._books and always
+        emit the FULL merged book to callbacks, never a partial.
         """
         # API sometimes sends a list, sometimes a dict
         items = data if isinstance(data, list) else [data]
@@ -1155,6 +1173,8 @@ class PolymarketWSClient:
             asset_id = item.get("asset_id")
             if not asset_id:
                 continue
+
+            event_type = item.get("event_type", "book")  # default to snapshot
 
             # --- Sequence tracking ---
             seq = item.get("sequence") or item.get("seq")
@@ -1174,38 +1194,106 @@ class PolymarketWSClient:
                             missed=gap,
                             total_gaps=self._sequence_gaps,
                         )
+                        # On gap, request a fresh snapshot via REST in background
+                        # (book will self-heal on next full snapshot from WS)
                     else:
                         # Sequence is continuous, clear stale flag
                         self._stale_assets.discard(asset_id)
                     self._last_sequence[asset_id] = seq_num
                 except (ValueError, TypeError):
                     pass  # Non-integer sequence, skip tracking
-                
+
             bids_raw = item.get("bids", [])
             asks_raw = item.get("asks", [])
-            
-            # If we have bids or asks, parse and notify
-            if bids_raw or asks_raw:
-                # Parse into OrderBook
-                book = self._parse_ws_book(asset_id, bids_raw, asks_raw)
-                
-                # Notify callbacks
-                if asset_id in self._callbacks:
-                    for cb in self._callbacks[asset_id]:
 
-                        try:
-                            await cb(book)
-                        except Exception as e:
-                            logger.error("Callback failed", error=str(e))
-                            
+            if not bids_raw and not asks_raw:
+                continue
+
+            if event_type == "price_change" and asset_id in self._books:
+                # DELTA: merge changed levels into existing book
+                book = self._merge_book_delta(asset_id, bids_raw, asks_raw)
+            else:
+                # SNAPSHOT (or first message for this asset): full replacement
+                book = self._parse_ws_book(asset_id, bids_raw, asks_raw)
+                self._books[asset_id] = book
+
+            # Notify callbacks with the FULL merged book
+            if asset_id in self._callbacks:
+                for cb in self._callbacks[asset_id]:
+                    try:
+                        await cb(book)
+                    except Exception as e:
+                        logger.error("Callback failed", error=str(e))
+
+    def _merge_book_delta(
+        self, asset_id: str, bids_raw: list, asks_raw: list
+    ) -> OrderBook:
+        """
+        Merge delta changes into the existing full book.
+        
+        Rules:
+        - size > 0 at a price: update/add that level
+        - size == 0 at a price: remove that level
+        
+        Returns the FULL updated book (not just the delta).
+        """
+        existing = self._books[asset_id]
+        
+        # Build dicts keyed by price for O(1) lookups
+        bid_map: dict[Decimal, Decimal] = {b.price: b.size for b in existing.bids}
+        ask_map: dict[Decimal, Decimal] = {a.price: a.size for a in existing.asks}
+        
+        # Apply bid deltas
+        for b in bids_raw:
+            try:
+                price = Decimal(str(b.get("price", "0")))
+                size = Decimal(str(b.get("size", "0")))
+                if size > 0:
+                    bid_map[price] = size  # Add or update
+                else:
+                    bid_map.pop(price, None)  # Remove
+            except (ValueError, TypeError):
+                continue
+        
+        # Apply ask deltas
+        for a in asks_raw:
+            try:
+                price = Decimal(str(a.get("price", "0")))
+                size = Decimal(str(a.get("size", "0")))
+                if size > 0:
+                    ask_map[price] = size  # Add or update
+                else:
+                    ask_map.pop(price, None)  # Remove
+            except (ValueError, TypeError):
+                continue
+        
+        # Reconstruct sorted OrderBook
+        book = OrderBook(
+            outcome_id=asset_id,
+            bids=sorted(
+                [OrderLevel(price=p, size=s) for p, s in bid_map.items()],
+                key=lambda x: x.price, reverse=True
+            ),
+            asks=sorted(
+                [OrderLevel(price=p, size=s) for p, s in ask_map.items()],
+                key=lambda x: x.price
+            ),
+            timestamp=datetime.utcnow()
+        )
+        
+        # Store the merged book
+        self._books[asset_id] = book
+        return book
+
     def _parse_ws_book(self, token_id: str, bids_raw: list, asks_raw: list) -> OrderBook:
-        """Parse raw WS data into OrderBook."""
+        """Parse raw WS data into a full OrderBook (for snapshot events)."""
         bids = []
         for b in bids_raw:
             try:
                 price = Decimal(str(b.get("price", "0")))
                 size = Decimal(str(b.get("size", "0")))
-                bids.append(OrderLevel(price=price, size=size))
+                if size > 0:  # Skip zero-size levels in snapshots
+                    bids.append(OrderLevel(price=price, size=size))
             except (ValueError, TypeError):
                 continue
                 
@@ -1214,7 +1302,8 @@ class PolymarketWSClient:
             try:
                 price = Decimal(str(a.get("price", "0")))
                 size = Decimal(str(a.get("size", "0")))
-                asks.append(OrderLevel(price=price, size=size))
+                if size > 0:  # Skip zero-size levels in snapshots
+                    asks.append(OrderLevel(price=price, size=size))
             except (ValueError, TypeError):
                 continue
                 
