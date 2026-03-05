@@ -186,6 +186,10 @@ class PolymarketClient:
                     await asyncio.sleep(backoff)
                     continue
 
+                # 404/400 = permanent errors, do NOT retry
+                if response.status_code in (400, 404):
+                    response.raise_for_status()
+
                 response.raise_for_status()
                 return response
 
@@ -466,6 +470,12 @@ class PolymarketClient:
 
             return self._parse_order_book(token_id, data)
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                # Market resolved/delisted — not an error, just no book available
+                return None
+            logger.warning("Failed to get order book", token_id=token_id, error=str(e))
+            return None
         except httpx.HTTPError as e:
             logger.warning("Failed to get order book", token_id=token_id, error=str(e))
             return None
