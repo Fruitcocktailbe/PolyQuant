@@ -822,7 +822,7 @@ class Navigator:
                     )
                     # Feed to kill switch as potential issue
                     if self._kill_switch:
-                        await self._kill_switch.record_error("stale_websocket_connection")
+                        self._kill_switch.record_api_error()
 
                     await asyncio.sleep(1)
                     continue
