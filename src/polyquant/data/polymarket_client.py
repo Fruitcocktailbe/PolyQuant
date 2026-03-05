@@ -796,8 +796,8 @@ class PolymarketClient:
             Current USDC balance as Decimal, or Decimal("0") on failure.
         """
         if not self._sdk_client:
-            logger.warning("Cannot fetch balance: SDK not initialized")
-            return Decimal("0")
+            logger.info("SDK not initialized (Paper Mode). Returning default $10,000.00 paper balance.")
+            return Decimal("10000.00")
 
         try:
             # py-clob-client exposes get_balance_allowance for USDC

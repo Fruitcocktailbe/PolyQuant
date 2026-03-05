@@ -46,6 +46,8 @@ pip install -e .
 # Create .env
 cp .env.example .env
 nano .env  # Add your API keys (Polymarket, Limitless, OpenRouter, etc.)
+# Note: If trading in 'paper' mode without a POLYGON_PRIVATE_KEY, your 
+# starting paper-trading UI balance will default to $10,000.00.
 
 # Generate Market Map (REQUIRED before trading)
 # This scans for arbitrage clusters, local constraints, and cross-exchange mappings.
