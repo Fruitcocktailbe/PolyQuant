@@ -873,40 +873,61 @@ class Navigator:
         market_ids: list[str],
         market_exchanges: Optional[dict[str, str]] = None,
     ) -> dict[str, OrderBook]:
-        """Fetch order books for all markets."""
+        """Fetch order books for all markets concurrently."""
         if not self._polymarket:
             return {}
             
         market_exchanges = market_exchanges or {}
-
         results = {}
-        # Simple implementation: fetch one by one
-        # In production, we'd use WebSocket updates
-        for mid in market_ids:
-            exchange_info = market_exchanges.get(mid, "polymarket")
-            if exchange_info.startswith("limitless"):
-                if getattr(self, "_limitless", None):
-                    # Limitless outcome IDs are just mid_0 and mid_1
-                    ob0 = await self._limitless.get_order_book(f"{mid}_0")
-                    ob1 = await self._limitless.get_order_book(f"{mid}_1")
-                    if ob0:
-                        results[f"{mid}_0"] = ob0
-                    if ob1:
-                        results[f"{mid}_1"] = ob1
-                continue
+        
+        # Limitless fetches
+        limitless_mids = [mid for mid in market_ids if market_exchanges.get(mid, "polymarket").startswith("limitless")]
+        poly_mids = [mid for mid in market_ids if mid not in limitless_mids]
+        
+        if getattr(self, "_limitless", None) and limitless_mids:
+            for mid in limitless_mids:
+                ob0 = await self._limitless.get_order_book(f"{mid}_0")
+                ob1 = await self._limitless.get_order_book(f"{mid}_1")
+                if ob0: results[f"{mid}_0"] = ob0
+                if ob1: results[f"{mid}_1"] = ob1
                 
-            # We need the outcomes to get token_ids
-            # This is slow, but better than nothing for now
-            # TODO: Cache market objects to avoid re-fetching metadata
-            market = await self._polymarket._gamma_client.get(f"/markets/{mid}")
-            if market.status_code == 200:
-                data = market.json()
-                for token in data.get("tokens", []):
-                    tid = token.get("token_id")
-                    if tid:
-                        ob = await self._polymarket.get_order_book(tid)
-                        if ob:
-                            results[tid] = ob
+        # Polymarket fetches - Concurrent with Semaphore to avoid rate limits
+        if poly_mids:
+            semaphore = asyncio.Semaphore(20)
+            
+            async def fetch_poly_market(mid: str):
+                async with semaphore:
+                    try:
+                        market = await self._polymarket._gamma_client.get(f"/markets/{mid}")
+                        if market.status_code == 200:
+                            data = market.json()
+                            tokens = [t.get("token_id") for t in data.get("tokens", []) if t.get("token_id")]
+                            
+                            # Fetch books for tokens concurrently
+                            books = await asyncio.gather(
+                                *[self._polymarket.get_order_book(tid) for tid in tokens],
+                                return_exceptions=True
+                            )
+                            
+                            # Store successful results
+                            local_results = {}
+                            for tid, book in zip(tokens, books):
+                                if book and not isinstance(book, Exception):
+                                    local_results[tid] = book
+                            return local_results
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch initial book for {mid}: {e}")
+                    return {}
+            
+            # Run all market fetches concurrently
+            market_results = await asyncio.gather(
+                *[fetch_poly_market(mid) for mid in poly_mids]
+            )
+            
+            # Merge results
+            for res in market_results:
+                results.update(res)
+
         return results
     
     async def _detect_opportunities(
