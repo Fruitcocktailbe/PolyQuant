@@ -740,11 +740,11 @@ class Navigator:
         try:
             initial_books = await asyncio.wait_for(
                 self._fetch_order_books_by_token(token_id_list),
-                timeout=60.0
+                timeout=120.0
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "⚠️  Initial order book fetch TIMED OUT after 60s. "
+                "⚠️  Initial order book fetch TIMED OUT after 120s. "
                 "Continuing with partial data — books will populate via WebSocket/polling."
             )
             initial_books = {}
@@ -944,52 +944,60 @@ class Navigator:
         """
         Fetch order books directly by token ID via the CLOB API.
         
-        This is the FASTEST path — one HTTP call per token,
-        no intermediate Gamma API lookup needed.
-        
-        Used at startup and hot-reload to populate the PriceCache.
-        NOT on the hot trading path (that uses WebSocket/cache).
+        Processes tokens in small batches to avoid rate limiting.
+        Used at startup and hot-reload (NOT on the hot trading path).
         """
         if not self._polymarket:
             return {}
         
         results: dict[str, OrderBook] = {}
-        semaphore = asyncio.Semaphore(25)  # Rate limit concurrent CLOB requests
         fetched = 0
         failed = 0
         
-        async def fetch_one(token_id: str) -> tuple[str, OrderBook | None]:
-            nonlocal fetched, failed
-            async with semaphore:
+        # Process in batches to avoid overwhelming the API
+        BATCH_SIZE = 10
+        BATCH_DELAY = 0.3  # seconds between batches
+        
+        for batch_start in range(0, len(token_ids), BATCH_SIZE):
+            batch = token_ids[batch_start:batch_start + BATCH_SIZE]
+            
+            async def fetch_one(token_id: str) -> tuple[str, OrderBook | None]:
                 try:
                     book = await self._polymarket.get_order_book(token_id)
-                    if book:
-                        fetched += 1
-                    else:
-                        failed += 1
                     return (token_id, book)
-                except Exception as e:
-                    failed += 1
-                    logger.debug(f"Failed to fetch book for {token_id[:20]}...: {e}")
+                except Exception:
                     return (token_id, None)
-        
-        logger.info(f"Fetching {len(token_ids)} order books via CLOB API...")
-        
-        all_results = await asyncio.gather(
-            *[fetch_one(tid) for tid in token_ids],
-            return_exceptions=True
-        )
-        
-        for item in all_results:
-            if isinstance(item, Exception):
-                failed += 1
-                continue
-            token_id, book = item
-            if book is not None:
-                results[token_id] = book
+            
+            batch_results = await asyncio.gather(
+                *[fetch_one(tid) for tid in batch],
+                return_exceptions=True
+            )
+            
+            for item in batch_results:
+                if isinstance(item, Exception):
+                    failed += 1
+                    continue
+                token_id, book = item
+                if book is not None:
+                    results[token_id] = book
+                    fetched += 1
+                else:
+                    failed += 1
+            
+            # Progress log every 50 tokens
+            total_done = batch_start + len(batch)
+            if total_done % 50 < BATCH_SIZE or total_done == len(token_ids):
+                logger.info(
+                    f"📡 Order book progress: {total_done}/{len(token_ids)} "
+                    f"({fetched} ok, {failed} failed)"
+                )
+            
+            # Pause between batches to avoid rate limits
+            if batch_start + BATCH_SIZE < len(token_ids):
+                await asyncio.sleep(BATCH_DELAY)
         
         logger.info(
-            f"Order book fetch complete: {fetched} success, {failed} failed "
+            f"✅ Order book fetch complete: {fetched} success, {failed} failed "
             f"out of {len(token_ids)} tokens"
         )
         
