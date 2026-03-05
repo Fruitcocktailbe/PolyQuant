@@ -542,14 +542,8 @@ class Navigator:
                     if not new_token_ids:
                         continue
                         
-                    # Fetch initial books for new tokens via CLOB API
-                    new_books = await self._fetch_order_books_by_token(list(new_token_ids))
-                    for token_id, book in new_books.items():
-                        if self._price_cache:
-                            await self._price_cache.update(token_id, book)
-                        
                     # Subscribe to WebSockets
-                    token_ids = list(new_books.keys())
+                    token_ids = list(new_token_ids)
                     if self._polymarket and hasattr(self._polymarket, "ws_client") and self._polymarket.ws_client:
                         logger.info(f"Subscribing to {len(token_ids)} new tokens via WebSocket")
                         await self._polymarket.ws_client.subscribe(
@@ -735,30 +729,10 @@ class Navigator:
         # Start hot-reload task
         self._hot_reload_task = asyncio.create_task(self._hot_reload_loop())
         
-        # 1. Initial snapshot fetch — direct CLOB API (fastest path, no Gamma round-trip)
-        logger.info("Fetching initial order book snapshots via CLOB API...")
-        try:
-            initial_books = await asyncio.wait_for(
-                self._fetch_order_books_by_token(token_id_list),
-                timeout=120.0
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "⚠️  Initial order book fetch TIMED OUT after 120s. "
-                "Continuing with partial data — books will populate via WebSocket/polling."
-            )
-            initial_books = {}
-        for token_id, book in initial_books.items():
-            await self._price_cache.update(token_id, book)
-        
-        logger.info(
-            f"📊 Loaded {len(initial_books)} order books into cache "
-            f"({self._price_cache.fresh_count} fresh)"
-        )
-            
-        # 2. Subscribe to WebSocket updates for ALL tokens
-        # WS is the PRIMARY data source — subscribe all tokens from constraints,
-        # not just those that succeeded via REST. Resolved tokens are silently ignored.
+        # 1. Subscribe to WebSocket updates for ALL tokens
+        # WS is the PRIMARY data source — subscribe all tokens from constraints.
+        # Resolved tokens are silently ignored.
+
         if self._polymarket:
             logger.info(f"Subscribing to {len(token_id_list)} tokens via WebSocket")
             # Create WS client if not exists
@@ -935,72 +909,7 @@ class Navigator:
 
             # No sleep needed - event-driven architecture handles timing
     
-    async def _fetch_order_books_by_token(
-        self,
-        token_ids: list[str],
-    ) -> dict[str, OrderBook]:
-        """
-        Fetch order books directly by token ID via the CLOB API.
-        
-        Processes tokens in small batches to avoid rate limiting.
-        Used at startup and hot-reload (NOT on the hot trading path).
-        """
-        if not self._polymarket:
-            return {}
-        
-        results: dict[str, OrderBook] = {}
-        fetched = 0
-        failed = 0
-        
-        # Process in batches to avoid overwhelming the API
-        BATCH_SIZE = 10
-        BATCH_DELAY = 0.3  # seconds between batches
-        
-        for batch_start in range(0, len(token_ids), BATCH_SIZE):
-            batch = token_ids[batch_start:batch_start + BATCH_SIZE]
-            
-            async def fetch_one(token_id: str) -> tuple[str, OrderBook | None]:
-                try:
-                    book = await self._polymarket.get_order_book(token_id)
-                    return (token_id, book)
-                except Exception:
-                    return (token_id, None)
-            
-            batch_results = await asyncio.gather(
-                *[fetch_one(tid) for tid in batch],
-                return_exceptions=True
-            )
-            
-            for item in batch_results:
-                if isinstance(item, Exception):
-                    failed += 1
-                    continue
-                token_id, book = item
-                if book is not None:
-                    results[token_id] = book
-                    fetched += 1
-                else:
-                    failed += 1
-            
-            # Progress log every 50 tokens
-            total_done = batch_start + len(batch)
-            if total_done % 50 < BATCH_SIZE or total_done == len(token_ids):
-                logger.info(
-                    f"📡 Order book progress: {total_done}/{len(token_ids)} "
-                    f"({fetched} ok, {failed} failed)"
-                )
-            
-            # Pause between batches to avoid rate limits
-            if batch_start + BATCH_SIZE < len(token_ids):
-                await asyncio.sleep(BATCH_DELAY)
-        
-        logger.info(
-            f"✅ Order book fetch complete: {fetched} success, {failed} failed "
-            f"out of {len(token_ids)} tokens"
-        )
-        
-        return results
-    
+    # ── Detection & Execution ──
     async def _detect_opportunities(
         self,
         order_books: dict[str, OrderBook],

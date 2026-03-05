@@ -186,8 +186,8 @@ class PolymarketClient:
                     await asyncio.sleep(backoff)
                     continue
 
-                # 404/400 = permanent errors, do NOT retry
-                if response.status_code in (400, 404):
+                # Permanent errors: do NOT retry
+                if response.status_code in (400, 401, 403, 404):
                     response.raise_for_status()
 
                 response.raise_for_status()
@@ -196,9 +196,16 @@ class PolymarketClient:
             except httpx.HTTPError as e:
                 last_error = e
                 if attempt < retries:
-                    backoff = 0.5 * (2 ** attempt)  # 0.5s, 1s, 2s
+                    # More aggressive backoff for generic HTTP errors (e.g. 502, ReadTimeout)
+                    # Start at 2s, 4s, 8s...
+                    backoff = 2.0 * (2 ** attempt)
+                    
+                    error_type = type(e).__name__
+                    if isinstance(e, httpx.HTTPStatusError):
+                        error_type = f"HTTP {e.response.status_code}"
+                        
                     logger.warning(
-                        "HTTP request failed, retrying",
+                        f"Request failed ({error_type}), retrying",
                         path=path,
                         attempt=attempt + 1,
                         backoff_seconds=backoff,
