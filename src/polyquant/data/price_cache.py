@@ -170,15 +170,21 @@ class PriceCache:
             and (now - self._last_update[token_id]) <= self._stale_threshold
         )
     
-    async def wait_for_update(self) -> None:
+    async def wait_for_update(self, timeout: float = 5.0) -> bool:
         """
         Wait for the next price update (event-driven).
 
-        This enables the Navigator to wait for updates instead of polling,
-        saving ~5ms per tick and eliminating CPU waste.
+        Returns True if an update arrived, False if timed out.
+        A timeout does NOT mean anything is broken — it just means
+        no WebSocket data arrived in that window.
         """
-        await self._update_event.wait()
-        self._update_event.clear()  # Reset for next update
+        try:
+            await asyncio.wait_for(self._update_event.wait(), timeout=timeout)
+            self._update_event.clear()
+            return True
+        except asyncio.TimeoutError:
+            self._update_event.clear()
+            return False
 
     def clear(self) -> None:
         """Clear all cached data."""

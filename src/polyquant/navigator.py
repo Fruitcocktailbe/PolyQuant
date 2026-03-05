@@ -396,6 +396,8 @@ class Navigator:
         server = uvicorn.Server(config_uv)
         self._uvicorn_server = server  # Store reference for graceful shutdown
         self._server_task = asyncio.create_task(server.serve())
+        await asyncio.sleep(0.5)  # Give uvicorn a moment to bind to port
+        logger.info("🌐 API server started on http://0.0.0.0:8000 — endpoints: /status, /api/status, /ws")
         setup_web_logging()
         await monitor.update_status(status="STARTING")
         
@@ -739,6 +741,11 @@ class Navigator:
             initial_books = {}
         for token_id, book in initial_books.items():
             await self._price_cache.update(token_id, book)
+        
+        logger.info(
+            f"📊 Loaded {len(initial_books)} order books into cache "
+            f"({self._price_cache.fresh_count} fresh)"
+        )
             
         # 2. Subscribe to WebSocket updates and set up polling
         # We need token IDs, not market IDs, for subscription
@@ -777,20 +784,54 @@ class Navigator:
             
         # 4. Main Event Loop
         tick_count = 0
+        no_data_ticks = 0  # Track consecutive timeouts
+        last_heartbeat = time.monotonic()
+        HEARTBEAT_INTERVAL = 30  # seconds
+        
+        logger.info("🟢 Navigator main loop STARTED — waiting for price data...")
+        
         while self._is_running:
             if max_ticks is not None and tick_count >= max_ticks:
                 break
-            # Event-driven architecture: Wait for price updates instead of polling
-            # This saves ~5ms per tick and eliminates CPU waste
-            await self._price_cache.wait_for_update()
+
+            # Event-driven: Wait up to 5s for a price update
+            got_update = await self._price_cache.wait_for_update(timeout=5.0)
+            
+            if not got_update:
+                no_data_ticks += 1
+                # First few timeouts: informational
+                if no_data_ticks == 6:  # ~30 seconds of no data
+                    logger.warning(
+                        "⚠️  No WebSocket price data received for 30s. "
+                        "Check: Is the WS connection alive? Are tokens subscribed?"
+                    )
+                # Periodic reminder every 60s
+                if no_data_ticks > 0 and no_data_ticks % 12 == 0:
+                    logger.warning(
+                        f"⏳ Still waiting for price data... ({no_data_ticks * 5}s without updates) "
+                        f"| Cache: {self._price_cache.size} total, {self._price_cache.fresh_count} fresh"
+                    )
+            else:
+                if no_data_ticks > 6:
+                    logger.info(f"✅ Price data resumed after {no_data_ticks * 5}s gap")
+                no_data_ticks = 0
+            
+            # Heartbeat: Show activity every HEARTBEAT_INTERVAL seconds
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                cache_size = self._price_cache.size
+                fresh = self._price_cache.fresh_count
+                logger.info(
+                    f"💓 Heartbeat | ticks={tick_count} | cache={fresh}/{cache_size} fresh "
+                    f"| {'LIVE' if fresh > 0 else 'WAITING FOR DATA'}"
+                )
+                last_heartbeat = now
 
             tick_start = datetime.utcnow()
 
             # Check connection health
             if self._polymarket and hasattr(self._polymarket, 'ws_client'):
                 # HFT LATENCY SHIELD: We cannot trade on stale data.
-                # If the websocket has not received a price update across any market
-                # within the configured timeframe (default 200ms), we consider internal orderbook state toxic.
                 if not self._polymarket.is_ws_healthy(max_age_seconds=config.ws_max_age_ms / 1000.0):
                     logger.warning(
                         "Trading blocked: Stale WebSocket connection",

@@ -200,6 +200,11 @@ async def websocket_endpoint(websocket: WebSocket):
 async def get_status():
     return monitor.state
 
+@app.get("/api/status")
+async def get_api_status():
+    """Alias so /api/status also works."""
+    return monitor.state
+
 @app.post("/kill")
 async def kill_switch_http():
     """Alternative HTTP endpoint for the kill switch."""
@@ -255,8 +260,9 @@ if STATIC_DIR.exists():
     async def serve_spa_fallback(rest_of_path: str):
         """Fallback for React SPA routing."""
         # Don't intercept API or WS calls
-        if rest_of_path.startswith("api") or rest_of_path == "ws" or rest_of_path == "status" or rest_of_path == "kill":
-             return None
+        if rest_of_path.startswith(("api", "ws", "status", "kill")):
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "not found"}, status_code=404)
              
         # Check if file exists in dist (e.g. favicon.ico)
         file_path = STATIC_DIR / rest_of_path
