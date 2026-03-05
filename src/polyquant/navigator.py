@@ -726,6 +726,26 @@ class Navigator:
         
         logger.info(f"Monitoring {len(token_id_list)} unique tokens across {len(cluster_ids)} clusters")
         
+        # Format clusters for the UI Dashboard
+        ui_clusters = []
+        for cid in cluster_ids:
+            # We don't have the original `MarketCluster` object here, just the `ConstraintManifest`.
+            # But the UI only needs `id`, `topic` (which we can fake or extract), `count`, and `status`.
+            manifest = await self._store.load_manifest(cid)
+            if manifest:
+                ui_clusters.append({
+                    "id": cid,
+                    "topic": manifest.description or f"Cluster {cid[:8]}",
+                    "count": len(manifest.constraints),
+                    "status": "active"
+                })
+        
+        from polyquant.api.server import monitor
+        await monitor.update_status(
+            pipeline_stage="COMPLETE", 
+            clusters=ui_clusters
+        )
+        
         # Start hot-reload task
         self._hot_reload_task = asyncio.create_task(self._hot_reload_loop())
         
@@ -848,6 +868,11 @@ class Navigator:
 
                 # Timestamp: Start opportunity detection
                 detect_start = datetime.utcnow()
+                
+                # Debug logging to show the hot path is active
+                logger.debug(
+                    f"🔥 HOT PATH: Evaluating {len(current_books)} markets for arbitrage..."
+                )
 
                 # Check for arbitrage opportunities
                 opportunities = await self._detect_opportunities(
@@ -1010,6 +1035,11 @@ class Navigator:
                     arb_opportunity = None
 
                 if arb_opportunity:
+                    logger.info(
+                        "Arbitrage opportunity found!",
+                        cluster_id=cluster_id,
+                        expected_profit=float(arb_opportunity.expected_profit)
+                    )
                     opp_data = {
                         "cluster_id": cluster_id,
                         "source": "constraint",
