@@ -272,6 +272,12 @@ The YES Price is the current market probability (0.00 to 1.00).
         )
         
         # ── Phase 2: Pre-filter and auto-cluster ──
+        total_markets_fetched = sum(len(e["markets"]) for e in events)
+        logger.info(
+            "Entering Phase 2 pre-filtering",
+            total_markets_fetched=total_markets_fetched,
+            total_events=len(events),
+        )
         clusters: list[MarketCluster] = []
         events_for_llm: list[dict] = []
         
