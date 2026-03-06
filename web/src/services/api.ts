@@ -145,6 +145,25 @@ class ApiService {
         }
     }
 
+    async resetKillSwitch(): Promise<void> {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ command: "reset" }));
+        } else {
+            await fetch(`${API_URL}/reset`, { method: "POST" });
+        }
+    }
+
+    async fetchCluster(clusterId: string): Promise<any> {
+        try {
+            const response = await fetch(`${API_URL}/api/clusters/${clusterId}`);
+            if (!response.ok) throw new Error("Network response was not ok");
+            return await response.json();
+        } catch (error) {
+            console.error("Failed to fetch cluster details:", error);
+            return null;
+        }
+    }
+
     disconnect() {
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);

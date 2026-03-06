@@ -40,22 +40,22 @@ export const TradeLog: React.FC<TradeLogProps> = ({ trades }) => {
                             className="bg-black/40 border border-white/5 p-2 flex items-center justify-between hover:border-neon-cyan/20 transition-colors"
                         >
                             <div className="flex items-center gap-3">
-                                <div className={`w-1 h-6 ${trade.trade?.side === 'buy' ? 'bg-neon-green' : 'bg-neon-red'}`} />
+                                <div className={`w-1 h-6 ${trade.trade?.side?.toLowerCase() === 'buy' ? 'bg-neon-green' : 'bg-neon-red'}`} />
                                 <div className="flex flex-col">
                                     <div className="flex items-center gap-2">
-                                        <span className={trade.trade?.side === 'buy' ? 'text-neon-green' : 'text-neon-red'}>
-                                            {trade.trade?.side?.toUpperCase()}
+                                        <span className={trade.trade?.side?.toLowerCase() === 'buy' ? 'text-neon-green' : 'text-neon-red'}>
+                                            {trade.trade?.side?.toUpperCase() || 'UNKNOWN'}
                                         </span>
-                                        <span className="text-white font-bold">{trade.trade?.outcome_id}</span>
+                                        <span className="text-white font-bold">{trade.trade?.outcome_id || 'Unknown Outcome'}</span>
                                         <span className="text-gray-500">@</span>
-                                        <span className="text-neon-cyan">{trade.filled_price}</span>
+                                        <span className="text-neon-cyan">{trade.filled_price?.toFixed(3) || '0.000'}</span>
                                     </div>
                                     <div className="flex items-center gap-2 text-[9px] text-gray-500">
-                                        <span className="uppercase">{trade.trade?.exchange || 'polymarket'}</span>
+                                        <span className="uppercase">{trade.trade?.exchange || 'unknown'}</span>
                                         <span>•</span>
-                                        <span>ID: {trade.order_id?.slice(0, 8)}</span>
+                                        <span>ID: {trade.order_id?.slice(0, 8) || 'N/A'}</span>
                                         <span>•</span>
-                                        <span>{new Date(trade.fill_time).toLocaleTimeString()}</span>
+                                        <span>{trade.fill_time ? new Date(trade.fill_time).toLocaleTimeString() : 'N/A'}</span>
                                     </div>
                                 </div>
                             </div>

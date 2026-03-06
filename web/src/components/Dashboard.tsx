@@ -120,20 +120,145 @@ const EquityChart = memo<{ data: { time: number; value: number }[] }>(({ data })
 EquityChart.displayName = 'EquityChart';
 
 // Memoized Cluster card
-const ClusterCard = memo<{ cluster: any }>(({ cluster }) => (
-    <div className="p-3 border-b border-white/5 hover:bg-white/5 transition-colors">
+const ClusterCard = memo<{ cluster: any; onClick?: (id: string) => void }>(({ cluster, onClick }) => (
+    <div
+        className={`p-3 border-b border-white/5 transition-colors ${onClick ? 'cursor-pointer hover:bg-white/10 hover:border-neon-cyan/50' : 'hover:bg-white/5'}`}
+        onClick={() => onClick && onClick(cluster.id)}
+    >
         <div className="flex justify-between items-center mb-1">
-            <span className="text-[10px] font-bold text-neon-cyan uppercase tracking-wider">{cluster.topic}</span>
-            <span className="text-[10px] text-gray-600 font-mono">#{cluster.id.slice(0, 4)}</span>
+            <span className="text-[10px] font-bold text-neon-cyan uppercase tracking-wider truncate mr-2">{cluster.topic}</span>
+            <span className="text-[10px] text-gray-600 font-mono shrink-0">#{cluster.id.slice(0, 4)}</span>
         </div>
         <div className="flex justify-between items-center">
             <span className="text-[10px] text-gray-400">{cluster.count} Markets</span>
             <span className="text-[10px] px-1.5 py-0.5 bg-neon-green/10 text-neon-green rounded-none border border-neon-green/20 uppercase tracking-tighter">
-                {cluster.status}
+                {cluster.status || 'ACTIVE'}
             </span>
         </div>
     </div>
 ));
+
+// Cluster Details Modal Component
+const ClusterDetailsModal = memo<{ clusterId: string | null; onClose: () => void }>(({ clusterId, onClose }) => {
+    const [details, setDetails] = useState<any>(null);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        if (!clusterId) {
+            setDetails(null);
+            return;
+        }
+
+        let isMounted = true;
+        setLoading(true);
+        api.fetchCluster(clusterId).then(data => {
+            if (isMounted) {
+                setDetails(data);
+                setLoading(false);
+            }
+        });
+
+        return () => { isMounted = false; };
+    }, [clusterId]);
+
+    if (!clusterId) return null;
+
+    return (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6 sm:p-10">
+            <div className="bg-obsidian border border-neon-cyan/30 w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden shadow-[0_0_30px_rgba(0,255,240,0.15)] rounded-sm">
+                <div className="p-4 border-b border-white/10 bg-black/40 flex justify-between items-center shrink-0">
+                    <div className="flex items-center gap-3">
+                        <Layers className="w-4 h-4 text-neon-cyan" />
+                        <div>
+                            <h2 className="text-xs font-bold text-white uppercase tracking-widest leading-none mb-1">
+                                {details?.topic || `Cluster ${clusterId.slice(0, 8)}`}
+                            </h2>
+                            <span className="text-[9px] font-mono text-gray-500 uppercase">ID: {clusterId}</span>
+                        </div>
+                    </div>
+                    <button onClick={onClose} className="text-gray-500 hover:text-white transition-colors">✕</button>
+                </div>
+
+                <div className="flex-1 overflow-auto p-0 custom-scrollbar relative bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-charcoal/30 to-transparent">
+                    {loading ? (
+                        <div className="flex items-center justify-center h-full text-neon-cyan/50 font-mono text-xs animate-pulse">
+                            Loading internal structure...
+                        </div>
+                    ) : details ? (
+                        <div className="p-5 space-y-6">
+                            {/* Stats */}
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                <div className="border border-white/5 bg-black/20 p-3">
+                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraints</div>
+                                    <div className="text-lg font-mono text-neon-green">{details.constraints?.length || 0}</div>
+                                </div>
+                                <div className="border border-white/5 bg-black/20 p-3">
+                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Linked Markets</div>
+                                    <div className="text-lg font-mono text-neon-purple">{details.market_ids?.length || 0}</div>
+                                </div>
+                                <div className="border border-white/5 bg-black/20 p-3">
+                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraint Ext.</div>
+                                    <div className="text-lg font-mono text-white">{details.extractor?.slice(0, 10) || 'None'}</div>
+                                </div>
+                                <div className="border border-white/5 bg-black/20 p-3">
+                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Validation Status</div>
+                                    <div className="text-lg font-mono text-neon-cyan text-sm mt-1">{details.is_valid ? 'VALID' : 'INVALID'}</div>
+                                </div>
+                            </div>
+
+                            {/* Constraints Detail */}
+                            <div>
+                                <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
+                                    <Activity className="w-3 h-3 text-neon-green" /> Constraint Equations
+                                </h3>
+                                <div className="space-y-2">
+                                    {details.constraints?.map((constraint: any, idx: number) => (
+                                        <div key={idx} className="bg-black/40 border border-white/5 p-3 hover:border-white/10 transition-colors">
+                                            <div className="flex justify-between items-start mb-2">
+                                                <span className="text-[10px] text-gray-500 uppercase">{constraint.type || 'Prio 0'}</span>
+                                                <div className="text-[10px] font-mono whitespace-nowrap overflow-x-auto custom-scrollbar pb-1 text-right max-w-[70%]">
+                                                    {Object.entries(constraint.coefficients || {}).map(([token, coeff]: [string, any], i, arr) => (
+                                                        <span key={token} className="inline-block">
+                                                            <span className={coeff > 0 ? "text-neon-cyan" : "text-neon-red"}>{coeff > 0 ? '+' : ''}{Number(coeff).toFixed(2)}</span>
+                                                            <span className="text-gray-400">×</span>
+                                                            <span className="text-white" title={token}>{token.slice(0, 5)}...</span>
+                                                            {i < arr.length - 1 ? "  " : ""}
+                                                        </span>
+                                                    ))}
+                                                    <span className="text-gray-500 mx-2">{constraint.operator || '<='}</span>
+                                                    <span className="text-neon-green">{constraint.rhs?.toFixed(2) || '0.00'}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {(!details.constraints || details.constraints.length === 0) && (
+                                        <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No constraints extracted.</div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Raw Excerpt */}
+                            <div>
+                                <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
+                                    <Cpu className="w-3 h-3 text-neon-purple" /> Exchanges Map
+                                </h3>
+                                <pre className="bg-black/60 border border-white/5 p-3 text-[9px] font-mono text-gray-400 overflow-x-auto custom-scrollbar">
+                                    {JSON.stringify(details.market_exchanges || {}, null, 2)}
+                                </pre>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="flex flex-col items-center justify-center h-full text-red-400 font-mono text-xs gap-2 p-10 text-center">
+                            Failed to load cluster details.
+                            <span className="text-gray-500 text-[10px]">The API may be unavailable or the cluster ID is invalid.</span>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+});
+ClusterDetailsModal.displayName = 'ClusterDetailsModal';
 
 // Memoized Opportunity ticker
 const OpportunityCard = memo<{ opp: any }>(({ opp }) => {
@@ -187,6 +312,7 @@ export const Dashboard: React.FC = () => {
     const [equityHistory, setEquityHistory] = useState<{ time: number; value: number }[]>([]);
     const [showRawData, setShowRawData] = useState(false);
     const [activeTab, setActiveTab] = useState<'chart' | 'terminal'>('chart');
+    const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
 
     // Stable callback for state updates
     const handleStateUpdate = useCallback((newState: SystemState) => {
@@ -317,7 +443,7 @@ export const Dashboard: React.FC = () => {
                                 </div>
                             )}
                             {state.clusters.map((c, idx) => (
-                                <ClusterCard key={idx} cluster={c} />
+                                <ClusterCard key={idx} cluster={c} onClick={setSelectedClusterId} />
                             ))}
                         </div>
                     </div>
@@ -388,6 +514,12 @@ export const Dashboard: React.FC = () => {
                         </div>
                     </div>
                 )}
+
+                {/* Interactive Cluster Details Modal */}
+                <ClusterDetailsModal
+                    clusterId={selectedClusterId}
+                    onClose={() => setSelectedClusterId(null)}
+                />
             </main>
         </div>
     );

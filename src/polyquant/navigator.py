@@ -52,7 +52,7 @@ from polyquant.agents import MicrostructureAgent
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
 from polyquant.data.trade_store import TradeStore
-from polyquant.api.server import monitor, app, set_trade_store, setup_web_logging
+from polyquant.api.server import monitor, app, set_trade_store, set_constraint_store, setup_web_logging
 from polyquant.utils import config, get_logger
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
 import uvicorn
@@ -427,6 +427,7 @@ class Navigator:
         
         # Load constraint store
         self._store = ConstraintStore()
+        set_constraint_store(self._store)
         manifests = await self._store.load_all_manifests()
         
         # Initialize execution guard with pre-computed constraints

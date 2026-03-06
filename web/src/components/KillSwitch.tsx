@@ -1,6 +1,7 @@
 import { useState, memo, useCallback } from 'react';
 import { api } from '../services/api';
 import { AlertTriangle, XOctagon } from 'lucide-react';
+// @ts-ignore
 import { motion, AnimatePresence } from 'framer-motion';
 
 interface KillSwitchProps {
@@ -20,18 +21,24 @@ export const KillSwitch = memo<KillSwitchProps>(({ active }) => {
     const openConfirm = useCallback(() => setShowConfirm(true), []);
     const closeConfirm = useCallback(() => setShowConfirm(false), []);
 
-    if (active || triggered) {
+    if (active || (triggered && active)) {
         return (
             <div className="h-full flex items-center justify-center bg-neon-red/10 border border-neon-red/50 shadow-neon-red animate-pulse relative overflow-hidden group">
                 <div className="absolute inset-0 bg-stripes opacity-20" />
                 <div className="z-10 flex flex-col items-center">
-                    <XOctagon className="w-10 h-10 text-neon-red mb-2" />
-                    <span className="text-lg font-bold text-white tracking-[0.2em] drop-shadow-md">
+                    <XOctagon className="w-6 h-6 text-neon-red mb-1" />
+                    <span className="text-sm font-bold text-white tracking-[0.2em] drop-shadow-md">
                         SYSTEM HALTED
                     </span>
-                    <span className="text-[10px] text-neon-red font-mono uppercase mt-1">
-                        Kill Switch Active
-                    </span>
+                    <button
+                        onClick={async () => {
+                            await api.resetKillSwitch();
+                            setTriggered(false);
+                        }}
+                        className="mt-2 px-3 py-1 bg-charcoal border border-neon-red/50 text-[10px] text-white hover:bg-neon-red hover:text-white transition-colors uppercase tracking-widest font-bold z-20"
+                    >
+                        Resume Trading
+                    </button>
                 </div>
             </div>
         );

@@ -193,6 +193,9 @@ async def websocket_endpoint(websocket: WebSocket):
             if data.get("command") == "panic_sell":
                 monitor.trigger_kill_switch()
                 await monitor.broadcast({"type": "alert", "message": "KILL SWITCH ACTIVATED"})
+            elif data.get("command") == "reset":
+                monitor.reset_kill_switch()
+                await monitor.broadcast({"type": "alert", "message": "SYSTEM RESUMED"})
     except WebSocketDisconnect:
         monitor.disconnect(websocket)
 
@@ -210,6 +213,12 @@ async def kill_switch_http():
     """Alternative HTTP endpoint for the kill switch."""
     monitor.trigger_kill_switch()
     return {"status": "triggered"}
+
+@app.post("/reset")
+async def reset_kill_switch_http():
+    """Alternative HTTP endpoint to reset the kill switch."""
+    monitor.reset_kill_switch()
+    return {"status": "reset"}
 
 # -----------------------------------------------------------------------------
 # Database Endpoints (TradeStore)
@@ -235,6 +244,27 @@ async def get_trade_summary():
     if _trade_store:
         return await _trade_store.get_trade_summary()
     return {"total_trades": 0, "total_notional": 0.0}
+
+# -----------------------------------------------------------------------------
+# Knowledge Map Endpoints (ConstraintStore)
+# -----------------------------------------------------------------------------
+
+_constraint_store = None
+
+def set_constraint_store(store: Any):
+    """Inject the ConstraintStore instance into the API server."""
+    global _constraint_store
+    _constraint_store = store
+
+@app.get("/api/clusters/{cluster_id}")
+async def get_cluster_details(cluster_id: str):
+    """Return the full ConstraintManifest for a specific cluster."""
+    if _constraint_store:
+        manifest = await _constraint_store.load_manifest(cluster_id)
+        if manifest:
+            return manifest.model_dump()
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Cluster not found")
 
 # -----------------------------------------------------------------------------
 # Static File Serving (Built-in UI)
