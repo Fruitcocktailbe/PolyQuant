@@ -83,23 +83,42 @@ class ExchangeMatcher:
         # Stage 1: Liquidity Pre-filtering
         logger.info("Stage 1: Fetching and filtering active markets from both exchanges...")
         
+        # Fetch ALL Polymarket markets via pagination (not just first page)
         poly_markets = []
         async with PolymarketClient() as p_client:
-            poly_markets, _ = await p_client.get_active_markets(limit=1000, min_liquidity=5000.0)
+            offset = 0
+            page_size = 500
+            while True:
+                batch, raw_count = await p_client.get_active_markets(
+                    limit=page_size, offset=offset, min_liquidity=2500.0
+                )
+                poly_markets.extend(batch)
+                offset += page_size
+                if raw_count < page_size:
+                    break  # No more pages
             
         limit_markets_raw = []
         try:
             async with LimitlessClient() as l_client:
-                # Fetch all active markets via pagination
-                limit_markets_raw = await l_client.get_markets()
+                # Fetch all active markets via pagination (larger page size for speed)
+                limit_markets_raw = await l_client.get_markets(limit=100)
         except Exception as e:
             logger.warning(f"Failed to fetch Limitless markets, skipping cross-exchange matching: {e}")
             
-        # Filter Limitless for decent liquidity/volume (e.g., > 5000 volume)
+        # Filter Limitless for minimum activity ($2500 in volume or liquidity)
+        # Note: Limitless returns raw USDC ints (6 decimals) AND formatted dollar strings
         limit_markets = []
         for m in limit_markets_raw:
             try:
-                if float(m.get("volume", 0)) > 5000.0 or float(m.get("liquidity", 0)) > 5000.0:
+                vol = float(m.get("volumeFormatted", 0) or m.get("volume", 0))
+                liq = float(m.get("liquidityFormatted", 0) or m.get("liquidity", 0))
+                # volumeFormatted is in dollars; raw volume is in micro-USDC
+                # If value is huge (>1M), it's raw — divide by 1e6
+                if vol > 1_000_000:
+                    vol = vol / 1_000_000
+                if liq > 1_000_000:
+                    liq = liq / 1_000_000
+                if vol > 2500.0 or liq > 2500.0:
                     limit_markets.append(m)
             except (ValueError, TypeError):
                 continue
@@ -155,7 +174,7 @@ class ExchangeMatcher:
             # Get top 3 indices for this Polymarket market
             top_3_indices = np.argsort(similarity_matrix[p_idx])[-3:][::-1]
             
-            # Require at least a 0.6 semantic similarity score to test with LLM (saves API costs)
+            # Require at least a 0.6 semantic similarity score to test with LLM
             for l_idx in top_3_indices:
                 sim_score = float(similarity_matrix[p_idx][l_idx])
                 if sim_score < 0.6:
@@ -174,8 +193,8 @@ class ExchangeMatcher:
                     p_end=str(p_market.end_date or "Not specified"),
                     l_q=l_market.get('title', ''),
                     l_d=l_market.get('description', ''),
-                    l_res=l_market.get('resolutionSource', '') or l_market.get('rules', '') or "Not specified",
-                    l_end=l_market.get('endDate', '') or l_market.get('expirationDate', '') or "Not specified",
+                    l_res=l_market.get('resolutionSource', '') or l_market.get('rules', '') or l_market.get('description', '')[:200] or "Not specified",
+                    l_end=l_market.get('expirationDate', '') or l_market.get('expirationTimestamp', '') or "Not specified",
                 )
                 
                 # Append to batch

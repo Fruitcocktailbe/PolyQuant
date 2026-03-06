@@ -48,6 +48,8 @@ from polyquant.data.constraint_store import ConstraintStore, ConstraintManifest
 from polyquant.data.price_cache import PriceCache
 from polyquant.risk import KillSwitch, PositionSizer
 from polyquant.solver import ArbitrageDetector, SCIPSolver
+from polyquant.solver.scip_solver import OptimizationResult
+from polyquant.data import ArbitrageOpportunity
 from polyquant.agents import MicrostructureAgent
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
@@ -1053,12 +1055,14 @@ class Navigator:
                         "cluster_id": cluster_id,
                         "source": "constraint",
                         "expected_profit": float(arb_opportunity.expected_profit),
+                        "arb_object": arb_opportunity,  # Keep typed object for executor
                         "trades": [
                             {
                                 "outcome_id": t.outcome_id,
                                 "side": t.side.value,
                                 "size": float(t.size),
                                 "limit_price": float(t.limit_price),
+                                "exchange": t.exchange,
                             }
                             for t in arb_opportunity.trades
                         ],
@@ -1148,16 +1152,108 @@ class Navigator:
             logger.debug("Balance reconciliation skipped", error=str(e))
 
     async def _execute_opportunity(self, opportunity: Any, signal_timestamp_us: int = 0) -> None:
-        """Execute a trading opportunity.
+        """Execute a trading opportunity through the TradeExecutor.
+
+        Converts the detected ArbitrageOpportunity into an OptimizationResult,
+        runs ExecutionGuard pre-flight checks on every leg, then dispatches
+        to TradeExecutor.execute_atomic() for paper or live execution.
 
         Args:
-            opportunity: The detected arbitrage opportunity.
+            opportunity: Dict with keys: cluster_id, source, expected_profit,
+                arb_object (ArbitrageOpportunity), trades (list of dicts).
             signal_timestamp_us: Microsecond timestamp of when the price signal
                 was first observed (for Rust-side staleness rejection).
         """
-        # TODO: Implement trade execution
         self._opportunities_found += 1
-        logger.info("Would execute opportunity", opportunity=opportunity)
+
+        # ── Extract the typed ArbitrageOpportunity ──
+        arb: ArbitrageOpportunity | None = opportunity.get("arb_object") if isinstance(opportunity, dict) else None
+        if not arb or not arb.trades:
+            logger.warning(
+                "Opportunity has no executable trades (missing arb_object or empty trades)",
+                cluster_id=opportunity.get("cluster_id") if isinstance(opportunity, dict) else "unknown",
+            )
+            return
+
+        cluster_id = opportunity.get("cluster_id", "unknown")
+
+        logger.info(
+            "Executing opportunity",
+            cluster_id=cluster_id,
+            expected_profit=float(arb.expected_profit),
+            trade_count=len(arb.trades),
+            trades=[
+                {
+                    "outcome_id": t.outcome_id,
+                    "side": t.side.value,
+                    "size": float(t.size),
+                    "price": float(t.limit_price),
+                    "exchange": t.exchange,
+                }
+                for t in arb.trades
+            ],
+        )
+
+        # ── Pre-flight: ExecutionGuard constraint checks ──
+        if self._guard:
+            for trade in arb.trades:
+                valid, reason = self._guard.check_trade(
+                    outcome_id=trade.outcome_id,
+                    side=trade.side.value,
+                    size=float(trade.size),
+                    price=float(trade.limit_price),
+                )
+                if not valid:
+                    logger.warning(
+                        "Trade rejected by ExecutionGuard",
+                        reason=reason,
+                        outcome_id=trade.outcome_id,
+                        cluster_id=cluster_id,
+                    )
+                    return
+
+        # ── Wrap in OptimizationResult (what TradeExecutor expects) ──
+        opt_result = OptimizationResult(
+            success=True,
+            trades=arb.trades,
+            expected_profit=arb.expected_profit,
+            status="arbitrage_detected",
+        )
+
+        # ── Execute atomically via TradeExecutor ──
+        if not self._trade_executor:
+            logger.error("TradeExecutor not initialized — cannot execute")
+            return
+
+        result = await self._trade_executor.execute_atomic(opt_result)
+
+        if result.success:
+            self._trades_executed += result.trade_count
+            logger.info(
+                "✅ Trade executed successfully",
+                cluster_id=cluster_id,
+                fills=result.trade_count,
+                total_filled=float(result.total_filled),
+                expected_profit=float(arb.expected_profit),
+            )
+
+            # Feed PnL to KillSwitch for drawdown tracking
+            if self._kill_switch:
+                # Approximate PnL: expected_profit is the best estimate until
+                # we have proper mark-to-market from fill prices vs fair value
+                pnl = float(arb.expected_profit)
+                await self._kill_switch.record_pnl(pnl)
+
+                # Record each fill for toxic flow detection
+                for _ in result.fills:
+                    self._kill_switch.record_fill()
+        else:
+            logger.warning(
+                "❌ Trade execution failed",
+                cluster_id=cluster_id,
+                reason=result.reason,
+                fills_before_failure=result.trade_count,
+            )
     
     def _on_kill_switch_trigger(self, event: Any) -> None:
         """Handle kill switch trigger — halt Rust sidecar and block until ACK."""

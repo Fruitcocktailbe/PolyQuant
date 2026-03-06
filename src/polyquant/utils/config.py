@@ -291,6 +291,12 @@ class PolyQuantConfig(BaseSettings):
         ge=0.0,
         description="Minimum profit in USD to consider trading (filter noise)"
     )
+
+    fw_min_profit: float = Field(
+        default=0.05,
+        ge=0.0,
+        description="Minimum profit in USD for Frank-Wolfe arbitrage detection"
+    )
     
     fw_max_iterations: int = Field(
         default=150,
