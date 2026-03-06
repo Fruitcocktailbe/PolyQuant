@@ -135,7 +135,14 @@ In the Lightsail Console, open the following **Inbound Ports**:
 
 - **Stop All**: `CTRL+C` in all sessions.
 - **Restart Redis**: `sudo systemctl restart redis-server`
-- **Clear Scan Cache**: `redis-cli FLUSHALL` (Use this if you want to force a full rescan of all markets)
+- **Clear PolyQuant Brain / Cache**: 
+  If you want to force Map Maker to scan from scratch, run these commands:
+  ```bash
+  redis-cli FLUSHALL
+  rm -rf .polyquant/constraints/
+  rm -f .polyquant/market_pairs.json
+  ```
+- **Exit Virtual Environment**: Run `deactivate` in the terminal to exit the `(venv)`.
 - **View Logs**: Check `logs/` directory in the root or the Web Dashboard terminal.
 
 > [!NOTE]
