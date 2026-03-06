@@ -413,6 +413,13 @@ class Navigator:
         self._trade_store = TradeStore()
         set_trade_store(self._trade_store)
         
+        # Hydrate the UI monitor with historical trades
+        try:
+            recent_trades = await self._trade_store.get_recent_trades(limit=50)
+            monitor.state.trades_executed = recent_trades
+        except Exception as e:
+            logger.warning(f"Could not load recent trades for UI: {e}")
+        
         # Initialize ZMQ IPC Client
         from polyquant.execution.rust_client import RustClient
         self._rust_client = RustClient()

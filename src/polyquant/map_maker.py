@@ -359,17 +359,7 @@ class MapMaker:
 
             # Reconstruct manifest from cached data
             try:
-                manifest = ConstraintManifest(
-                    cluster_id=cluster.cluster_id,
-                    topic=cluster.topic,
-                    market_ids=[m.market_id for m in cluster.markets],
-                    constraints=[
-                        StoredConstraint(**c) for c in cached_result.get("constraints", [])
-                    ],
-                    dependencies=[
-                        StoredDependency(**d) for d in cached_result.get("dependencies", [])
-                    ],
-                )
+                manifest = ConstraintManifest(**cached_result)
                 # Mark as from cache for statistics
                 manifest._from_cache = True  # type: ignore
                 return manifest
@@ -523,31 +513,7 @@ class MapMaker:
             )
 
             # Cache the result for future runs (5 minute TTL)
-            cache_data = {
-                "constraints": [
-                    {
-                        "constraint_id": c.constraint_id,
-                        "description": c.description,
-                        "coefficients": c.coefficients,
-                        "rhs": c.rhs,
-                        "confidence": c.confidence,
-                        "reasoning": c.reasoning,
-                        "source_markets": c.source_markets,
-                    }
-                    for c in stored_constraints
-                ],
-                "dependencies": [
-                    {
-                        "source_market_id": d.source_market_id,
-                        "source_outcome": d.source_outcome,
-                        "target_market_id": d.target_market_id,
-                        "target_outcome": d.target_outcome,
-                        "relationship": d.relationship,
-                        "confidence": d.confidence,
-                    }
-                    for d in stored_dependencies
-                ],
-            }
+            cache_data = manifest.model_dump(mode="json")
             await cache.set_llm_result(cluster_hash, cache_data, ttl_seconds=300)
 
             logger.info(
