@@ -74,11 +74,15 @@ class ExchangeMatcher:
         with open(CACHE_FILE, "w") as f:
             json.dump(self.mapped_pairs, f, indent=2)
 
-    async def run_matching_pipeline(self) -> Dict[str, str]:
-        """Runs the 3-stage funnel to find new cross-exchange arb pairs."""
+    async def run_matching_pipeline(self) -> tuple[Dict[str, str], Dict[str, Any]]:
+        """Runs the 3-stage funnel to find new cross-exchange arb pairs.
+        
+        Returns:
+            Tuple of (mapped_pairs dict, pipeline_stats dict)
+        """
         if SentenceTransformer is None:
             logger.error("sentence-transformers is not installed. Run `pip install sentence-transformers`")
-            return self.mapped_pairs
+            return self.mapped_pairs, {"error": "sentence-transformers not installed"}
 
         # Stage 1: Liquidity Pre-filtering
         logger.info("Stage 1: Fetching and filtering active markets from both exchanges...")
@@ -96,6 +100,8 @@ class ExchangeMatcher:
                 offset += page_size
                 if raw_count < page_size:
                     break  # No more pages
+        
+        poly_fetched_total = len(poly_markets)
             
         limit_markets_raw = []
         try:
@@ -124,9 +130,28 @@ class ExchangeMatcher:
                 continue
         
         logger.info(f"Stage 1 Complete: {len(poly_markets)} Polymarket | {len(limit_markets)} Limitless targets.")
+
+        # Track stats for the report
+        pipeline_stats = {
+            "polymarket_fetched": poly_fetched_total,
+            "polymarket_after_filter": len(poly_markets),
+            "limitless_fetched": len(limit_markets_raw),
+            "limitless_after_filter": len(limit_markets),
+            "limitless_discarded": len(limit_markets_raw) - len(limit_markets),
+            "already_mapped": len(self.mapped_pairs),
+            "llm_verifications_sent": 0,
+            "llm_matches_confirmed": 0,
+            "llm_matches_rejected": 0,
+            "llm_errors": 0,
+            "vector_fallbacks": 0,
+            "new_pairs_found": 0,
+            "total_pairs_after": 0,
+            "matched_pairs_detail": [],
+        }
         
         if not poly_markets or not limit_markets:
-            return self.mapped_pairs
+            pipeline_stats["total_pairs_after"] = len(self.mapped_pairs)
+            return self.mapped_pairs, pipeline_stats
 
         # Prepare corpuses for TF-IDF
         p_docs = [f"{m.question} {m.description}" for m in poly_markets]
@@ -217,8 +242,10 @@ class ExchangeMatcher:
                 
         if not eval_tasks:
             logger.info("No new pairs met the semantic similarity threshold for LLM verification.")
-            return self.mapped_pairs
+            pipeline_stats["total_pairs_after"] = len(self.mapped_pairs)
+            return self.mapped_pairs, pipeline_stats
             
+        pipeline_stats["llm_verifications_sent"] = len(eval_tasks)
         logger.info(f"Firing {len(eval_tasks)} LLM verification requests concurrently...")
         results = await asyncio.gather(*eval_tasks, return_exceptions=True)
         
@@ -236,6 +263,7 @@ class ExchangeMatcher:
 
             if isinstance(resp, Exception) or resp is None:
                 # LLM FAILED (400 error or timeout) - Check for vector fallback
+                pipeline_stats["llm_errors"] += 1
                 if meta["sim_score"] > 0.92:
                     logger.warning(
                         "LLM FAILED - Using High-Confidence Vector Fallback (>0.92)",
@@ -245,6 +273,7 @@ class ExchangeMatcher:
                     )
                     is_match = True
                     match_reason = "Vector Fallback (LLM Failed)"
+                    pipeline_stats["vector_fallbacks"] += 1
                 else:
                     logger.error(f"LLM evaluation failed and score ({meta['sim_score']:.2f}) too low for fallback: {resp}")
                     continue
@@ -257,6 +286,15 @@ class ExchangeMatcher:
                 self.mapped_pairs[p_market.market_id] = meta["l_id"]
                 processed_p_market_ids.add(p_market.market_id)
                 new_matches += 1
+                pipeline_stats["llm_matches_confirmed"] += 1
+                pipeline_stats["matched_pairs_detail"].append({
+                    "polymarket": p_market.question[:80],
+                    "limitless": meta["l_title"][:80],
+                    "similarity": round(meta["sim_score"], 3),
+                    "method": match_reason,
+                })
+            else:
+                pipeline_stats["llm_matches_rejected"] += 1
                 
                 # Update UI Monitor with UI-friendly list
                 ui_pair = {
@@ -276,7 +314,9 @@ class ExchangeMatcher:
             self.save_cache()
             
         logger.info(f"Pipeline complete. Identified {new_matches} new dual-arb pairs. Total cached: {len(self.mapped_pairs)}")
-        return self.mapped_pairs
+        pipeline_stats["new_pairs_found"] = new_matches
+        pipeline_stats["total_pairs_after"] = len(self.mapped_pairs)
+        return self.mapped_pairs, pipeline_stats
 
     def save_cache(self):
         self._save_cache()

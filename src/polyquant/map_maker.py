@@ -27,6 +27,7 @@ import hashlib
 import json
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from polyquant.agents import (
@@ -275,19 +276,20 @@ class MapMaker:
                     "cache_hit_rate": f"{(cache_hits / total_clusters * 100):.1f}%" if total_clusters > 0 else "0%",
                 }
 
-            async def run_cross_exchange_pipeline() -> int:
+            async def run_cross_exchange_pipeline() -> dict[str, Any]:
                 await monitor.update_status(pipeline_stage="MATCHING")
                 if self._exchange_matcher:
-                    new_mappings = await self._exchange_matcher.run_matching_pipeline()
-                    return len(new_mappings)
-                return 0
+                    new_mappings, matching_stats = await self._exchange_matcher.run_matching_pipeline()
+                    matching_stats["total_pairs"] = len(new_mappings)
+                    return matching_stats
+                return {"skipped": True}
 
             # Run cross exchange matching first so reasoning pipeline can use the newly discovered Limitless pairs
-            new_cross_pairs = await run_cross_exchange_pipeline()
+            matching_stats = await run_cross_exchange_pipeline()
             analysis_data = await run_reasoning_pipeline()
             
             results["analysis"] = analysis_data
-            results["cross_exchange_pairs"] = new_cross_pairs
+            results["matching"] = matching_stats
             
             results["status"] = "complete"
             results["outcome"] = "success"
@@ -310,8 +312,113 @@ class MapMaker:
             status=results["status"],
             elapsed=elapsed,
         )
+
+        # Generate and save report
+        report_path = self._generate_report(results)
+        results["report_path"] = str(report_path)
         
         return results
+
+    def _generate_report(self, results: dict[str, Any]) -> Path:
+        """Generate a comprehensive run report and save it to .polyquant/reports/."""
+        reports_dir = Path.cwd() / ".polyquant" / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_file = reports_dir / f"mapmaker_report_{timestamp}.txt"
+        
+        lines = []
+        lines.append("=" * 70)
+        lines.append("  POLYQUANT MAP MAKER — RUN REPORT")
+        lines.append("=" * 70)
+        lines.append(f"  Timestamp    : {results.get('start_time', 'N/A')}")
+        lines.append(f"  Status       : {results.get('status', 'unknown').upper()}")
+        lines.append(f"  Version      : {results.get('version', 'N/A')}")
+        lines.append(f"  Duration     : {results.get('elapsed_seconds', 0):.1f} seconds")
+        lines.append("")
+        
+        # Discovery
+        disc = results.get("discovery", {})
+        lines.append("-" * 70)
+        lines.append("  PHASE 1: DISCOVERY")
+        lines.append("-" * 70)
+        lines.append(f"  Clusters found        : {disc.get('clusters_found', 0)}")
+        lines.append(f"  Total markets in scope: {disc.get('total_markets', 0)}")
+        lines.append("")
+        
+        # Cross-Exchange Matching
+        match = results.get("matching", {})
+        if not match.get("skipped"):
+            lines.append("-" * 70)
+            lines.append("  PHASE 2: CROSS-EXCHANGE MATCHING (Polymarket ↔ Limitless)")
+            lines.append("-" * 70)
+            lines.append(f"  Polymarket markets fetched  : {match.get('polymarket_fetched', 'N/A')}")
+            lines.append(f"  Polymarket after $2500 filt : {match.get('polymarket_after_filter', 'N/A')}")
+            lines.append(f"  Limitless markets fetched   : {match.get('limitless_fetched', 'N/A')}")
+            lines.append(f"  Limitless after $2500 filt  : {match.get('limitless_after_filter', 'N/A')}")
+            lines.append(f"  Limitless discarded (low $) : {match.get('limitless_discarded', 'N/A')}")
+            lines.append(f"  Already mapped (from cache) : {match.get('already_mapped', 0)}")
+            lines.append(f"  LLM verifications sent      : {match.get('llm_verifications_sent', 0)}")
+            lines.append(f"  LLM matches confirmed       : {match.get('llm_matches_confirmed', 0)}")
+            lines.append(f"  LLM matches rejected        : {match.get('llm_matches_rejected', 0)}")
+            lines.append(f"  LLM errors                  : {match.get('llm_errors', 0)}")
+            lines.append(f"  Vector fallbacks (>0.92)    : {match.get('vector_fallbacks', 0)}")
+            lines.append(f"  NEW pairs found this run    : {match.get('new_pairs_found', 0)}")
+            lines.append(f"  Total pairs (cumulative)    : {match.get('total_pairs_after', 0)}")
+            
+            pairs_detail = match.get("matched_pairs_detail", [])
+            if pairs_detail:
+                lines.append("")
+                lines.append("  Matched Pairs Detail:")
+                for i, p in enumerate(pairs_detail, 1):
+                    lines.append(f"    {i}. [{p['similarity']:.3f}] {p['method']}")
+                    lines.append(f"       PM: {p['polymarket']}")
+                    lines.append(f"       LM: {p['limitless']}")
+            lines.append("")
+        else:
+            lines.append("-" * 70)
+            lines.append("  PHASE 2: CROSS-EXCHANGE MATCHING — SKIPPED")
+            lines.append("-" * 70)
+            lines.append("")
+        
+        # Constraint Analysis
+        analysis = results.get("analysis", {})
+        lines.append("-" * 70)
+        lines.append("  PHASE 3: CONSTRAINT ANALYSIS (LLM Reasoning)")
+        lines.append("-" * 70)
+        lines.append(f"  Manifests saved        : {analysis.get('manifests_saved', 0)}")
+        lines.append(f"  Total constraints      : {analysis.get('total_constraints', 0)}")
+        lines.append(f"  Total dependencies     : {analysis.get('total_dependencies', 0)}")
+        lines.append(f"  Cache hits             : {analysis.get('cache_hits', 0)}")
+        lines.append(f"  Cache hit rate         : {analysis.get('cache_hit_rate', 'N/A')}")
+        lines.append("")
+        
+        # Error
+        if results.get("error"):
+            lines.append("-" * 70)
+            lines.append("  ERROR")
+            lines.append("-" * 70)
+            lines.append(f"  {results['error']}")
+            tb = results.get("traceback", "")
+            if tb:
+                for tb_line in tb.strip().split("\n"):
+                    lines.append(f"  {tb_line}")
+            lines.append("")
+        
+        lines.append("=" * 70)
+        lines.append("  END OF REPORT")
+        lines.append("=" * 70)
+        
+        report_text = "\n".join(lines)
+        
+        # Save to file
+        report_file.write_text(report_text, encoding="utf-8")
+        
+        # Also print to console
+        print("\n" + report_text)
+        
+        logger.info(f"Report saved to {report_file}")
+        return report_file
     
     @staticmethod
     def _compute_cluster_hash(cluster: MarketCluster) -> str:
@@ -568,12 +675,8 @@ async def main() -> None:
             min_liquidity=1000,
         )
         
-        print("\n" + "=" * 60)
-        print("Map Building Result:")
-        print("=" * 60)
-        
-        for key, value in result.items():
-            print(f"  {key}: {value}")
+        report_path = result.get("report_path", "N/A")
+        print(f"\n  Report saved to: {report_path}")
 
 
 if __name__ == "__main__":
