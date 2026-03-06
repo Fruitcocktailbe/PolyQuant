@@ -1,8 +1,6 @@
 import { useState, memo, useCallback } from 'react';
 import { api } from '../services/api';
 import { AlertTriangle, XOctagon } from 'lucide-react';
-// @ts-ignore
-import { motion, AnimatePresence } from 'framer-motion';
 
 interface KillSwitchProps {
     active: boolean;
@@ -55,41 +53,36 @@ export const KillSwitch = memo<KillSwitchProps>(({ active }) => {
                 <span className="text-sm font-bold font-mono tracking-[0.2em] group-hover:text-white transition-colors">EMERGENCY STOP</span>
             </button>
 
-            <AnimatePresence>
-                {showConfirm && (
-                    <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-4">
-                        <motion.div
-                            initial={{ scale: 0.9, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0.9, opacity: 0 }}
-                            className="bg-charcoal border border-neon-red/50 p-8 max-w-md w-full shadow-neon-red rounded-none relative"
-                        >
-                            <div className="absolute top-0 left-0 w-full h-1 bg-neon-red shadow-neon-red" />
+            {showConfirm && (
+                <div className="fixed inset-0 bg-black/90 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                    <div
+                        className="bg-charcoal border border-neon-red/50 p-8 max-w-md w-full shadow-[0_0_30px_rgba(255,0,85,0.4)] rounded-none relative animate-in zoom-in-95 duration-200"
+                    >
+                        <div className="absolute top-0 left-0 w-full h-1 bg-neon-red shadow-neon-red" />
 
-                            <AlertTriangle className="w-16 h-16 text-neon-red mx-auto mb-6 animate-pulse" />
-                            <h2 className="text-2xl font-bold text-white mb-2 text-center tracking-widest font-header">CONFIRM PURGE</h2>
-                            <p className="text-gray-400 mb-8 text-center text-sm font-mono border-l-2 border-neon-red/30 pl-4 mx-4">
-                                This will immediately stop all active solvers and attempt to liquidate all positions at market price.
-                            </p>
+                        <AlertTriangle className="w-16 h-16 text-neon-red mx-auto mb-6 animate-pulse" />
+                        <h2 className="text-2xl font-bold text-white mb-2 text-center tracking-widest font-header">CONFIRM PURGE</h2>
+                        <p className="text-gray-400 mb-8 text-center text-sm font-mono border-l-2 border-neon-red/30 pl-4 mx-4">
+                            This will immediately stop all active solvers and attempt to liquidate all positions at market price.
+                        </p>
 
-                            <div className="flex gap-4 font-mono text-sm">
-                                <button
-                                    onClick={closeConfirm}
-                                    className="flex-1 py-3 px-6 bg-transparent border border-gray-700 text-gray-400 hover:text-white hover:border-white transition-all uppercase tracking-wider"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={handlePanic}
-                                    className="flex-1 py-3 px-6 bg-neon-red/10 border border-neon-red text-neon-red hover:bg-neon-red hover:text-white hover:shadow-neon-red transition-all uppercase tracking-wider font-bold"
-                                >
-                                    Execute
-                                </button>
-                            </div>
-                        </motion.div>
+                        <div className="flex gap-4 font-mono text-sm">
+                            <button
+                                onClick={closeConfirm}
+                                className="flex-1 py-3 px-6 bg-transparent border border-gray-700 text-gray-400 hover:text-white hover:border-white transition-all uppercase tracking-wider"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handlePanic}
+                                className="flex-1 py-3 px-6 bg-neon-red/10 border border-neon-red text-neon-red hover:bg-neon-red hover:text-white hover:shadow-neon-red transition-all uppercase tracking-wider font-bold"
+                            >
+                                Execute
+                            </button>
+                        </div>
                     </div>
-                )}
-            </AnimatePresence>
+                </div>
+            )}
         </>
     );
 });
