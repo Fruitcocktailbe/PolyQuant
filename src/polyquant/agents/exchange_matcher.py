@@ -37,18 +37,23 @@ LLM_VERIFY_PROMPT = """
 You are a financial exchange matching engine.
 Your task is to determine if two prediction markets are EXACTLY identical.
 They must resolve to the exact same real-world outcome, same timeframe, and same truth source.
+Pay special attention to the Resolution Source and End Date — if they differ, they are NOT a match.
 
 Polymarket Question: {p_q}
 Polymarket Description: {p_d}
+Polymarket Resolution Source: {p_res}
+Polymarket End Date: {p_end}
 
 Limitless Candidate Question: {l_q}
 Limitless Candidate Description: {l_d}
+Limitless Resolution Source: {l_res}
+Limitless End Date: {l_end}
 
 Respond ONLY in JSON. Return a boolean "is_match" and a short "reasoning".
-{
+{{
     "is_match": true/false,
     "reasoning": "..."
-}
+}}
 """
 
 class ExchangeMatcher:
@@ -161,12 +166,16 @@ class ExchangeMatcher:
                 if not l_id:
                     continue
                     
-                # Format Verify Prompt
+                # Format Verify Prompt (includes resolution criteria)
                 prompt = LLM_VERIFY_PROMPT.format(
                     p_q=p_market.question,
                     p_d=p_market.description,
+                    p_res=p_market.resolution_source or "Not specified",
+                    p_end=str(p_market.end_date or "Not specified"),
                     l_q=l_market.get('title', ''),
-                    l_d=l_market.get('description', '')
+                    l_d=l_market.get('description', ''),
+                    l_res=l_market.get('resolutionSource', '') or l_market.get('rules', '') or "Not specified",
+                    l_end=l_market.get('endDate', '') or l_market.get('expirationDate', '') or "Not specified",
                 )
                 
                 # Append to batch

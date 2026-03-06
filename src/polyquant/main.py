@@ -66,8 +66,19 @@ async def run_map_maker(
         dict: Results summary with cluster count, constraint count, etc.
     """
     from polyquant.map_maker import MapMaker
+    from polyquant.api.server import app, monitor, setup_web_logging
+    import uvicorn
 
     logger.info("Starting Map Maker...")
+    
+    # Start Sidecar UI Server so Dashboard can watch MapMaker progress
+    config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
+    server = uvicorn.Server(config_uv)
+    server_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.5)  # Give uvicorn a moment to bind to port
+    logger.info("🌐 API server started on http://0.0.0.0:8000 — Dashboard will now show scanning progress")
+    setup_web_logging()
+    await monitor.update_status(status="MAPPING")
 
     try:
         async with MapMaker() as map_maker:
@@ -82,6 +93,12 @@ async def run_map_maker(
             print("=" * 60)
             for key, value in result.items():
                 print(f"  {key}: {value}")
+            
+            # Keep server alive for a few seconds to let final updates flush to UI
+            await monitor.update_status(status="MAPPING_COMPLETE")
+            await asyncio.sleep(5)
+            server.should_exit = True
+            await server_task
 
             return result
     except Exception as e:

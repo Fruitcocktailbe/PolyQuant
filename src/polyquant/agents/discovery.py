@@ -297,10 +297,40 @@ The YES Price is the current market probability (0.00 to 1.00).
             
             # Auto-cluster: NegRisk events with price deviation detection
             # ENHANCED (Week 5): Explicit deviation detection for arbitrage opportunities
+            # ENHANCED (Week 6): Filter zero-volume outcomes to prevent phantom signals
             if neg_risk_id and len(valid_markets) > 1:
-                # Calculate actual price sum
+                # Filter out outcomes with negligible volume before calculating price sum.
+                # Dead/zero-volume outcomes often have phantom mid-prices that inflate
+                # the sum far beyond 1.0 (e.g., 14.43 or 4.50), producing false positives.
+                MIN_OUTCOME_VOLUME = 100  # $100 minimum volume to be considered "real"
+                priced_markets = [
+                    m for m in valid_markets
+                    if m.outcomes and m.volume and m.volume > MIN_OUTCOME_VOLUME
+                ]
+                filtered_count = len(valid_markets) - len(priced_markets)
+
+                if not priced_markets:
+                    # All outcomes are dead — skip this event entirely
+                    logger.debug(
+                        "NegRisk event skipped: all outcomes below volume threshold",
+                        event_title=event_title,
+                        total_outcomes=len(valid_markets),
+                        threshold=MIN_OUTCOME_VOLUME,
+                    )
+                    continue
+
+                if filtered_count > 0:
+                    logger.debug(
+                        "NegRisk: filtered low-volume outcomes from price sum",
+                        event_title=event_title,
+                        kept=len(priced_markets),
+                        filtered=filtered_count,
+                        threshold=MIN_OUTCOME_VOLUME,
+                    )
+
+                # Calculate actual price sum using only outcomes with real volume
                 total_price = sum(
-                    m.outcomes[0].price for m in valid_markets if m.outcomes
+                    m.outcomes[0].price for m in priced_markets
                 )
 
                 # Detect deviation from theoretical sum of 1.0 (ensure types match)

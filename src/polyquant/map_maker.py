@@ -223,6 +223,16 @@ class MapMaker:
                 cache_hits = 0
 
                 total_clusters = len(clusters)
+                
+                # Helper to update a single cluster's status in the UI
+                async def update_ui_cluster_status(cid: str, new_status: str):
+                    current_clusters = monitor.state.clusters
+                    for c in current_clusters:
+                        if c["id"] == cid:
+                            c["status"] = new_status
+                            break
+                    await monitor.update_status(clusters=current_clusters)
+
                 for idx, cluster in enumerate(clusters, 1):
                     # Progress logging
                     logger.info(
@@ -230,13 +240,19 @@ class MapMaker:
                         cluster_id=cluster.cluster_id,
                         topic=cluster.topic,
                     )
+                    
+                    await update_ui_cluster_status(cluster.cluster_id, "Analyzing (LLM)...")
 
                     manifest = await self._analyze_cluster(cluster)
 
                     if manifest:
                         # Check if this was a cache hit
-                        if hasattr(manifest, '_from_cache') and manifest._from_cache:
+                        is_cached = hasattr(manifest, '_from_cache') and manifest._from_cache
+                        if is_cached:
                             cache_hits += 1
+                            await update_ui_cluster_status(cluster.cluster_id, f"Cached ({manifest.constraint_count} found)")
+                        else:
+                            await update_ui_cluster_status(cluster.cluster_id, f"Parsed ({manifest.constraint_count} found)")
 
                         if manifest.constraint_count > 0:
                             if self._store:
@@ -244,6 +260,8 @@ class MapMaker:
                             manifests_saved += 1
                             total_constraints += manifest.constraint_count
                             total_dependencies += manifest.dependency_count
+                    else:
+                        await update_ui_cluster_status(cluster.cluster_id, "No constraints found")
 
                     # Progress percentage
                     progress_pct = (idx / total_clusters) * 100
