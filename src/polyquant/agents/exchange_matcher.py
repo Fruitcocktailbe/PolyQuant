@@ -107,7 +107,7 @@ class ExchangeMatcher:
         try:
             async with LimitlessClient() as l_client:
                 # Fetch all active markets via pagination (larger page size for speed)
-                limit_markets_raw = await l_client.get_markets(limit=100)
+                limit_markets_raw = await l_client.get_markets(limit=20)
         except Exception as e:
             logger.error(f"LimitlessClient context failed: {e}")
             # Fallback: Try fetching markets with a raw HTTP call (no signing/nonce needed)
@@ -118,7 +118,7 @@ class ExchangeMatcher:
                     while True:
                         resp = await raw_client.get(
                             f"{config.limitless_api_url}/markets/active",
-                            params={"limit": 100, "page": page}
+                            params={"limit": 20, "page": page}
                         )
                         resp.raise_for_status()
                         data = resp.json()
@@ -127,7 +127,7 @@ class ExchangeMatcher:
                             break
                         limit_markets_raw.extend(batch)
                         page += 1
-                        if len(batch) < 100:
+                        if len(batch) < 20:
                             break
                 logger.info(f"Fallback fetch succeeded: {len(limit_markets_raw)} Limitless markets")
             except Exception as fallback_err:

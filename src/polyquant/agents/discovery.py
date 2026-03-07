@@ -465,7 +465,8 @@ The YES Price is the current market probability (0.00 to 1.00).
             ]
 
         # Prevent massive prompts that break the LLM API / Context window
-        MAX_BATCH_SIZE = 150
+        # Reduced from 150 to 50 to prevent free-tier models from returning unterminated JSON strings
+        MAX_BATCH_SIZE = 50
         if len(markets) > MAX_BATCH_SIZE:
             logger.info(f"Chunking {len(markets)} markets into batches of {MAX_BATCH_SIZE}...")
             batches = [markets[i:i + MAX_BATCH_SIZE] for i in range(0, len(markets), MAX_BATCH_SIZE)]
