@@ -467,7 +467,7 @@ class Navigator:
         self._position_sizer = PositionSizer(capital=10000)
         
         self._is_running = True
-        await monitor.update_status(status="ONLINE")
+        await monitor.update_status(status="ONLINE", active_solvers=1)
         
         # Initialize price cache for low-latency access
         self._price_cache = PriceCache(stale_threshold_seconds=2.0)

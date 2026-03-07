@@ -18,7 +18,7 @@ export default {
                 }
             },
             fontFamily: {
-                mono: ['JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', 'monospace'],
+                mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'Courier New', 'monospace'],
                 sans: ['Inter', 'system-ui', 'sans-serif'],
             },
             boxShadow: {

@@ -60,7 +60,7 @@ class LimitlessClient:
             
         self._rest_client = httpx.AsyncClient(
             base_url=self.api_url,
-            timeout=5.0, # Using explicit timeout as clob_timeout may not be in config
+            timeout=15.0, # Using explicit timeout as clob_timeout may not be in config
             headers=headers,
             verify=True
         )
@@ -121,7 +121,7 @@ class LimitlessClient:
                     "limit": limit,
                     "page": page
                 })
-            except httpx.HTTPStatusError as e:
+            except Exception as e:
                 logger.error(f"Failed to fetch Limitless markets: {e}")
                 break
                 

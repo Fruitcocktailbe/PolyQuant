@@ -109,7 +109,29 @@ class ExchangeMatcher:
                 # Fetch all active markets via pagination (larger page size for speed)
                 limit_markets_raw = await l_client.get_markets(limit=100)
         except Exception as e:
-            logger.warning(f"Failed to fetch Limitless markets, skipping cross-exchange matching: {e}")
+            logger.error(f"LimitlessClient context failed: {e}")
+            # Fallback: Try fetching markets with a raw HTTP call (no signing/nonce needed)
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=15.0) as raw_client:
+                    page = 1
+                    while True:
+                        resp = await raw_client.get(
+                            f"{config.limitless_api_url}/markets/active",
+                            params={"limit": 100, "page": page}
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        batch = data.get("data", []) or data.get("markets", [])
+                        if not batch:
+                            break
+                        limit_markets_raw.extend(batch)
+                        page += 1
+                        if len(batch) < 100:
+                            break
+                logger.info(f"Fallback fetch succeeded: {len(limit_markets_raw)} Limitless markets")
+            except Exception as fallback_err:
+                logger.error(f"Fallback Limitless fetch also failed: {fallback_err}")
             
         # Filter Limitless for minimum activity ($2500 in volume or liquidity)
         # Note: Limitless returns raw USDC ints (6 decimals) AND formatted dollar strings
@@ -132,7 +154,7 @@ class ExchangeMatcher:
         logger.info(f"Stage 1 Complete: {len(poly_markets)} Polymarket | {len(limit_markets)} Limitless targets.")
 
         # Track stats for the report
-        pipeline_stats = {
+        pipeline_stats: Dict[str, Any] = {
             "polymarket_fetched": poly_fetched_total,
             "polymarket_after_filter": len(poly_markets),
             "limitless_fetched": len(limit_markets_raw),
