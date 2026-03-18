@@ -31,7 +31,6 @@ from itertools import groupby
 from typing import Any
 
 from polyquant.data import ProposedTrade, OrderSide
-from polyquant.solver.scip_solver import OptimizationResult
 from polyquant.utils import get_logger, config
 
 logger = get_logger(__name__)
@@ -108,31 +107,26 @@ class TradeExecutor:
             paper_mode=self._paper_mode,
         )
     
-    async def execute_atomic(self, result: OptimizationResult) -> ExecutionResult:
+    async def execute_trade(self, trade: ProposedTrade) -> ExecutionResult:
         """
-        Execute all trades atomically or none.
-
-        Week 4: Parallel execution of independent legs within priority groups.
-
-        Strategy:
-        1. Group trades by priority (lower = illiquid, must execute first)
-        2. Within a group (same priority), execute in parallel (independent)
-        3. Between groups, execute sequentially (dependencies)
+        Execute a single directional trade.
 
         Returns:
             ExecutionResult with fills or failure reason
         """
-        if not result.success or not result.trades:
+        if not trade:
             return ExecutionResult(
                 success=False,
-                reason="No trades to execute",
+                reason="No trade to execute",
             )
+            
+        result_trades = [trade]
 
         # Single-pass pre-flight checks: balance, in-flight capital, VWAP slippage
         if not self._paper_mode:
             poly_buy_cost = Decimal("0")
             base_buy_cost = Decimal("0")
-            for t in result.trades:
+            for t in result_trades:
                 if t.side.value == "BUY":
                     if t.exchange == "polymarket":
                         poly_buy_cost += t.notional_value
@@ -169,7 +163,7 @@ class TradeExecutor:
                             )
 
         # Sort by priority (lower = first = illiquid)
-        sorted_trades = sorted(result.trades, key=lambda t: t.priority)
+        sorted_trades = sorted(result_trades, key=lambda t: t.priority)
 
         # Week 4: Group by priority for parallel execution
         priority_groups = [

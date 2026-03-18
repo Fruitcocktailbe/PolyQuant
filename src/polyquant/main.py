@@ -1,38 +1,22 @@
 """
-PolyQuant 2.0 - Main Entry Point
+PolyQuant 2.0 - Liquidity Vacuum Scanner
 
-This is the main entry point for PolyQuant's two-mode architecture:
-
-1. MAP MODE (Offline - "Slow Brain"):
-   - Discovers markets from Polymarket
-   - Analyzes logical dependencies using LLMs
-   - Validates constraints
-   - Generates and persists Constraint Manifests
-   - Run periodically (e.g., hourly)
-
-2. TRADE MODE (Online - "Fast Brain"):
-   - Loads pre-computed Constraint Manifests
-   - Connects to real-time price feeds (WebSocket)
-   - Detects arbitrage opportunities using solvers
-   - Executes trades with <50ms latency
-   - Runs continuously
+This is the main entry point for the PolyQuant Momentum Scanner.
+It runs continuously to:
+1. Discover markets from Polymarket (Gamma API) where YES < $0.10
+2. Connect to real-time price feeds (WebSocket)
+3. Detect momentum and volume spikes
+4. Execute trades when opportunities arise
 
 USAGE:
 ------
-    # Build constraint map (run first, or periodically)
-    python -m polyquant.main map
-
-    # Start real-time trading
-    python -m polyquant.main trade
+    # Start real-time scanning/trading
+    python -m polyquant.main
 
     # Or programmatically
-    from polyquant.main import run_map_maker, run_navigator
+    from polyquant.main import run_navigator
 
     async def main():
-        # Build map first
-        await run_map_maker()
-
-        # Then trade
         await run_navigator()
 """
 
@@ -46,76 +30,16 @@ from polyquant.utils import get_logger
 logger = get_logger(__name__)
 
 
-async def run_map_maker(
-    limit: int = 500,
-    min_liquidity: float = 1000,
-    force: bool = False,
-) -> dict[str, Any]:
+async def run_navigator(limit: int = 0) -> None:
     """
-    Run the Map Maker to build constraint manifests.
+    Run the Navigator for real-time momentum scanning.
 
-    This performs offline analysis of market structures and saves
-    the results to disk for the Navigator to use.
-
-    Args:
-        limit: Maximum number of markets to analyze.
-        min_liquidity: Minimum liquidity threshold for markets.
-        force: Whether to force a re-scan of already processed markets.
-
-    Returns:
-        dict: Results summary with cluster count, constraint count, etc.
-    """
-    from polyquant.map_maker import MapMaker
-    from polyquant.api.server import app, monitor, setup_web_logging
-    import uvicorn
-
-    logger.info("Starting Map Maker...")
-    
-    # Start Sidecar UI Server so Dashboard can watch MapMaker progress
-    config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
-    server = uvicorn.Server(config_uv)
-    server_task = asyncio.create_task(server.serve())
-    await asyncio.sleep(0.5)  # Give uvicorn a moment to bind to port
-    logger.info("🌐 API server started on http://0.0.0.0:8000 — Dashboard will now show scanning progress")
-    setup_web_logging()
-    await monitor.update_status(status="MAPPING")
-
-    try:
-        async with MapMaker() as map_maker:
-            result = await map_maker.build_map(
-                limit=limit,
-                min_liquidity=min_liquidity,
-                skip_processed=not force,
-            )
-
-            print("\n" + "=" * 60)
-            print("Map Building Result:")
-            print("=" * 60)
-            for key, value in result.items():
-                print(f"  {key}: {value}")
-            
-            # Keep server alive for a few seconds to let final updates flush to UI
-            await monitor.update_status(status="MAPPING_COMPLETE")
-            await asyncio.sleep(5)
-            server.should_exit = True
-            await server_task
-
-            return result
-    except Exception as e:
-        logger.error("Map Maker failed", error=str(e), exc_info=True)
-        return {"status": "failed", "error": str(e)}
-
-
-async def run_navigator() -> None:
-    """
-    Run the Navigator for real-time trading.
-
-    This loads pre-computed constraints and runs continuously,
-    monitoring markets and executing trades when opportunities arise.
+    This runs continuously, monitoring markets via WebSocket and 
+    executing trades when strong signals are found.
     """
     from polyquant.navigator import Navigator
 
-    logger.info("Starting Navigator...")
+    logger.info("Starting Navigator (Scanner)...")
 
     navigator: Navigator | None = None
 
@@ -128,7 +52,7 @@ async def run_navigator() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        navigator = Navigator()
+        navigator = Navigator(market_limit=limit)
         async with navigator:
             await navigator.run()
     except KeyboardInterrupt:
@@ -139,50 +63,22 @@ async def run_navigator() -> None:
 
 
 async def main() -> None:
-    """Main entry point for PolyQuant."""
+    """Main entry point for PolyQuant Scanner."""
     parser = argparse.ArgumentParser(
-        description="PolyQuant 2.0 - Autonomous Arbitrage Extraction System",
+        description="PolyQuant 2.0 - Real-Time Momentum Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Modes:
-  map       Run the Map Maker (offline constraint analysis)
-  trade     Run the Navigator (real-time trading)
-
-Typical Workflow:
-  1. Run 'map' mode to build constraint manifests (first time or periodically)
-  2. Run 'trade' mode to start real-time trading
-
 Examples:
-  python -m polyquant.main map      # Build constraint map
-  python -m polyquant.main trade    # Start trading
+  python -m polyquant.main              # Run full scan
+  python -m polyquant.main --limit 50   # Quick test with 50 markets
         """,
     )
 
     parser.add_argument(
-        "mode",
-        choices=["map", "trade"],
-        nargs="?",
-        default="map",
-        help="Execution mode (default: map)",
-    )
-
-    # Map Maker arguments
-    parser.add_argument(
         "--limit",
         type=int,
-        default=500,
-        help="Maximum markets to scan in 'map' mode (default: 500, 0 for all)",
-    )
-    parser.add_argument(
-        "--min-liquidity",
-        type=float,
-        default=1000.0,
-        help="Minimum liquidity threshold in 'map' mode (default: 1000)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Force re-scan of already processed markets in 'map' mode",
+        default=0,
+        help="Max number of Tier-1 markets to process (0 = all)",
     )
 
     args = parser.parse_args()
@@ -190,23 +86,11 @@ Examples:
     print(f"""
     ===============================================================
                           PolyQuant 2.0
-            Autonomous Arbitrage Extraction System
-                        Mode: {args.mode.upper()}
+               Real-Time Momentum Scanning System
     ===============================================================
     """)
 
-    if args.mode == "map":
-        await run_map_maker(
-            limit=args.limit,
-            min_liquidity=args.min_liquidity,
-            force=args.force,
-        )
-    elif args.mode == "trade":
-        await run_navigator()
-    else:
-        # This shouldn't happen due to argparse choices, but just in case
-        logger.error(f"Unknown mode: {args.mode}")
-        parser.print_help()
+    await run_navigator(limit=args.limit)
 
 
 if __name__ == "__main__":

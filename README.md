@@ -1,6 +1,6 @@
-# PolyQuant 2.0
+# PolyQuant 2.0 - Liquidity Vacuum
 
-**Autonomous Arbitrage Extraction via Multi-Agent Logical Reasoning**
+**Real-Time Momentum Scanning System for Polymarket**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
@@ -8,24 +8,22 @@
 
 ## 🎯 Overview
 
-PolyQuant 2.0 is a modular agent swarm that autonomously extracts arbitrage opportunities from Polymarket prediction markets. The system translates human language market descriptions into mathematical constraints and executes optimal trades with <30ms latency.
+PolyQuant 2.0 has been upgraded from a cross-exchange arbitrage engine into an ultra-fast **momentum execution scanner** natively built for Polymarket. Using a strategy known as the "Liquidity Vacuum", it scans for underpriced markets (<$0.10 YES price), monitors real-time WebSockets, and executes entries when massive volume spikes and momentum swings occur simultaneously.
 
 ## 🏗️ Architecture
 
-PolyQuant 2.0 uses a **hybrid architecture** combining Python's high-level reasoning with Rust's low-level execution speed.
-
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Discovery  │ -> │  Map Maker  │ -> │  Validator  │ -> │ Navigator   │ -> │  OMS Sidecar│
-│   Agent     │    │(Correlation)│    │ (Reasoning) │    │ (Fast Brain)│    │   (Rust)    │
-│(Gemini 2.0) │    │(Logic Arch) │    │(Thinking)   │    │  (Python)   │    │(Execution)  │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-       ^                                                        |                  |
-       └─────────────────────────── manifests ──────────────────┘                  v
-                                                                            Polymarket/Limitless
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  Tier 1     │ -> │  Tier 2     │ -> │  Tier 3     │ -> │  OMS Sidecar│
+│ Discovery   │    │ (Warmup)    │    │ (Websocket  │    │   (Rust)    │
+│ (Gamma API) │    │ (CLOB Hist) │    │  Monitor)   │    │(Execution)  │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
-- **Python (Intelligence)**: Handles market discovery, LLM-based reasoning, and real-time arbitrage detection.
+- **Python (Intelligence)**: 
+  - Iterates through the API to find illiquid/cheap markets.
+  - Generates 200m EMAs.
+  - Connects to the Polymarket WebSocket and filters conditions in real time.
 - **Rust (Execution)**: A dedicated Order Management System (OMS) sidecar that handles signing, submission, and multi-exchange connectivity with <10ms overhead.
 - **Web UI (Monitoring)**: A React/Vite dashboard for real-time monitoring and manual overrides (KillSwitch).
 
@@ -34,18 +32,13 @@ PolyQuant 2.0 uses a **hybrid architecture** combining Python's high-level reaso
 ```
 polyquant/
 ├── src/
-│   ├── agents/              # AI Agent implementations
-│   ├── solver/              # Optimization engine (SCIP/FW)
 │   ├── api/                 # Monitoring API (FastAPI)
-│   ├── data/                # Data layer
+│   ├── data/                # Data layer (Websocket/Gamma Clients)
+│   ├── execution/           # Trade execution logic
 │   ├── risk/                # Risk (KillSwitch/PositionSizer)
 │   └── utils/               # Config/Logging
-├── oms-sidecar/             # [NEW] Rust Execution Engine
-│   ├── src/                 # Multi-exchange execution logic
-│   └── Cargo.toml           # Optimized binary build
-├── web/                     # [NEW] React/Vite Dashboard
-│   └── src/components/      # PipelineMonitor, KillSwitch, LogTerminal
-├── manifests/               # Pre-computed market logic files
+├── oms-sidecar/             # Rust Execution Engine
+├── web/                     # React/Vite Dashboard
 ├── .env                     # Centralized configuration
 └── README.md
 ```
@@ -56,7 +49,6 @@ polyquant/
 
 - Python 3.11+
 - Rust 1.75+
-- SCIP Optimization Suite
 
 ### Installation
 
@@ -85,13 +77,8 @@ npm install
 ### Configuration
 
 ```bash
-# Copy environment template
 cp .env.example .env
-
-# Edit .env with your API keys
-# - GEMINI_API_KEY
-# - DEEPSEEK_API_KEY
-# - ALCHEMY_API_KEY
+# Edit .env with your Polymarket + Polygon Keys
 ```
 
 ### Running the System
@@ -102,10 +89,10 @@ cp .env.example .env
    cargo run --release
    ```
 
-2. **Run the Agent Swarm**:
+2. **Run the Scanner**:
    ```bash
    # In a new terminal
-   python -m polyquant.main trade
+   python src/polyquant/main.py
    ```
 
 3. **Launch the Dashboard**:
@@ -113,34 +100,11 @@ cp .env.example .env
    cd web
    npm run dev
    ```
-# Or run individual agents
-python -m polyquant.agents.discovery
-```
-
-## ⚙️ Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MIN_LIQUIDITY` | Minimum market liquidity (USD) | 1000.0 |
-| `LLM_TEMPERATURE` | Global agent reasoning temp | 0.0 |
-| `SCIP_GAP` | Solver optimality precision | 0.001 |
-| `MIN_PROFIT_THRESHOLD` | Execute if profit > X | 0.05 |
-| `MAX_DRAWDOWN` | Emergency kill switch | 0.15 |
-
-## 📊 Success Metrics
-
-| Metric | Target |
-|--------|--------|
-| Extraction Efficiency | $500+ avg profit/trade |
-| Logical Accuracy | >81% on dependent pairs |
-| Latency | <30ms decision-to-mempool |
 
 ## 🔒 Risk Management
 
-- **Modified Kelly Criterion**: Position sizing capped at 50% of order book depth
-- **Kill Switch**: Automatic halt if drawdown exceeds 15%
-- **VWAP Guardrail**: Abort if slippage exceeds $0.05 profit margin
-- **Solver Timeout**: Halt if 5-minute rolling average timeout exceeded
+- **Modified Kelly Criterion**: Position sizing capped based on risk models.
+- **Kill Switch**: Automatic halt if drawdown exceeds threshold.
 
 ## 📝 License
 
