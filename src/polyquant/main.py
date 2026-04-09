@@ -1,468 +1,196 @@
 """
-PolyQuant 2.0 Main Orchestrator
+PolyQuant 2.0 - Main Entry Point
 
-This is the main entry point that coordinates all agents in the pipeline.
+This is the main entry point for PolyQuant's two-mode architecture:
 
-THE PIPELINE:
--------------
-1. Discovery Agent (GPT-4o) -> Scans markets, finds clusters
-2. Logic Architect (DeepSeek-R1) -> Analyzes dependencies
-3. Validator Agent (o1-preview) -> Verifies constraints
-4. Solver Oracle (SCIP) -> Computes optimal trades
-5. Executor (Rust) -> Executes trades [NOT YET IMPLEMENTED]
+1. MAP MODE (Offline - "Slow Brain"):
+   - Discovers markets from Polymarket
+   - Analyzes logical dependencies using LLMs
+   - Validates constraints
+   - Generates and persists Constraint Manifests
+   - Run periodically (e.g., hourly)
 
-EXECUTION MODES:
-----------------
-- paper: Simulation mode, no real trades
-- live: Real trading (requires confirmation)
+2. TRADE MODE (Online - "Fast Brain"):
+   - Loads pre-computed Constraint Manifests
+   - Connects to real-time price feeds (WebSocket)
+   - Detects arbitrage opportunities using solvers
+   - Executes trades with <50ms latency
+   - Runs continuously
 
 USAGE:
 ------
-    # From command line
-    python -m polyquant.main
-    
+    # Build constraint map (run first, or periodically)
+    python -m polyquant.main map
+
+    # Start real-time trading
+    python -m polyquant.main trade
+
     # Or programmatically
-    from polyquant.main import PolyQuantOrchestrator
-    
-    async def run():
-        orchestrator = PolyQuantOrchestrator()
-        async with orchestrator:
-            await orchestrator.run_pipeline()
+    from polyquant.main import run_map_maker, run_navigator
+
+    async def main():
+        # Build map first
+        await run_map_maker()
+
+        # Then trade
+        await run_navigator()
 """
 
 import asyncio
+import argparse
 import signal
-import sys
-from datetime import datetime
 from typing import Any
 
-from polyquant.agents import (
-    DiscoveryAgent,
-    LogicArchitect,
-    MarketCluster,
-    ValidatorAgent,
-)
-from polyquant.data import PolymarketClient
-from polyquant.risk import KillSwitch, PositionSizer
-from polyquant.solver import ArbitrageDetector, SCIPSolver
 from polyquant.utils import config, get_logger
 
 logger = get_logger(__name__)
 
 
-class PolyQuantOrchestrator:
+async def run_map_maker(
+    limit: int = 500,
+    min_liquidity: float | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
     """
-    Main orchestrator that coordinates all agents in the arbitrage pipeline.
-    
-    The orchestrator runs the full pipeline:
-    1. Discovery: Find related markets
-    2. Reasoning: Identify logical dependencies
-    3. Verification: Validate constraints
-    4. Optimization: Find optimal trades
-    5. Execution: Submit trades (paper or live mode)
-    
-    Example:
-        orchestrator = PolyQuantOrchestrator()
-        
-        async with orchestrator:
-            # Run once
-            await orchestrator.run_pipeline()
-            
-            # Or run continuously
-            await orchestrator.run_continuous(interval_seconds=60)
+    Run the Map Maker to build constraint manifests.
+
+    This performs offline analysis of market structures and saves
+    the results to disk for the Navigator to use.
+
+    Args:
+        limit: Maximum number of markets to analyze.
+        min_liquidity: Minimum liquidity threshold for markets.
+        force: Whether to force a re-scan of already processed markets.
+
+    Returns:
+        dict: Results summary with cluster count, constraint count, etc.
     """
-    
-    def __init__(self):
-        """Initialize the orchestrator with all components."""
-        self.trading_mode = config.trading_mode
-        
-        # Initialize components (lazy - actual init happens in __aenter__)
-        self._discovery: DiscoveryAgent | None = None
-        self._logic_architect: LogicArchitect | None = None
-        self._validator: ValidatorAgent | None = None
-        self._solver: SCIPSolver | None = None
-        self._arbitrage_detector: ArbitrageDetector | None = None
-        self._polymarket: PolymarketClient | None = None
-        
-        # Risk management
-        self._kill_switch: KillSwitch | None = None
-        self._position_sizer: PositionSizer | None = None
-        
-        # State tracking
-        self._is_running = False
-        self._pipeline_count = 0
-        self._opportunities_found = 0
-        self._trades_executed = 0
-        
-        logger.info(
-            "PolyQuantOrchestrator initialized",
-            trading_mode=self.trading_mode,
-        )
-    
-    async def __aenter__(self) -> "PolyQuantOrchestrator":
-        """Initialize all components."""
-        logger.info("Starting PolyQuant 2.0...")
-        
-        # Initialize agents
-        self._discovery = DiscoveryAgent()
-        await self._discovery.__aenter__()
-        
-        self._logic_architect = LogicArchitect()
-        await self._logic_architect.__aenter__()
-        
-        self._validator = ValidatorAgent()
-        await self._validator.__aenter__()
-        
-        # Initialize solver
-        self._solver = SCIPSolver()
-        self._arbitrage_detector = ArbitrageDetector()
-        
-        # Initialize Polymarket client
-        self._polymarket = PolymarketClient()
-        await self._polymarket.__aenter__()
-        
-        # Initialize risk management
-        self._kill_switch = KillSwitch(
-            initial_capital=10000,  # TODO: Get from config/user
-            on_trigger=self._on_kill_switch_trigger,
-        )
-        self._position_sizer = PositionSizer(capital=10000)
-        
-        self._is_running = True
-        
-        logger.info("PolyQuant 2.0 started successfully")
-        return self
-    
-    async def __aexit__(self, *args: Any) -> None:
-        """Cleanup all components."""
-        logger.info("Shutting down PolyQuant 2.0...")
-        
-        self._is_running = False
-        
-        if self._discovery:
-            await self._discovery.__aexit__(*args)
-        if self._logic_architect:
-            await self._logic_architect.__aexit__(*args)
-        if self._validator:
-            await self._validator.__aexit__(*args)
-        if self._polymarket:
-            await self._polymarket.__aexit__(*args)
-        
-        logger.info(
-            "PolyQuant 2.0 shutdown complete",
-            pipelines_run=self._pipeline_count,
-            opportunities_found=self._opportunities_found,
-            trades_executed=self._trades_executed,
-        )
-    
-    async def run_pipeline(self) -> dict[str, Any]:
-        """
-        Run the full pipeline once.
-        
-        Executes all phases in sequence:
-        1. Discovery -> Find market clusters
-        2. Logic Architect -> Analyze dependencies
-        3. Validator -> Verify constraints
-        4. Solver -> Find optimal trades
-        5. (Future) Executor -> Submit trades
-        
-        Returns:
-            Dict with pipeline results and metrics
-        """
-        start_time = datetime.utcnow()
-        self._pipeline_count += 1
-        
-        logger.info("Starting pipeline run", run_number=self._pipeline_count)
-        
-        # Check kill switch
-        if self._kill_switch and not self._kill_switch.can_trade():
-            logger.warning("Pipeline blocked by kill switch")
-            return {"status": "blocked", "reason": "kill_switch"}
-        
-        results: dict[str, Any] = {
-            "run_number": self._pipeline_count,
-            "start_time": start_time.isoformat(),
-            "status": "running",
-        }
-        
-        try:
-            # ================================================================
-            # PHASE 1: DISCOVERY
-            # ================================================================
-            logger.info("Phase 1: Discovery - Scanning markets...")
-            
-            if not self._discovery:
-                raise RuntimeError("Discovery agent not initialized")
-            
-            clusters = await self._discovery.scan_markets(
-                limit=50,
-                min_liquidity=1000,
+    from polyquant.map_maker import MapMaker
+
+    if min_liquidity is None:
+        min_liquidity = config.min_liquidity
+
+    try:
+        async with MapMaker() as map_maker:
+            result = await map_maker.build_map(
+                limit=limit,
+                min_liquidity=min_liquidity,
+                skip_processed=not force,
             )
-            
-            results["discovery"] = {
-                "clusters_found": len(clusters),
-                "total_markets": sum(len(c.markets) for c in clusters),
-            }
-            
-            if not clusters:
-                logger.info("No market clusters found")
-                results["status"] = "complete"
-                results["outcome"] = "no_clusters"
-                return results
-            
-            # ================================================================
-            # PHASE 2: REASONING
-            # ================================================================
-            logger.info("Phase 2: Reasoning - Analyzing dependencies...")
-            
-            if not self._logic_architect:
-                raise RuntimeError("Logic Architect not initialized")
-            
-            all_dependencies = []
-            all_constraints = []
-            
-            for cluster in clusters:
-                analysis = await self._logic_architect.analyze_cluster(cluster)
-                all_dependencies.extend(analysis.dependencies)
-                all_constraints.extend(analysis.constraints)
-            
-            results["reasoning"] = {
-                "dependencies_found": len(all_dependencies),
-                "constraints_generated": len(all_constraints),
-            }
-            
-            if not all_constraints:
-                logger.info("No constraints found")
-                results["status"] = "complete"
-                results["outcome"] = "no_constraints"
-                return results
-            
-            # ================================================================
-            # PHASE 3: VERIFICATION
-            # ================================================================
-            logger.info("Phase 3: Verification - Validating constraints...")
-            
-            if not self._validator:
-                raise RuntimeError("Validator agent not initialized")
-            
-            # Validate each cluster's analysis
-            validated_constraints = []
-            validation_issues = []
-            
-            for cluster in clusters:
-                analysis = await self._logic_architect.analyze_cluster(cluster)
-                validated = await self._validator.validate(analysis)
-                
-                if validated.is_valid:
-                    validated_constraints.extend(validated.validated_constraints)
-                else:
-                    validation_issues.extend(validated.issues)
-            
-            results["verification"] = {
-                "valid_constraints": len(validated_constraints),
-                "issues_found": len(validation_issues),
-            }
-            
-            if not validated_constraints:
-                logger.info("No constraints passed validation")
-                results["status"] = "complete"
-                results["outcome"] = "validation_failed"
-                return results
-            
-            # ================================================================
-            # PHASE 4: OPTIMIZATION
-            # ================================================================
-            logger.info("Phase 4: Optimization - Finding arbitrage...")
-            
-            if not self._polymarket:
-                raise RuntimeError("Polymarket client not initialized")
-            
-            # Get order books for all markets in validated clusters
-            # For now, use the first validated analysis
-            opportunities = []
-            
-            for cluster in clusters:
-                # Re-run validation for this cluster
-                analysis = await self._logic_architect.analyze_cluster(cluster)
-                validated = await self._validator.validate(analysis)
-                
-                if not validated.is_valid:
-                    continue
-                
-                # Get order books
-                order_books = {}
-                for market in cluster.markets:
-                    try:
-                        obs = await self._polymarket.get_all_order_books(market)
-                        order_books.update(obs)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to get order book",
-                            market_id=market.market_id,
-                            error=str(e),
-                        )
-                
-                if not order_books:
-                    continue
-                
-                # Detect arbitrage
-                opportunity = await self._arbitrage_detector.detect(
-                    validated,
-                    order_books,
-                    min_profit=10.0,
-                )
-                
-                if opportunity:
-                    opportunities.append(opportunity)
-            
-            results["optimization"] = {
-                "opportunities_found": len(opportunities),
-                "total_expected_profit": sum(
-                    float(o.expected_profit) for o in opportunities
-                ),
-            }
-            
-            self._opportunities_found += len(opportunities)
-            
-            # ================================================================
-            # PHASE 5: EXECUTION (Paper/Live)
-            # ================================================================
-            if opportunities:
-                logger.info(
-                    "Phase 5: Execution",
-                    mode=self.trading_mode,
-                    opportunity_count=len(opportunities),
-                )
-                
-                if self.trading_mode == "paper":
-                    # Paper trading - just log what we would do
-                    for opp in opportunities:
-                        logger.info(
-                            "[PAPER] Would execute trades",
-                            expected_profit=float(opp.expected_profit),
-                            trade_count=len(opp.trades),
-                        )
-                    results["execution"] = {
-                        "mode": "paper",
-                        "trades_simulated": sum(len(o.trades) for o in opportunities),
-                    }
-                else:
-                    # Live trading - TODO: Implement Rust executor integration
-                    logger.warning("Live trading not yet implemented")
-                    results["execution"] = {
-                        "mode": "live",
-                        "status": "not_implemented",
-                    }
-            
-            results["status"] = "complete"
-            results["outcome"] = "success"
-            
-        except Exception as e:
-            logger.error("Pipeline failed", error=str(e))
-            results["status"] = "error"
-            results["error"] = str(e)
-        
-        # Record timing
-        elapsed = (datetime.utcnow() - start_time).total_seconds()
-        results["elapsed_seconds"] = elapsed
-        
-        logger.info(
-            "Pipeline run complete",
-            run_number=self._pipeline_count,
-            status=results["status"],
-            elapsed=elapsed,
-        )
-        
-        return results
-    
-    async def run_continuous(
-        self,
-        interval_seconds: int = 60,
-        max_runs: int | None = None,
-    ) -> None:
-        """
-        Run the pipeline continuously.
-        
-        Args:
-            interval_seconds: Seconds between runs
-            max_runs: Maximum number of runs (None = infinite)
-        """
-        run_count = 0
-        
-        logger.info(
-            "Starting continuous operation",
-            interval=interval_seconds,
-            max_runs=max_runs,
-        )
-        
-        while self._is_running and (max_runs is None or run_count < max_runs):
-            try:
-                await self.run_pipeline()
-            except Exception as e:
-                logger.error("Pipeline run failed", error=str(e))
-            
-            run_count += 1
-            
-            if self._is_running and (max_runs is None or run_count < max_runs):
-                logger.debug(
-                    "Waiting before next run",
-                    seconds=interval_seconds,
-                )
-                await asyncio.sleep(interval_seconds)
-        
-        logger.info("Continuous operation ended", total_runs=run_count)
-    
-    def stop(self) -> None:
-        """Signal the orchestrator to stop."""
-        logger.info("Stop requested")
-        self._is_running = False
-    
-    def _on_kill_switch_trigger(self, event: Any) -> None:
-        """Handle kill switch trigger."""
-        logger.critical(
-            "KILL SWITCH TRIGGERED - STOPPING ALL OPERATIONS",
-            event=event,
-        )
-        self.stop()
+
+            print("\n" + "=" * 60)
+            print("Map Building Result:")
+            print("=" * 60)
+            for key, value in result.items():
+                print(f"  {key}: {value}")
+
+            return result
+    except Exception as e:
+        logger.error("Map Maker failed", error=str(e), exc_info=True)
+        return {"status": "failed", "error": str(e)}
+
+
+async def run_navigator() -> None:
+    """
+    Run the Navigator for real-time trading.
+
+    This loads pre-computed constraints and runs continuously,
+    monitoring markets and executing trades when opportunities arise.
+    """
+    from polyquant.navigator import Navigator
+
+    logger.info("Starting Navigator...")
+
+    navigator: Navigator | None = None
+
+    def signal_handler(sig: int, frame: Any) -> None:
+        print("\nShutdown signal received...")
+        if navigator:
+            navigator.stop()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        navigator = Navigator()
+        async with navigator:
+            await navigator.run()
+    except KeyboardInterrupt:
+        logger.info("Navigator stopped by user")
+    except Exception as e:
+        logger.error("Navigator failed", error=str(e), exc_info=True)
+        raise
 
 
 async def main() -> None:
-    """Main entry point for the application."""
-    print("""
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                     PolyQuant 2.0                             ║
-    ║       Autonomous Arbitrage Extraction System                  ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    """Main entry point for PolyQuant."""
+    parser = argparse.ArgumentParser(
+        description="PolyQuant 2.0 - Autonomous Arbitrage Extraction System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  map       Run the Map Maker (offline constraint analysis)
+  trade     Run the Navigator (real-time trading)
+
+Typical Workflow:
+  1. Run 'map' mode to build constraint manifests (first time or periodically)
+  2. Run 'trade' mode to start real-time trading
+
+Examples:
+  python -m polyquant.main map      # Build constraint map
+  python -m polyquant.main trade    # Start trading
+        """,
+    )
+
+    parser.add_argument(
+        "mode",
+        choices=["map", "trade"],
+        nargs="?",
+        default="map",
+        help="Execution mode (default: map)",
+    )
+
+    # Map Maker arguments
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum markets to scan in 'map' mode (default: 500, 0 for all)",
+    )
+    parser.add_argument(
+        "--min-liquidity",
+        type=float,
+        default=1000.0,
+        help="Minimum liquidity threshold in 'map' mode (default: 1000)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-scan of already processed markets in 'map' mode",
+    )
+
+    args = parser.parse_args()
+
+    print(f"""
+    ===============================================================
+                          PolyQuant 2.0
+            Autonomous Arbitrage Extraction System
+                        Mode: {args.mode.upper()}
+    ===============================================================
     """)
-    
-    # Set up signal handlers for graceful shutdown
-    orchestrator: PolyQuantOrchestrator | None = None
-    
-    def signal_handler(sig: int, frame: Any) -> None:
-        print("\nShutdown signal received...")
-        if orchestrator:
-            orchestrator.stop()
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        orchestrator = PolyQuantOrchestrator()
-        async with orchestrator:
-            # Run a single pipeline for now
-            # TODO: Add CLI arguments for continuous mode
-            result = await orchestrator.run_pipeline()
-            
-            print("\n" + "=" * 60)
-            print("Pipeline Result:")
-            print("=" * 60)
-            
-            for key, value in result.items():
-                print(f"  {key}: {value}")
-            
-    except Exception as e:
-        logger.error("Fatal error", error=str(e))
-        sys.exit(1)
+
+    if args.mode == "map":
+        await run_map_maker(
+            limit=args.limit,
+            min_liquidity=args.min_liquidity,
+            force=args.force,
+        )
+    elif args.mode == "trade":
+        await run_navigator()
+    else:
+        # This shouldn't happen due to argparse choices, but just in case
+        logger.error(f"Unknown mode: {args.mode}")
+        parser.print_help()
 
 
 if __name__ == "__main__":

@@ -58,31 +58,45 @@ class PolyQuantConfig(BaseSettings):
     
     gemini_api_key: SecretStr = Field(
         default=SecretStr(""),
-        description="Google Gemini API key for Discovery and Validator agents"
+        description="Google Gemini API Key",
     )
-    
-    deepseek_api_key: SecretStr = Field(
-        default=SecretStr(""),
-        description="DeepSeek API key for the Logic Architect (R1 model)"
-    )
-    
+
     alchemy_api_key: SecretStr = Field(
         default=SecretStr(""),
         description="Alchemy API key for Polygon blockchain data"
+    )
+
+    polygon_private_key: SecretStr = Field(
+        default=SecretStr(""),
+        description="Polygon wallet private key for EIP-712 signing (0x...)"
     )
     
     # =========================================================================
     # Polymarket Connection Settings
     # =========================================================================
     
-    polymarket_clob_url: str = Field(
-        default="https://clob.polymarket.com",
-        description="Polymarket CLOB REST API endpoint"
+    # API 1: Gamma API - Market discovery and metadata
+    polymarket_gamma_url: str = Field(
+        default="https://gamma-api.polymarket.com",
+        description="Polymarket Gamma API for market discovery and metadata"
     )
     
+    # API 2: CLOB API - Prices, order books, and trading
+    polymarket_clob_url: str = Field(
+        default="https://clob.polymarket.com",
+        description="Polymarket CLOB API for prices, orderbooks, and trading"
+    )
+    
+    # API 3: Data API - Positions, activity, and history
+    polymarket_data_url: str = Field(
+        default="https://data-api.polymarket.com",
+        description="Polymarket Data API for positions, activity, and history"
+    )
+    
+    # API 4: WebSocket - Real-time updates
     polymarket_ws_url: str = Field(
-        default="wss://ws-subscriptions-clob.polymarket.com/ws",
-        description="Polymarket WebSocket endpoint for real-time data"
+        default="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        description="Polymarket WebSocket for real-time price and order updates"
     )
     
     # =========================================================================
@@ -128,7 +142,63 @@ class PolyQuantConfig(BaseSettings):
     vwap_slippage_limit: float = Field(
         default=0.05,
         ge=0.0,
-        description="Maximum VWAP slippage in dollars before aborting trade"
+        description="Maximum VWAP slippage as fraction (0.05 = 5%) before aborting trade"
+    )
+
+    # =========================================================================
+    # Fee & Cost Parameters (P0 Critical - deducted from expected profit)
+    # =========================================================================
+
+    polymarket_taker_fee_pct: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=0.10,
+        description="Polymarket taker fee as fraction (0.02 = 2%) applied per leg"
+    )
+
+    polygon_gas_per_tx: float = Field(
+        default=0.30,
+        ge=0.0,
+        description="Estimated Polygon gas cost per transaction in USD"
+    )
+
+    # =========================================================================
+    # HTTP Timeout & Retry Settings
+    # =========================================================================
+
+    clob_timeout_seconds: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=60.0,
+        description="HTTP timeout for CLOB API requests (order books, trading)"
+    )
+
+    gamma_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description="HTTP timeout for Gamma API requests (market discovery)"
+    )
+
+    http_max_retries: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="Max retries for GET requests with exponential backoff"
+    )
+
+    order_confirm_timeout_ms: int = Field(
+        default=5000,
+        ge=1000,
+        le=30000,
+        description="Max time in ms to poll for order confirmation before cancelling"
+    )
+
+    order_confirm_poll_interval_ms: int = Field(
+        default=100,
+        ge=50,
+        le=1000,
+        description="Interval in ms between order status polls"
     )
     
     solver_timeout_seconds: int = Field(
@@ -136,7 +206,122 @@ class PolyQuantConfig(BaseSettings):
         ge=1,
         description="Maximum time for SCIP solver before timing out"
     )
+
+    initial_capital: float = Field(
+        default=10000.0,
+        ge=0.0,
+        description="Initial capital in USD for position sizing and drawdown tracking"
+    )
+
+    fw_min_profit: float = Field(
+        default=0.50,
+        ge=0.0,
+        description="Minimum expected profit in USD for the Frank-Wolfe solver to flag an opportunity"
+    )
     
+    # =========================================================================
+    # Frank-Wolfe Algorithm Parameters (from research papers)
+    # =========================================================================
+    
+    initial_epsilon: float = Field(
+        default=0.1,
+        ge=0.001,
+        le=0.5,
+        description="Initial contraction parameter for Barrier Frank-Wolfe (Part 2)"
+    )
+    
+    min_profit_threshold: float = Field(
+        default=0.05,
+        ge=0.0,
+        description="Minimum profit in USD to consider trading (filter noise)"
+    )
+    
+    fw_max_iterations: int = Field(
+        default=150,
+        ge=10,
+        description="Maximum Frank-Wolfe iterations before stopping"
+    )
+
+    # =========================================================================
+    # Position Sizing & Risk Limits
+    # =========================================================================
+
+    max_single_trade_pct: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Max fraction of capital per single trade (0.05 = 5%)"
+    )
+
+    max_total_exposure_pct: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Max fraction of capital for total open exposure (0.25 = 25%)"
+    )
+
+    kelly_fraction: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of full Kelly to use (0.5 = Half Kelly, safer)"
+    )
+
+    # =========================================================================
+    # Market Discovery & Filtering
+    # =========================================================================
+
+    min_liquidity: float = Field(
+        default=1000.0,
+        ge=0.0,
+        description="Minimum event liquidity in USD for Map Maker scanning"
+    )
+
+    zombie_low_threshold: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=0.5,
+        description="Reject markets with YES price below this (0.02 = 2%)"
+    )
+
+    zombie_high_threshold: float = Field(
+        default=0.98,
+        ge=0.5,
+        le=1.0,
+        description="Reject markets with YES price above this (0.98 = 98%)"
+    )
+
+    # =========================================================================
+    # Solver & Algorithm Fine-Tuning
+    # =========================================================================
+
+    scip_gap: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=0.1,
+        description="Target optimality gap for SCIP solver (0.01 = 1%)"
+    )
+
+    min_trade_size: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Minimum trade size in USD to ignore dust"
+    )
+
+    llm_temperature: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for all LLM calls"
+    )
+
+    validator_confidence_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence score required for Validator to pass a constraint"
+    )
+
     # =========================================================================
     # Logging Configuration
     # =========================================================================

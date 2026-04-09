@@ -57,6 +57,7 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from polyquant.utils import config, get_logger
+from polyquant.utils.cache import cache
 
 logger = get_logger(__name__)
 
@@ -68,6 +69,7 @@ class TriggerReason(str, Enum):
     API_ERRORS = "api_error_rate_exceeded"
     MANUAL = "manual_trigger"
     LATENCY = "latency_exceeded"
+    UNWIND_FAILURE = "unwind_failure"
     UNKNOWN = "unknown"
 
 
@@ -178,6 +180,49 @@ class KillSwitch:
             max_drawdown=self.max_drawdown,
             initial_capital=initial_capital,
         )
+        
+    async def load_state(self) -> None:
+        """Load state from Redis."""
+        state = await cache.load_kill_switch_state()
+        if state:
+            self._is_triggered = state.get("is_triggered", False)
+            self.high_water_mark = state.get("high_water_mark", self.initial_capital)
+            self.current_capital = state.get("current_capital", self.initial_capital)
+            self._trigger_count = state.get("trigger_count", 0)
+            
+            # Restore trigger event if present
+            if state.get("trigger_event"):
+                evt = state["trigger_event"]
+                self._trigger_event = TriggerEvent(
+                    timestamp=datetime.fromisoformat(evt["timestamp"]),
+                    reason=TriggerReason(evt["reason"]),
+                    details=evt["details"],
+                    metric_value=evt["metric_value"],
+                    threshold=evt["threshold"],
+                )
+            
+            logger.info(
+                "KillSwitch state loaded from Redis",
+                high_water_mark=self.high_water_mark,
+                is_triggered=self._is_triggered
+            )
+
+    async def save_state(self) -> None:
+        """Save state to Redis."""
+        state = {
+            "is_triggered": self._is_triggered,
+            "high_water_mark": self.high_water_mark,
+            "current_capital": self.current_capital,
+            "trigger_count": self._trigger_count,
+            "trigger_event": {
+                "timestamp": self._trigger_event.timestamp.isoformat(),
+                "reason": self._trigger_event.reason.value,
+                "details": self._trigger_event.details,
+                "metric_value": self._trigger_event.metric_value,
+                "threshold": self._trigger_event.threshold,
+            } if self._trigger_event else None
+        }
+        await cache.save_kill_switch_state(state)
     
     @property
     def is_triggered(self) -> bool:
@@ -191,7 +236,7 @@ class KillSwitch:
             return 0.0
         return (self.high_water_mark - self.current_capital) / self.high_water_mark
     
-    def can_trade(self) -> bool:
+    async def can_trade(self) -> bool:
         """
         Check if trading is allowed.
         
@@ -202,13 +247,13 @@ class KillSwitch:
             return False
         
         # Run checks that might trigger
-        self._check_drawdown()
-        self._check_solver_timeouts()
-        self._check_latency()
+        await self._check_drawdown()
+        await self._check_solver_timeouts()
+        await self._check_latency()
         
         return not self._is_triggered
     
-    def record_pnl(self, amount: float) -> None:
+    async def record_pnl(self, amount: float) -> None:
         """
         Record a P&L change.
         
@@ -233,9 +278,12 @@ class KillSwitch:
         )
         
         # Check if this triggers
-        self._check_drawdown()
+        await self._check_drawdown()
+        
+        # Persist state
+        await self.save_state()
     
-    def record_solver_time(self, seconds: float) -> None:
+    async def record_solver_time(self, seconds: float) -> None:
         """
         Record a solver execution time.
         
@@ -251,7 +299,7 @@ class KillSwitch:
             (t, s) for t, s in self._solver_times if t > cutoff
         ]
         
-        self._check_solver_timeouts()
+        await self._check_solver_timeouts()
     
     def record_api_error(self) -> None:
         """Record an API error occurrence."""
@@ -262,7 +310,7 @@ class KillSwitch:
         cutoff = now - timedelta(minutes=5)
         self._api_errors = [t for t in self._api_errors if t > cutoff]
     
-    def record_latency(self, ms: float) -> None:
+    async def record_latency(self, ms: float) -> None:
         """
         Record a trade latency measurement.
         
@@ -278,9 +326,9 @@ class KillSwitch:
             (t, l) for t, l in self._trade_latencies if t > cutoff
         ]
         
-        self._check_latency()
+        await self._check_latency()
     
-    def trigger(self, reason: str, trigger_type: TriggerReason = TriggerReason.MANUAL) -> None:
+    async def trigger(self, reason: str, trigger_type: TriggerReason = TriggerReason.MANUAL) -> None:
         """
         Manually trigger the kill switch.
         
@@ -292,9 +340,9 @@ class KillSwitch:
             logger.warning("Kill switch already triggered")
             return
         
-        self._trigger(trigger_type, reason, 0, 0)
+        await self._trigger(trigger_type, reason, 0, 0)
     
-    def reset(self, confirm: bool = False) -> bool:
+    async def reset(self, confirm: bool = False) -> bool:
         """
         Reset the kill switch to allow trading.
         
@@ -322,6 +370,7 @@ class KillSwitch:
         self._is_triggered = False
         self._trigger_event = None
         
+        await self.save_state()
         return True
     
     def get_state(self) -> KillSwitchState:
@@ -335,7 +384,7 @@ class KillSwitch:
             trigger_count=self._trigger_count,
         )
     
-    def _trigger(
+    async def _trigger(
         self,
         reason: TriggerReason,
         details: str,
@@ -368,21 +417,24 @@ class KillSwitch:
                 self._on_trigger(self._trigger_event)
             except Exception as e:
                 logger.error("Kill switch callback failed", error=str(e))
+        
+        # Save state immediately
+        await self.save_state()
     
-    def _check_drawdown(self) -> None:
+    async def _check_drawdown(self) -> None:
         """Check if drawdown exceeds threshold."""
         if self._is_triggered:
             return
         
         if self.current_drawdown > self.max_drawdown:
-            self._trigger(
+            await self._trigger(
                 TriggerReason.DRAWDOWN,
                 f"Drawdown {self.current_drawdown:.1%} exceeds {self.max_drawdown:.1%}",
                 self.current_drawdown,
                 self.max_drawdown,
             )
     
-    def _check_solver_timeouts(self) -> None:
+    async def _check_solver_timeouts(self) -> None:
         """Check if solver timeout rate is too high."""
         if self._is_triggered or len(self._solver_times) < 3:
             return
@@ -394,14 +446,14 @@ class KillSwitch:
         rate = timeouts / len(self._solver_times)
         
         if rate > self.max_solver_timeout_rate:
-            self._trigger(
+            await self._trigger(
                 TriggerReason.SOLVER_TIMEOUT,
                 f"Solver timeout rate {rate:.1%} exceeds {self.max_solver_timeout_rate:.1%}",
                 rate,
                 self.max_solver_timeout_rate,
             )
     
-    def _check_latency(self) -> None:
+    async def _check_latency(self) -> None:
         """Check if latency is consistently too high."""
         if self._is_triggered or len(self._trade_latencies) < 5:
             return
@@ -411,7 +463,7 @@ class KillSwitch:
         
         # Only trigger if consistently 3x over threshold
         if avg_latency > self.latency_threshold_ms * 3:
-            self._trigger(
+            await self._trigger(
                 TriggerReason.LATENCY,
                 f"Average latency {avg_latency:.0f}ms exceeds 3x threshold",
                 avg_latency,

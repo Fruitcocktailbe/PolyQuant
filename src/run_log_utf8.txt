@@ -1,0 +1,77 @@
+D:\GithubLocal\PolyQuant\src\polyquant\agents\discovery.py:40: FutureWarning: 
+
+All support for the `google.generativeai` package has ended. It will no longer be receiving 
+updates or bug fixes. Please switch to the `google.genai` package as soon as possible.
+See README for more details:
+
+https://github.com/google-gemini/deprecated-generative-ai-python/blob/main/README.md
+
+  import google.generativeai as genai
+
+    ===============================================================
+                          PolyQuant 2.0
+            Autonomous Arbitrage Extraction System
+    ===============================================================
+    
+2026-02-07T00:32:03.571862Z [info     ] PolyQuantOrchestrator initialized [__main__] trading_mode=paper
+2026-02-07T00:32:03.572540Z [info     ] Starting PolyQuant 2.0...      [__main__]
+2026-02-07T00:32:03.573134Z [info     ] DiscoveryAgent initialized     [polyquant.agents.discovery]
+2026-02-07T00:32:03.573288Z [info     ] PolymarketClient initialized   [polyquant.data.polymarket_client] clob_url=https://clob.polymarket.com data_url=https://data-api.polymarket.com gamma_url=https://gamma-api.polymarket.com
+2026-02-07T00:32:04.232113Z [warning  ] Gemini API key not set - running in No-LLM mode [polyquant.agents.discovery]
+2026-02-07T00:32:04.232338Z [info     ] LogicArchitect initialized     [polyquant.agents.logic_architect]
+2026-02-07T00:32:04.443562Z [info     ] ValidatorAgent initialized     [polyquant.agents.validator]
+2026-02-07T00:32:04.443826Z [info     ] SCIPSolver initialized         [polyquant.solver.scip_solver] extraction_alpha=0.9 scip_available=True timeout=30
+2026-02-07T00:32:04.444032Z [info     ] SCIPSolver initialized         [polyquant.solver.scip_solver] extraction_alpha=0.9 scip_available=True timeout=30
+2026-02-07T00:32:04.444227Z [info     ] PolymarketClient initialized   [polyquant.data.polymarket_client] clob_url=https://clob.polymarket.com data_url=https://data-api.polymarket.com gamma_url=https://gamma-api.polymarket.com
+2026-02-07T00:32:05.073936Z [info     ] KillSwitch initialized         [polyquant.risk.kill_switch] initial_capital=10000 max_drawdown=0.15
+2026-02-07T00:32:05.074195Z [info     ] PositionSizer initialized      [polyquant.risk.position_sizing] capital=10000 limits={'max_single_trade_pct': 0.05, 'max_total_exposure_pct': 0.25, 'max_orderbook_depth_pct': 0.5, 'kelly_fraction': 0.5}
+2026-02-07T00:32:05.074409Z [info     ] PolyQuant 2.0 started successfully [__main__]
+D:\GithubLocal\PolyQuant\src\polyquant\main.py:189: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  start_time = datetime.utcnow()
+2026-02-07T00:32:05.074886Z [info     ] Starting pipeline run          [__main__] run_number=1
+2026-02-07T00:32:05.075080Z [info     ] Phase 1: Discovery - Scanning markets... [__main__]
+2026-02-07T00:32:05.075205Z [info     ] Scanning markets               [polyquant.agents.discovery] limit=50 min_liquidity=1000
+2026-02-07T00:32:05.449105Z [info     ] Fetched markets                [polyquant.data.polymarket_client] after_filter=2 total=50
+2026-02-07T00:32:05.449415Z [info     ] Found 2 markets to analyze     [polyquant.agents.discovery]
+2026-02-07T00:32:05.449556Z [info     ] Gemini not initialized, skipping clustering [polyquant.agents.discovery]
+2026-02-07T00:32:05.449713Z [info     ] Market scan complete           [polyquant.agents.discovery] clusters_found=1 markets_processed=2
+2026-02-07T00:32:05.449890Z [info     ] Phase 2: Reasoning - Analyzing dependencies... [__main__]
+2026-02-07T00:32:05.450020Z [info     ] Analyzing cluster              [polyquant.agents.logic_architect] cluster_id=1770420725.44969 market_count=2 topic='Uncategorized (No AI)'
+2026-02-07T00:32:05.450230Z [info     ] DeepSeek API key not set - skipping logic analysis [polyquant.agents.logic_architect]
+2026-02-07T00:32:05.450376Z [info     ] No constraints found - proceeding to unconstrained optimization [__main__]
+2026-02-07T00:32:05.461652Z [info     ] Phase 3: Verification - Validating constraints... [__main__]
+2026-02-07T00:32:05.461843Z [info     ] Analyzing cluster              [polyquant.agents.logic_architect] cluster_id=1770420725.44969 market_count=2 topic='Uncategorized (No AI)'
+2026-02-07T00:32:05.462061Z [info     ] DeepSeek API key not set - skipping logic analysis [polyquant.agents.logic_architect]
+2026-02-07T00:32:05.462223Z [info     ] Validating analysis            [polyquant.agents.validator] cluster_id=1770420725.44969 constraint_count=0 dependency_count=0
+2026-02-07T00:32:08.595405Z [error    ] Validation failed              [polyquant.agents.validator] error='\n  No API_KEY or ADC found. Please either:\n    - Set the `GOOGLE_API_KEY` environment variable.\n    - Manually pass the key with `genai.configure(api_key=my_api_key)`.\n    - Or set up Application Default Credentials, see https://ai.google.dev/gemini-api/docs/oauth for more information.'
+2026-02-07T00:32:08.595786Z [info     ] Validation complete            [polyquant.agents.validator] error_count=1 is_valid=False warning_count=0
+2026-02-07T00:32:08.596082Z [info     ] No constraints passed validation - proceeding to unconstrained optimization [__main__]
+2026-02-07T00:32:08.596271Z [info     ] Phase 4: Optimization - Finding arbitrage... [__main__]
+D:\GithubLocal\PolyQuant\src\polyquant\main.py:414: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  elapsed = (datetime.utcnow() - start_time).total_seconds()
+2026-02-07T00:32:08.596534Z [info     ] Pipeline run complete          [__main__] elapsed=3.52164 run_number=1 status=complete
+
+============================================================
+Pipeline Result:
+============================================================
+  run_number: 1
+  start_time: 2026-02-07T00:32:05.074878
+  status: complete
+  discovery: {'clusters_found': 1, 'total_markets': 2}
+  reasoning: {'dependencies_found': 0, 'constraints_generated': 0}
+  verification: {'valid_constraints': 0, 'issues_found': 1}
+  optimization: {'opportunities_found': 0, 'total_expected_profit': 0}
+  outcome: success
+  elapsed_seconds: 3.52164
+2026-02-07T00:32:08.597090Z [info     ] Shutting down PolyQuant 2.0... [__main__]
+2026-02-07T00:32:08.597971Z [info     ] PolyQuant 2.0 shutdown complete [__main__] opportunities_found=0 pipelines_run=1 trades_executed=0
+ERROR:    Traceback (most recent call last):
+  File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\starlette\routing.py", line 701, in lifespan
+    await receive()
+  File "C:\Users\poela\AppData\Roaming\Python\Python314\site-packages\uvicorn\lifespan\on.py", line 137, in receive
+    return await self.receive_queue.get()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\asyncio\queues.py", line 186, in get
+    await getter
+asyncio.exceptions.CancelledError
+

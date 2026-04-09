@@ -140,7 +140,7 @@ def configure_logging() -> None:
     # Configure the root logger
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
-    root_logger.setLevel(config.log_level)
+    root_logger.setLevel(logging.DEBUG)
     
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)

@@ -1,0 +1,219 @@
+# PolyQuant 2.0 — Comprehensive Application Overview
+
+## What Is PolyQuant?
+
+PolyQuant is an **autonomous arbitrage extraction system** for [Polymarket](https://polymarket.com/) prediction markets. It uses AI agents to discover logically related markets, formalize their dependencies as mathematical constraints, and then run optimization solvers in real-time to detect and execute arbitrage trades.
+
+**Example:** If "Trump wins Pennsylvania" is priced at $0.60 and "GOP wins Pennsylvania" is priced at $0.55, there's a logical inconsistency (the first *implies* the second), which represents an arbitrage opportunity.
+
+---
+
+## Architecture: Two-Mode "Slow Brain / Fast Brain"
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      PolyQuant 2.0                       │
+│                                                          │
+│  ┌──────────────────┐           ┌──────────────────┐     │
+│  │   MAP MAKER      │           │    NAVIGATOR     │     │
+│  │  (Slow Brain)    │──────────►│  (Fast Brain)    │     │
+│  │  Offline / LLMs  │ Manifests │  Real-Time / <50ms│    │
+│  └──────────────────┘           └──────────────────┘     │
+└──────────────────────────────────────────────────────────┘
+```
+
+| | Map Maker | Navigator |
+|---|---|---|
+| **Purpose** | Discover & analyze market constraints | Execute trades in real-time |
+| **Speed** | Minutes (LLM calls OK) | <50ms end-to-end |
+| **When** | Periodically (e.g. hourly) | Runs 24/7 continuously |
+| **LLM Usage** | Heavy (Gemini Flash Thinking) | None (pre-computed) |
+| **Command** | `python -m polyquant.main map` | `python -m polyquant.main trade` |
+
+---
+
+## Module Inventory & Status
+
+### ✅ Well-Implemented (Code Complete)
+
+| Module | File | Status |
+|--------|------|--------|
+| **Entry Point** | [main.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/main.py) | ✅ CLI with `map`/`trade` modes |
+| **Config** | [config.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/utils/config.py) | ✅ Pydantic settings from `.env` |
+| **Data Models** | [market_models.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/market_models.py) | ✅ Market, OrderBook, ProposedTrade, etc. |
+| **Discovery Agent** | [discovery.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/discovery.py) | ✅ Gemini-powered market clustering |
+| **Logic Architect** | [logic_architect.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/logic_architect.py) | ✅ Constraint formalization via Gemini |
+| **Validator Agent** | [validator.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/validator.py) | ✅ LLM-based constraint verification |
+| **Map Maker** | [map_maker.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/map_maker.py) | ✅ Full pipeline orchestrator |
+| **Constraint Store** | [constraint_store.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/constraint_store.py) | ✅ JSON file persistence |
+| **SCIP Solver** | [scip_solver.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/solver/scip_solver.py) | ✅ Integer programming oracle (needs SCIP binaries) |
+| **Frank-Wolfe Solver** | [fw_solver.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/solver/fw_solver.py) | ✅ Vectorized Barrier FW with ArbitrageDetector |
+| **Navigator** | [navigator.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/navigator.py) | ✅ Real-time loop with ExecutionGuard |
+| **Kill Switch** | [kill_switch.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/risk/kill_switch.py) | ✅ Drawdown / latency / solver timeout monitors |
+| **Position Sizing** | [position_sizing.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/risk/position_sizing.py) | ✅ Modified Kelly Criterion |
+| **Polymarket Client** | [polymarket_client.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/polymarket_client.py) | ✅ REST + WebSocket clients |
+| **Redis Cache** | [cache.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/utils/cache.py) | ✅ Market dedup, LLM caching, heartbeat |
+| **API Server** | [server.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/api/server.py) | ✅ FastAPI sidecar with WebSocket |
+| **Microstructure** | [microstructure.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/microstructure.py) | ✅ Order book imbalance & spread analysis |
+| **Auth/Signing** | [auth.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/auth.py) | ✅ EIP-712 Python signer via `eth_account` |
+| **Rust Signer** | [lib.rs](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution_core/src/lib.rs) | ✅ PyO3 EIP-712 signing crate |
+| **Web Dashboard** | [web/](file:///d:/GithubLocal/PolyQuant/web/) | ✅ React + Vite + Tailwind with Dashboard, KillSwitch, LogTerminal, MarketList |
+
+### ⚠️ Incomplete / Stub Code (Blocking for Production)
+
+| Module | File | Issue |
+|--------|------|-------|
+| **Trade Executor** | [executor.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution/executor.py#L175) | `TODO: Implement real API call` — `_submit_order()` returns `None` in live mode |
+| **Trade Executor** | [executor.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution/executor.py#L214) | `TODO: Submit real unwind order` — unwind logic is a no-op in live mode |
+| **Navigator** | [navigator.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/navigator.py#L579) | `TODO: Implement trade execution` — `_execute_opportunity()` is incomplete |
+| **Correlation Agent** | [correlation.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/correlation.py#L45) | `TODO: placeholder for the actual statistical engine` — `analyze_pairs()` returns empty |
+| **Watchdog** | [watchdog.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/utils/watchdog.py#L77) | `TODO: Add actual termination logic` |
+| **Rust Integration** | [auth.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/auth.py#L12-18) | Rust `execution_core` import is **fully commented out**, `RUST_AVAILABLE = False` hardcoded |
+
+---
+
+## What Needs to Happen to Make It Functional
+
+### 🔴 Critical Path (Required to Run at All)
+
+#### 1. Install SCIP Optimization Suite
+The `pyscipopt` Python package is a wrapper — you need the **C++ SCIP binaries** installed on your system.
+- Download [SCIPOptSuite 9.0+](https://scipopt.org/) for Windows
+- Set the `SCIP_HOME` environment variable
+- Without this, the solver falls back to a stub that always returns failure
+
+#### 2. Install & Run Redis
+The cache layer (`cache.py`) requires a running Redis instance. It's used for:
+- Market deduplication (avoiding re-analyzing known markets)
+- LLM result caching (saving API costs)
+- Kill switch state persistence (safety-critical)
+- Heartbeat monitoring
+
+Redis binaries are bundled in the repo at [`redis/`](file:///d:/GithubLocal/PolyQuant/redis/), or use `redis.zip`.
+
+#### 3. Set Up API Keys (`.env`)
+Copy `.env.example` → `.env` and fill in:
+- `GEMINI_API_KEY` — Required for all 3 agents (Discovery, Logic Architect, Validator)
+- `POLYGON_PRIVATE_KEY` — Required for order signing and trade execution
+- `ALCHEMY_API_KEY` — For blockchain data (optional initially)
+
+#### 4. Install Python Dependencies
+```bash
+pip install -e ".[dev]"
+```
+Key dependencies: `pydantic`, `google-generativeai`, `httpx`, `websockets`, `pyscipopt`, `redis`, `fastapi`, `py-clob-client`, `eth-account`
+
+---
+
+### 🟡 Required for Live Trading
+
+#### 5. Implement Real Trade Execution
+This is the **biggest gap** in the codebase. Three locations need work:
+
+**a)** [executor.py `_submit_order()`](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution/executor.py#L158-188) — Currently returns `None` in live mode with a `TODO` comment. Needs to call `PolymarketClient.place_order()`.
+
+**b)** [executor.py `_unwind()`](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution/executor.py#L190-217) — Unwind/reversal logic is a no-op in live mode. Needs real order submission.
+
+**c)** [navigator.py `_execute_opportunity()`](file:///d:/GithubLocal/PolyQuant/src/polyquant/navigator.py#L579) — The Navigator detects opportunities but doesn't yet execute them. Needs to wire up the `TradeExecutor`.
+
+> [!CAUTION]
+> The `place_order()` method in `polymarket_client.py` does exist and uses `py-clob-client` SDK, but it calls blocking SDK methods from async code. This needs to be wrapped in `asyncio.to_thread()` or the SDK client needs to be created once and reused.
+
+#### 6. Enable the Rust Signer (Performance)
+The Rust `execution_core` crate ([lib.rs](file:///d:/GithubLocal/PolyQuant/src/polyquant/execution_core/src/lib.rs)) is **fully implemented** but **not connected**:
+- The import in [auth.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/auth.py#L12-18) is commented out
+- `RUST_AVAILABLE` is hardcoded to `False`
+- The crate needs to be built first: `cd src/polyquant/execution_core && maturin develop`
+- Then uncomment the import and remove the hardcoded `False`
+
+This provides **~10-50x faster** EIP-712 signing compared to the Python `eth_account` fallback.
+
+#### 7. Fund a Polygon Wallet
+- Need USDC (or USDC.e) on Polygon for trading
+- The private key goes in `POLYGON_PRIVATE_KEY`
+- Start with **paper mode** (`TRADING_MODE=paper`) before committing real funds
+
+---
+
+### 🟢 Optional / Enhancements
+
+#### 8. Complete the Correlation Agent
+[correlation.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/agents/correlation.py) has the structure but `analyze_pairs()` returns an empty list. This would enable leader-laggard detection for additional alpha.
+
+#### 9. Complete the Watchdog
+[watchdog.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/utils/watchdog.py) can detect hung processes via Redis heartbeats but has a TODO for actual process termination logic.
+
+#### 10. WebSocket Reconnection Logic
+The `PolymarketWSClient` in [polymarket_client.py](file:///d:/GithubLocal/PolyQuant/src/polyquant/data/polymarket_client.py#L548-549) has a comment `# Reconnection logic would go here` — production needs auto-reconnect with exponential backoff.
+
+#### 11. Navigator Market Caching
+[navigator.py line 487](file:///d:/GithubLocal/PolyQuant/src/polyquant/navigator.py#L487): `TODO: Cache market objects to avoid re-fetching metadata` — repeated API calls for the same market metadata.
+
+#### 12. Web Dashboard Polish
+The React dashboard works but is minimal:
+- `Dashboard.tsx` — Main layout with status metrics
+- `KillSwitch.tsx` — Emergency stop button
+- `LogTerminal.tsx` — Live log viewer
+- `MarketList.tsx` — Active markets display
+
+All connect to the FastAPI sidecar via WebSocket. Could benefit from position tracking, P&L charts, and trade history.
+
+---
+
+## Data Flow Summary
+
+```
+                          MAP MAKER (Offline)
+                          ==================
+Polymarket Gamma API → DiscoveryAgent (Gemini) → MarketClusters
+                                                       ↓
+                                            LogicArchitect (Gemini)
+                                                       ↓
+                                            ValidatorAgent (Gemini)
+                                                       ↓
+                                            ConstraintStore → .polyquant/constraints/*.json
+
+                          NAVIGATOR (Real-Time)
+                          =====================
+ConstraintStore → Load manifests → ExecutionGuard (in-memory, O(1))
+                                          ↓
+Polymarket WebSocket → PriceCache → ArbitrageDetector (Frank-Wolfe + SCIP)
+                                          ↓
+                                   Opportunity found?
+                                          ↓
+                                   PositionSizer (Kelly) → KillSwitch check
+                                          ↓
+                                   TradeExecutor → CLOB API  [⚠️ NOT YET WIRED]
+```
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|-------|-----------|
+| **Language** | Python 3.11+ (core), Rust (signing accelerator) |
+| **AI/LLM** | Google Gemini 2.0 Flash / Flash Thinking |
+| **Optimization** | SCIP (Integer Programming), Frank-Wolfe (Barrier variant) |
+| **Blockchain** | Polygon PoS, EIP-712 signing, `py-clob-client` SDK |
+| **Caching** | Redis (async via `redis.asyncio`) |
+| **API Server** | FastAPI + uvicorn (sidecar) |
+| **Frontend** | React + Vite + TypeScript + Tailwind CSS |
+| **Data** | Polymarket Gamma API (REST), CLOB API (REST+WS) |
+
+---
+
+## Quick Start Checklist
+
+| # | Step | Status |
+|---|------|--------|
+| 1 | Install SCIPOptSuite binaries | ❌ Required |
+| 2 | Start Redis server | ❌ Required |
+| 3 | Create `.env` from `.env.example` with API keys | ❌ Required |
+| 4 | `pip install -e ".[dev]"` | ❌ Required |
+| 5 | Run Map Maker: `python -m polyquant.main map` | ❌ Needs 1-4 |
+| 6 | Run Navigator (paper): `python -m polyquant.main trade` | ❌ Needs 1-5 |
+| 7 | Implement real execution in `executor.py` | ❌ For live trading |
+| 8 | Build Rust crate: `maturin develop` | ❌ For performance |
+| 9 | Fund Polygon wallet | ❌ For live trading |
+| 10 | Switch to `TRADING_MODE=live` | ❌ After all testing |
