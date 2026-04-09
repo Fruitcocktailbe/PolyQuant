@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, memo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, memo, useRef } from 'react';
 import {
     LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer
 } from 'recharts';
@@ -304,6 +304,7 @@ const INITIAL_STATE: SystemState = {
     opportunities: [],
     trades_executed: [],
     pipeline_stage: 'IDLE',
+    pipeline_events: [],
     logs: [],
 };
 
@@ -311,8 +312,9 @@ export const Dashboard: React.FC = () => {
     const [state, setState] = useState<SystemState>(INITIAL_STATE);
     const [equityHistory, setEquityHistory] = useState<{ time: number; value: number }[]>([]);
     const [showRawData, setShowRawData] = useState(false);
-    const [activeTab, setActiveTab] = useState<'chart' | 'terminal'>('chart');
+    const [activeTab, setActiveTab] = useState<'chart' | 'terminal' | 'pipeline'>('chart');
     const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
+    const prevStageRef = useRef<string>('IDLE');
 
     // Stable callback for state updates
     const handleStateUpdate = useCallback((newState: SystemState) => {
@@ -335,6 +337,16 @@ export const Dashboard: React.FC = () => {
         const unsubscribe = api.subscribe(handleStateUpdate);
         return () => unsubscribe();
     }, [handleStateUpdate]);
+
+    // Auto-switch to pipeline tab when MapMaker starts a new run
+    useEffect(() => {
+        const prev = prevStageRef.current;
+        const curr = state.pipeline_stage;
+        if (prev === 'IDLE' && curr === 'DISCOVERY') {
+            setActiveTab('pipeline');
+        }
+        prevStageRef.current = curr;
+    }, [state.pipeline_stage]);
 
     return (
         <div className="h-screen w-screen flex flex-col bg-obsidian text-gray-300 font-sans selection:bg-neon-cyan/30 selection:text-neon-cyan overflow-hidden bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-charcoal via-obsidian to-obsidian">
@@ -386,35 +398,50 @@ export const Dashboard: React.FC = () => {
                 {/* Center Col: Equity & Risk */}
                 <div className="col-span-6 row-span-12 flex flex-col gap-3">
                     <div className="flex-[0.65] flex flex-col min-h-0">
-                        {['DISCOVERY', 'LOGIC', 'MATCHING'].includes(state.pipeline_stage) ? (
-                            <PipelineMonitor stage={state.pipeline_stage} mappedPairs={state.mapped_pairs} />
-                        ) : (
-                            <div className="flex-1 flex flex-col min-h-0">
-                                <div className="flex h-10 border-b border-white/5 bg-black/20">
-                                    <button
-                                        onClick={() => setActiveTab('chart')}
-                                        className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'chart' ? 'border-neon-cyan text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
-                                    >
-                                        EQUITY_CURVE
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('terminal')}
-                                        className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'terminal' ? 'border-neon-purple text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
-                                    >
-                                        SYSTEM_TERMINAL
-                                    </button>
-                                </div>
-                                <div className="flex-1 min-h-0">
-                                    {activeTab === 'chart' ? (
-                                        <EquityChart data={equityHistory} />
-                                    ) : (
-                                        <div className="h-full bg-charcoal/50 border border-white/5 border-t-0 backdrop-blur-sm">
-                                            <LogTerminal logs={state.logs} />
-                                        </div>
+                        <div className="flex-1 flex flex-col min-h-0">
+                            <div className="flex h-10 border-b border-white/5 bg-black/20">
+                                <button
+                                    onClick={() => setActiveTab('chart')}
+                                    className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'chart' ? 'border-neon-cyan text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+                                >
+                                    EQUITY_CURVE
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('terminal')}
+                                    className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 ${activeTab === 'terminal' ? 'border-neon-purple text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+                                >
+                                    SYSTEM_TERMINAL
+                                </button>
+                                <button
+                                    onClick={() => setActiveTab('pipeline')}
+                                    className={`px-6 text-[10px] font-bold tracking-widest transition-all border-b-2 flex items-center gap-2 ${activeTab === 'pipeline' ? 'border-neon-green text-white bg-white/5' : 'border-transparent text-gray-500 hover:text-gray-300'}`}
+                                >
+                                    PIPELINE_FEED
+                                    {['DISCOVERY', 'LOGIC', 'MATCHING'].includes(state.pipeline_stage) && (
+                                        <span className="relative flex h-2 w-2">
+                                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neon-green opacity-75" />
+                                            <span className="relative inline-flex rounded-full h-2 w-2 bg-neon-green" />
+                                        </span>
                                     )}
-                                </div>
+                                    {(state.pipeline_events?.length || 0) > 0 && activeTab !== 'pipeline' && (
+                                        <span className="text-[8px] text-gray-500 font-mono">({state.pipeline_events.length})</span>
+                                    )}
+                                </button>
                             </div>
-                        )}
+                            <div className="flex-1 min-h-0">
+                                {activeTab === 'chart' && (
+                                    <EquityChart data={equityHistory} />
+                                )}
+                                {activeTab === 'terminal' && (
+                                    <div className="h-full bg-charcoal/50 border border-white/5 border-t-0 backdrop-blur-sm">
+                                        <LogTerminal logs={state.logs} />
+                                    </div>
+                                )}
+                                {activeTab === 'pipeline' && (
+                                    <PipelineMonitor stage={state.pipeline_stage} mappedPairs={state.mapped_pairs} pipelineEvents={state.pipeline_events || []} />
+                                )}
+                            </div>
+                        </div>
                     </div>
                     <div className="flex-[0.35] min-h-0 flex flex-col gap-3">
                         <TradeLog trades={state.trades_executed} />

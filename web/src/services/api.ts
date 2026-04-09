@@ -10,6 +10,7 @@ export interface SystemState {
     opportunities: any[];
     trades_executed: any[];
     pipeline_stage: string;
+    pipeline_events: any[];
     logs: string[];
 }
 
@@ -46,6 +47,7 @@ class ApiService {
         opportunities: [],
         trades_executed: [],
         pipeline_stage: "IDLE",
+        pipeline_events: [],
         logs: [],
     };
 
@@ -115,7 +117,8 @@ class ApiService {
             newState.mapped_pairs.length !== this.state.mapped_pairs.length ||
             newState.opportunities.length !== this.state.opportunities.length ||
             newState.trades_executed.length !== this.state.trades_executed.length ||
-            newState.pipeline_stage !== this.state.pipeline_stage
+            newState.pipeline_stage !== this.state.pipeline_stage ||
+            (newState.pipeline_events?.length || 0) !== (this.state.pipeline_events?.length || 0)
         );
     }
 

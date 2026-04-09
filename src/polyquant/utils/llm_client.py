@@ -16,6 +16,7 @@ USAGE:
 """
 
 import json
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -97,6 +98,10 @@ def call_llm_json(
     
     messages.append({"role": "user", "content": full_prompt})
 
+    prompt_chars = len(full_prompt)
+    print(f"\n--- 🤖 LLM START: {model} | Prompt: {prompt_chars:,} chars ---")
+    t0 = time.time()
+
     try:
         response = client.chat.completions.create(
             model=model,
@@ -104,6 +109,7 @@ def call_llm_json(
             temperature=temperature,
         )
 
+        elapsed = time.time() - t0
         content = response.choices[0].message.content
         actual_model = getattr(response, "model", model)
         logger.debug("LLM response received", model_used=actual_model)
@@ -114,8 +120,12 @@ def call_llm_json(
         elif content and "```" in content:
             content = content.split("```")[1].split("```")[0]
 
-        return json.loads(content.strip()) if content else None
+        parsed = json.loads(content.strip()) if content else None
+        print(f"--- ✅ LLM SUCCESS [{elapsed:.1f}s] | Model: {actual_model} ---\n")
+        return parsed
 
     except Exception as e:
+        elapsed = time.time() - t0
+        print(f"--- ❌ LLM FAILED [{elapsed:.1f}s] | Error: {e} ---\n")
         logger.error("LLM call failed", error=str(e), model=model)
         return None

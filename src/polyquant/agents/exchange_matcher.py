@@ -30,14 +30,23 @@ from polyquant.utils import get_logger, config
 
 logger = get_logger(__name__)
 
-CACHE_DIR = Path(".polyquant")
+CACHE_DIR = Path(".polyquant/constraints")
 CACHE_FILE = CACHE_DIR / "market_pairs.json"
 
 LLM_VERIFY_PROMPT = """
-You are a financial exchange matching engine.
-Your task is to determine if two prediction markets are EXACTLY identical.
-They must resolve to the exact same real-world outcome, same timeframe, and same truth source.
-Pay special attention to the Resolution Source and End Date — if they differ, they are NOT a match.
+You are an arbitrage trading engine.
+Your task is to determine if two prediction markets represent the SAME real-world outcome.
+They must be logically equivalent, even if they use different wording or different standard sources.
+
+Examples of MATCH:
+- "Will BTC hit $100k in 2025?" vs "Will Bitcoin reach $100k before 2026?" (Same outcome)
+- "Trump to win election" vs "Donald Trump victor in 2024" (Same logical outcome)
+- "Fed cuts rates in Sept" vs "Federal Reserve 25bps+ rate cut by Sept" (Equivalent financial outcome)
+
+Examples of NOT A MATCH:
+- "Who will win the election?" vs "Will Trump win the election?" (Different structure: multiple choice vs binary)
+- "Will BTC hit 100k in May?" vs "Will BTC hit 100k in June?" (Different timeframes)
+- "Will ETH be above $3000?" vs "Will ETH be above $3000 OR BTC above $100k?" (One has extra conditions)
 
 Polymarket Question: {p_q}
 Polymarket Description: {p_d}
@@ -221,10 +230,10 @@ class ExchangeMatcher:
             # Get top 3 indices for this Polymarket market
             top_3_indices = np.argsort(similarity_matrix[p_idx])[-3:][::-1]
             
-            # Require at least a 0.6 semantic similarity score to test with LLM
+            # Require at least a 0.52 semantic similarity score to test with LLM
             for l_idx in top_3_indices:
                 sim_score = float(similarity_matrix[p_idx][l_idx])
-                if sim_score < 0.6:
+                if sim_score < 0.52:
                     continue
                     
                 l_market = limit_markets[l_idx]
@@ -268,8 +277,24 @@ class ExchangeMatcher:
             return self.mapped_pairs, pipeline_stats
             
         pipeline_stats["llm_verifications_sent"] = len(eval_tasks)
-        logger.info(f"Firing {len(eval_tasks)} LLM verification requests concurrently...")
-        results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+        logger.info(f"Firing {len(eval_tasks)} LLM verification requests (Rate limited to 20 RPM)...")
+
+        # OpenRouter free tier limits to 20 requests per minute
+        # We will use a semaphore of 2 and a sleep to restrict throughput
+        sem = asyncio.Semaphore(2)
+
+        async def controlled_llm_call(task):
+            async with sem:
+                try:
+                    res = await task
+                    # Add delay to stay under ~20 RPM (3 seconds per request across 2 workers)
+                    await asyncio.sleep(6.0)
+                    return res
+                except Exception as e:
+                    return e
+
+        rate_limited_tasks = [controlled_llm_call(t) for t in eval_tasks]
+        results = await asyncio.gather(*rate_limited_tasks, return_exceptions=True)
         
         # Process results, grouping by Polymarket market_id so we only map the first true match
         processed_p_market_ids = set()

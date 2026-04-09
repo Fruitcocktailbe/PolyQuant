@@ -468,18 +468,96 @@ The YES Price is the current market probability (0.00 to 1.00).
         # Reduced from 150 to 50 to prevent free-tier models from returning unterminated JSON strings
         MAX_BATCH_SIZE = 50
         if len(markets) > MAX_BATCH_SIZE:
-            logger.info(f"Chunking {len(markets)} markets into batches of {MAX_BATCH_SIZE}...")
-            batches = [markets[i:i + MAX_BATCH_SIZE] for i in range(0, len(markets), MAX_BATCH_SIZE)]
+            logger.info(f"Chunking {len(markets)} markets into batches (max {MAX_BATCH_SIZE})...")
+            
+            batches = []
+            if config.enable_semantic_matching:
+                try:
+                    from sentence_transformers import SentenceTransformer, util
+                    import gc
+                    import torch
+                    
+                    logger.info("Loading semantic model for pre-clustering targets...")
+                    model = SentenceTransformer('all-MiniLM-L6-v2')
+                    
+                    # Get embeddings
+                    questions = [m.question for m in markets]
+                    embeddings = model.encode(questions, convert_to_tensor=True)
+                    
+                    # Compute sim matrix
+                    sim_matrix = util.cos_sim(embeddings, embeddings).cpu().numpy()
+                    
+                    # Free model immediately to save RAM on 2GB instances
+                    del model
+                    del embeddings
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    # Greedy clustering
+                    visited = set()
+                    clusters = []
+                    for i in range(len(markets)):
+                        if i in visited:
+                            continue
+                        
+                        # Start a new cluster with market i
+                        cluster = [markets[i]]
+                        visited.add(i)
+                        
+                        # Find all related markets
+                        for j in range(i + 1, len(markets)):
+                            if j not in visited and sim_matrix[i][j] >= 0.40:
+                                cluster.append(markets[j])
+                                visited.add(j)
+                        
+                        clusters.append(cluster)
+                    
+                    # Bin packing clusters into batches of MAX_BATCH_SIZE
+                    current_batch = []
+                    for cluster in clusters:
+                        if len(cluster) > MAX_BATCH_SIZE:
+                            # Flush current batch
+                            if current_batch:
+                                batches.append(current_batch)
+                                current_batch = []
+                            # Slice huge cluster
+                            for i in range(0, len(cluster), MAX_BATCH_SIZE):
+                                batches.append(cluster[i:i + MAX_BATCH_SIZE])
+                        else:
+                            if len(current_batch) + len(cluster) > MAX_BATCH_SIZE:
+                                batches.append(current_batch)
+                                current_batch = []
+                            current_batch.extend(cluster)
+                    
+                    if current_batch:
+                        batches.append(current_batch)
+                        
+                    logger.info(f"Semantically clustered into {len(batches)} batches.")
+
+                except Exception as e:
+                    logger.warning(f"Semantic pre-clustering failed ({e}), falling back to arbitrary slicing.")
+                    batches = [markets[i:i + MAX_BATCH_SIZE] for i in range(0, len(markets), MAX_BATCH_SIZE)]
+            else:
+                batches = [markets[i:i + MAX_BATCH_SIZE] for i in range(0, len(markets), MAX_BATCH_SIZE)]
+            
             all_clusters = []
             
-            # Limit concurrency to avoid rate limits
-            sem = asyncio.Semaphore(3)
+            # Limit concurrency to exactly 2 with a delay to respect OpenRouter's 20 RPM free tier
+            sem = asyncio.Semaphore(2)
             
-            async def process_batch(b: list[Market]) -> list[MarketCluster]:
+            async def process_batch(b: list[Market], batch_idx: int) -> list[MarketCluster]:
                 async with sem:
-                    return await self._cluster_markets(b)
+                    try:
+                        res = await self._cluster_markets(b)
+                        await asyncio.sleep(6.0) # Stay under 20 RPM
+                        return res
+                    except Exception as e:
+                        logger.warning(f"Batch {batch_idx} LLM failed: {e}")
+                        return [MarketCluster(topic="Uncategorized (Batch Failed)", markets=b)]
             
-            results = await asyncio.gather(*(process_batch(b) for b in batches), return_exceptions=True)
+            tasks = [process_batch(b, i) for i, b in enumerate(batches)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
                 if isinstance(r, list):
                     all_clusters.extend(r)

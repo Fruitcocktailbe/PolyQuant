@@ -46,6 +46,7 @@ class SystemState(BaseModel):
     opportunities: List[Dict[str, Any]] = []  # Detected by Navigator
     trades_executed: List[Dict[str, Any]] = []  # Finalized fills
     pipeline_stage: str = "IDLE"  # "IDLE", "DISCOVERY", "LOGIC", "MATCHING", "COMPLETE"
+    pipeline_events: List[Dict[str, Any]] = []  # Chronological MapMaker activity feed
     logs: List[str] = []
 
 class Monitor:
@@ -116,6 +117,46 @@ class Monitor:
         
         # Fire-and-forget log broadcast
         asyncio.create_task(self.broadcast({"type": "log", "data": log_entry}))
+
+    async def emit_pipeline_event(
+        self,
+        stage: str,
+        event_type: str,
+        message: str,
+        detail: str = "",
+        duration: float | None = None,
+    ):
+        """
+        Emit a structured pipeline event for the UI timeline.
+
+        Args:
+            stage: Pipeline stage (DISCOVERY, LOGIC, MATCHING, COMPLETE)
+            event_type: One of: info, llm_start, llm_success, llm_fail,
+                        cache_hit, validation_fail, match, api_fetch
+            message: Short summary line
+            detail: Optional extra detail (topic, reason, etc.)
+            duration: Optional elapsed time in seconds
+        """
+        import datetime as _dt
+
+        event = {
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "stage": stage,
+            "type": event_type,
+            "message": message,
+            "detail": detail,
+        }
+        if duration is not None:
+            event["duration"] = round(duration, 2)
+
+        self.state.pipeline_events.append(event)
+        # Keep last 200 events
+        if len(self.state.pipeline_events) > 200:
+            self.state.pipeline_events = self.state.pipeline_events[-200:]
+
+        asyncio.create_task(
+            self.broadcast({"type": "state_update", "data": self.state.model_dump()})
+        )
 
     def trigger_kill_switch(self):
         self.state.kill_switch_active = True

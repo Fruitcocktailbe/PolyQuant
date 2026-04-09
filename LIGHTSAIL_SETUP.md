@@ -161,3 +161,28 @@ If you can't connect to the dashboard (localhost:5173):
    
    Then open `http://localhost:5173` in your browser.
 3. **Public IP Access**: If not using a tunnel, open `http://<your-lightsail-ip>:5173`. Ensure ports 5173 and 8000 are open in the Lightsail Firewall settings.
+
+## 9. Troubleshooting: Git Pull Errors ("would be overwritten by merge")
+
+When pulling updates from GitHub, you might encounter an error like this if local files track differently than remote files:
+`error: Your local changes to the following files would be overwritten by merge:`
+
+This frequently happens with `web/node_modules/.package-lock.json` or other auto-generated files.
+
+**Solution 1: The `stash` method (Easiest)**
+This temporarily shelves your conflicts, lets you pull the new code, and then throws away your temporary shelved changes.
+```bash
+git stash
+git pull origin <branch-name>
+git stash drop
+```
+
+**Solution 2: The `checkout` method**
+This explicitly discards any local modifications to the conflicting file, replacing it with the last cleanly tracked version.
+```bash
+git checkout -- <path/to/conflicting/file>
+git pull origin <branch-name>
+```
+
+> [!TIP]
+> After fixing conflicts with `node_modules` files, always remember to `cd web` and run `npm install` afterwards to ensure your dependencies are synchronized properly!

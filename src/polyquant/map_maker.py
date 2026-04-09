@@ -25,6 +25,7 @@ USAGE:
 import asyncio
 import hashlib
 import json
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,6 +178,16 @@ class MapMaker:
             # ================================================================
             # PHASE 1: DISCOVERY
             # ================================================================
+            # Clear previous run's events and emit start banner
+            monitor.state.pipeline_events = []
+            print(f"\n{'='*60}")
+            print(f"  \U0001f680 MAP MAKER STARTED — {start_time.strftime('%H:%M:%S UTC')}")
+            print(f"{'='*60}")
+            await monitor.emit_pipeline_event(
+                "DISCOVERY", "info",
+                f"MapMaker started (v{new_version})",
+            )
+
             logger.info("Phase 1: Discovery - Scanning markets...")
             await monitor.update_status(pipeline_stage="DISCOVERY", mapped_pairs=[])
             
@@ -199,10 +210,18 @@ class MapMaker:
                 } for c in clusters]
             )
 
+            total_markets = sum(len(c.markets) for c in clusters)
+            print(f"--- \U0001f4e1 DISCOVERY: Found {len(clusters)} clusters ({total_markets} markets) ---")
             logger.info(f"Discovered {len(clusters)} clusters")
+
+            await monitor.emit_pipeline_event(
+                "DISCOVERY", "info",
+                f"Discovered {len(clusters)} clusters ({total_markets} markets)",
+            )
+
             results["discovery"] = {
                 "clusters_found": len(clusters),
-                "total_markets": sum(len(c.markets) for c in clusters),
+                "total_markets": total_markets,
             }
             
             if not clusters:
@@ -244,16 +263,39 @@ class MapMaker:
                     
                     await update_ui_cluster_status(cluster.cluster_id, "Analyzing (LLM)...")
 
+                    print(f"\n--- \U0001f9e9 LOGIC [{idx}/{total_clusters}]: '{cluster.topic}' ({len(cluster.markets)} markets) ---")
+                    await monitor.emit_pipeline_event(
+                        "LOGIC", "llm_start",
+                        f"Analyzing cluster {idx}/{total_clusters}: {cluster.topic}",
+                        detail=f"{len(cluster.markets)} markets",
+                    )
+
+                    t_cluster = time.time()
                     manifest = await self._analyze_cluster(cluster)
+                    cluster_elapsed = time.time() - t_cluster
 
                     if manifest:
                         # Check if this was a cache hit
                         is_cached = hasattr(manifest, '_from_cache') and manifest._from_cache
                         if is_cached:
                             cache_hits += 1
+                            print(f"--- \u26a1 CACHE HIT: '{cluster.topic}' ({manifest.constraint_count} constraints) ---")
                             await update_ui_cluster_status(cluster.cluster_id, f"Cached ({manifest.constraint_count} found)")
+                            await monitor.emit_pipeline_event(
+                                "LOGIC", "cache_hit",
+                                f"Cache hit for '{cluster.topic}'",
+                                detail=f"{manifest.constraint_count} constraints reused",
+                                duration=cluster_elapsed,
+                            )
                         else:
+                            print(f"--- \u2705 ANALYZED: '{cluster.topic}' [{cluster_elapsed:.1f}s] -> {manifest.constraint_count} constraints, {manifest.dependency_count} deps ---")
                             await update_ui_cluster_status(cluster.cluster_id, f"Parsed ({manifest.constraint_count} found)")
+                            await monitor.emit_pipeline_event(
+                                "LOGIC", "llm_success",
+                                f"Analyzed '{cluster.topic}'",
+                                detail=f"{manifest.constraint_count} constraints, {manifest.dependency_count} dependencies",
+                                duration=cluster_elapsed,
+                            )
 
                         if manifest.constraint_count > 0:
                             if self._store:
@@ -262,7 +304,13 @@ class MapMaker:
                             total_constraints += manifest.constraint_count
                             total_dependencies += manifest.dependency_count
                     else:
+                        print(f"--- \u2796 NO CONSTRAINTS: '{cluster.topic}' [{cluster_elapsed:.1f}s] ---")
                         await update_ui_cluster_status(cluster.cluster_id, "No constraints found")
+                        await monitor.emit_pipeline_event(
+                            "LOGIC", "info",
+                            f"No constraints found for '{cluster.topic}'",
+                            duration=cluster_elapsed,
+                        )
 
                     # Progress percentage
                     progress_pct = (idx / total_clusters) * 100
@@ -278,9 +326,33 @@ class MapMaker:
 
             async def run_cross_exchange_pipeline() -> dict[str, Any]:
                 await monitor.update_status(pipeline_stage="MATCHING")
+                print(f"\n{'='*60}")
+                print(f"--- \U0001f310 MATCHING: Starting cross-exchange pipeline ---")
+                print(f"{'='*60}")
+                await monitor.emit_pipeline_event(
+                    "MATCHING", "info",
+                    "Starting cross-exchange matching pipeline",
+                )
+                t_match = time.time()
                 if self._exchange_matcher:
                     new_mappings, matching_stats = await self._exchange_matcher.run_matching_pipeline()
                     matching_stats["total_pairs"] = len(new_mappings)
+                    match_elapsed = time.time() - t_match
+                    new_found = matching_stats.get("new_pairs_found", 0)
+                    total = matching_stats.get("total_pairs_after", len(new_mappings))
+                    print(f"--- \u2705 MATCHING COMPLETE [{match_elapsed:.1f}s]: {new_found} new pairs, {total} total ---\n")
+                    await monitor.emit_pipeline_event(
+                        "MATCHING", "info",
+                        f"Matching complete: {new_found} new pairs found ({total} total cached)",
+                        duration=match_elapsed,
+                    )
+                    # Emit individual match events for any newly found pairs
+                    for pair in matching_stats.get("matched_pairs_detail", []):
+                        await monitor.emit_pipeline_event(
+                            "MATCHING", "match",
+                            f"Matched: {pair.get('polymarket', '')[:50]}",
+                            detail=f"↔ {pair.get('limitless', '')[:50]} (sim: {pair.get('similarity', 0):.2f})",
+                        )
                     return matching_stats
                 return {"skipped": True}
 
@@ -306,6 +378,15 @@ class MapMaker:
         # Record timing
         elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(results["start_time"])).total_seconds()
         results["elapsed_seconds"] = elapsed
+
+        # Final summary
+        print(f"\n{'='*60}")
+        print(f"--- \U0001f3c1 MAP MAKER COMPLETE [{elapsed:.0f}s] | Status: {results['status'].upper()} ---")
+        print(f"{'='*60}\n")
+        await monitor.emit_pipeline_event(
+            "COMPLETE", "info",
+            f"MapMaker finished in {elapsed:.0f}s — {results['status'].upper()}",
+        )
         
         logger.info(
             "Map building complete",
@@ -513,10 +594,18 @@ class MapMaker:
             validated = await self._validator.validate(analysis)
             
             if not validated.is_valid:
+                issue_reasons = [i.description for i in validated.issues[:3]]
+                reason_str = "; ".join(issue_reasons) if issue_reasons else "Unknown"
+                print(f"--- \u26a0\ufe0f  VALIDATOR REJECTED: '{cluster.topic}' | Reason: {reason_str} ---")
                 logger.warning(
                     "Validation failed",
                     cluster_id=cluster.cluster_id,
                     issues=len(validated.issues),
+                )
+                await monitor.emit_pipeline_event(
+                    "LOGIC", "validation_fail",
+                    f"Validation issues for '{cluster.topic}'",
+                    detail=reason_str,
                 )
                 # Still save partial constraints that passed
             
