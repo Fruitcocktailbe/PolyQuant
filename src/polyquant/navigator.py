@@ -573,32 +573,63 @@ class Navigator:
             except Exception as e:
                 logger.error("Failed to hot-reload markets", error=str(e))
 
-    async def _limitless_polling_loop(self, token_ids: list[str]) -> None:
+    async def _limitless_polling_loop(
+        self, token_ids: list[str], matched_token_ids: set[str] | None = None
+    ) -> None:
         """
-        Background task to poll Limitless for order books, as they don't have WS.
+        Background task to poll Limitless for order books.
+
+        Two-tier polling:
+        - Fast tier (250ms): tokens with active cross-exchange Polymarket pairs
+        - Slow tier (1s): all other Limitless tokens
+        
+        Rate budget: Limitless allows 100 req/sec per user.
+        Worst case at 250ms with 20 matched tokens = ~80 req/sec (safe).
         """
         if not self._limitless:
             return
-            
-        logger.info(f"Limitless polling loop active for {len(token_ids)} tokens")
+
+        matched = matched_token_ids or set()
+        fast_tokens = [tid for tid in token_ids if tid in matched]
+        slow_tokens = [tid for tid in token_ids if tid not in matched]
+
+        logger.info(
+            f"Limitless polling loop active",
+            fast_tier=f"{len(fast_tokens)} tokens @ 250ms",
+            slow_tier=f"{len(slow_tokens)} tokens @ 1s",
+        )
+
+        fast_counter = 0  # Track cycles to interleave slow tokens
+
         while self._is_running:
             try:
-                # Fetch books sequentially to avoid hammering the beta API
-                for token_id in token_ids:
+                # Fast tier: poll matched tokens every cycle (250ms)
+                for token_id in fast_tokens:
                     if not self._is_running:
                         break
-                        
                     ob = await self._limitless.get_order_book(token_id)
                     if ob:
-                        # Feed the price cache so the main event loop wakes up
                         await self._price_cache.update(token_id, ob)
-                        
-                # Wait 1s between full passes
-                await asyncio.sleep(1.0)
-                
+
+                # Slow tier: poll unmatched tokens every 4th cycle (~1s)
+                fast_counter += 1
+                if fast_counter >= 4 and slow_tokens:
+                    fast_counter = 0
+                    for token_id in slow_tokens:
+                        if not self._is_running:
+                            break
+                        ob = await self._limitless.get_order_book(token_id)
+                        if ob:
+                            await self._price_cache.update(token_id, ob)
+
+                # 250ms between fast cycles
+                await asyncio.sleep(0.25)
+
             except Exception as e:
                 logger.error("Limitless polling loop encountered error", error=str(e))
-                await asyncio.sleep(5.0) # Back off on error
+                await asyncio.sleep(5.0)  # Back off on error
+
+
 
     def stop(self) -> None:
         """Gracefully stop the navigator loop."""
@@ -779,10 +810,21 @@ class Navigator:
             
         # 3. Limitless REST Polling Task (since no WS exists yet)
         limitless_tokens = [tid for tid in token_id_list if "_" in tid and not tid.startswith("0x")]
+        # Identify matched cross-exchange tokens for fast-tier polling (250ms)
+        matched_limitless_tokens: set[str] = set()
+        for _cid in cluster_ids:
+            _manifest = await self._store.load_manifest(_cid)
+            if _manifest and _manifest.market_exchanges:
+                for mid, exch in _manifest.market_exchanges.items():
+                    if exch.startswith("limitless"):
+                        # Build the token IDs for this Limitless market
+                        matched_limitless_tokens.add(f"{mid}_0")
+                        matched_limitless_tokens.add(f"{mid}_1")
+
         if hasattr(self, "_limitless") and self._limitless and limitless_tokens:
-             logger.info(f"Starting background REST polling for {len(limitless_tokens)} Limitless tokens")
+             logger.info(f"Starting background REST polling for {len(limitless_tokens)} Limitless tokens ({len(matched_limitless_tokens)} fast-tier)")
              self._limitless_polling_task = asyncio.create_task(
-                 self._limitless_polling_loop(limitless_tokens)
+                 self._limitless_polling_loop(limitless_tokens, matched_limitless_tokens)
              )
             
         # 4. Main Event Loop

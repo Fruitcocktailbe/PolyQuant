@@ -550,25 +550,43 @@ The YES Price is the current market probability (0.00 to 1.00).
                 async with sem:
                     try:
                         res = await self._cluster_markets(b)
-                        await asyncio.sleep(6.0) # Stay under 20 RPM
+                        await asyncio.sleep(6.0)  # Stay under 20 RPM
                         return res
                     except Exception as e:
                         logger.warning(f"Batch {batch_idx} LLM failed: {e}")
+                        # Hold the semaphore slot for the full window even on failure
+                        # so a 429 or timeout doesn't immediately release capacity.
+                        await asyncio.sleep(6.0)
                         return [MarketCluster(topic="Uncategorized (Batch Failed)", markets=b)]
-            
+
             tasks = [process_batch(b, i) for i, b in enumerate(batches)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for r in results:
+
+            retry_batches: list[list[Market]] = []
+            for i, r in enumerate(results):
                 if isinstance(r, list):
                     all_clusters.extend(r)
-                elif isinstance(r, Exception):
-                    logger.warning(f"LLM batch failed, skipping that chunk: {r}")
-                    # Fallback for this chunk so we don't lose the markets
-                    all_clusters.append(MarketCluster(
-                        topic="Uncategorized (Batch Failed)",
-                        markets=batches[results.index(r)],
-                        potential_dependencies=[],
-                    ))
+                else:
+                    # BaseException (e.g. CancelledError) — not caught by process_batch.
+                    # Queue for sequential retry at the end of this run.
+                    logger.warning(
+                        f"Batch {i} did not complete ({type(r).__name__}), queued for retry"
+                    )
+                    retry_batches.append(batches[i])
+
+            if retry_batches:
+                logger.info(f"Retrying {len(retry_batches)} interrupted batch(es) sequentially...")
+                for idx, b in enumerate(retry_batches):
+                    if idx > 0:
+                        await asyncio.sleep(6.0)  # Rate-limit between retries
+                    try:
+                        retry_result = await self._cluster_markets(b)
+                        all_clusters.extend(retry_result)
+                        logger.info(f"Retry {idx + 1}/{len(retry_batches)} succeeded.")
+                    except Exception as e:
+                        logger.warning(f"Retry {idx + 1}/{len(retry_batches)} failed: {e}. Using fallback cluster.")
+                        all_clusters.append(MarketCluster(topic="Uncategorized (Retry Failed)", markets=b))
+
             return all_clusters
 
         # Format markets for the prompt - include prices and liquidity

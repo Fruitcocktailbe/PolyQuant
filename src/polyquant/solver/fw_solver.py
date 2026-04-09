@@ -862,10 +862,13 @@ class ArbitrageDetector:
         reserved_capital = Decimal("0")
         available_capital = Decimal(str(self.position_sizer.capital))
 
-        best_ring_trades = []
-        best_ring_profit = Decimal("-1")
-        best_ring_markets = []
-        best_ring_roi = 0.0
+        # Multi-ring accumulators: collect ALL profitable non-overlapping rings
+        all_accepted_trades = []
+        all_accepted_markets = set()
+        total_accepted_profit = Decimal("0")
+        min_confidence = 1.0  # Track worst confidence across accepted rings
+        total_capital_deployed = Decimal("0")
+        rings_accepted_count = 0
 
         # Collect all potential rings for ranking
         candidate_rings = []
@@ -1088,30 +1091,49 @@ class ArbitrageDetector:
             estimated_execution_time_sec = len(ring_trades) * 0.1
             capital_efficiency = float(net_profit / Decimal(str(estimated_execution_time_sec)))
 
-            # Accept this ring (only processing top ring for now, can extend to multiple)
+            # Accept this ring — accumulate into multi-ring result
             reserved_capital += capital_required
-            best_ring_trades = ring_trades
-            best_ring_profit = net_profit
-            best_ring_markets = ring_markets
-            best_ring_roi = roi
+            total_capital_deployed += capital_required
+            all_accepted_trades.extend(ring_trades)
+            all_accepted_markets.update(ring_markets)
+            total_accepted_profit += net_profit
+            min_confidence = min(min_confidence, confidence)
+            rings_accepted_count += 1
 
             logger.info(
-                f"Found Dutching Arbitrage Opportunity",
-                profit=float(net_profit),
-                roi=f"{roi:.2%}",
+                f"Accepted Dutching Ring ({len(all_accepted_trades)} total trades across {len(all_accepted_markets)} markets)",
+                ring_profit=float(net_profit),
+                ring_roi=f"{roi:.2%}",
                 confidence=f"{confidence:.2%}",
-                capital_efficiency=f"${capital_efficiency:.2f}/sec"
+                capital_efficiency=f"${capital_efficiency:.2f}/sec",
+                rings_accepted=rings_accepted_count,
             )
 
-            return ArbitrageOpportunity(
-                markets=best_ring_markets,
-                trades=best_ring_trades,
-                expected_profit=net_profit,
-                roi=roi,
-                capital_efficiency=capital_efficiency,
-                confidence=confidence
-            )
+            # Continue to next ring instead of returning — accumulate more rings
 
-        # No acceptable rings found
-        return None
+        # After processing all candidate rings, return combined result
+        if not all_accepted_trades:
+            return None
+
+        combined_roi = float(total_accepted_profit / total_capital_deployed) if total_capital_deployed > 0 else 0.0
+        combined_efficiency = float(total_accepted_profit / Decimal(str(len(all_accepted_trades) * 0.1)))
+
+        logger.info(
+            f"Dutching Multi-Ring Complete",
+            total_rings=rings_accepted_count,
+            total_trades=len(all_accepted_trades),
+            total_profit=float(total_accepted_profit),
+            combined_roi=f"{combined_roi:.2%}",
+            confidence=f"{min_confidence:.2%}",
+        )
+
+        return ArbitrageOpportunity(
+            markets=list(all_accepted_markets),
+            trades=all_accepted_trades,
+            expected_profit=total_accepted_profit,
+            roi=combined_roi,
+            capital_efficiency=combined_efficiency,
+            confidence=min_confidence,
+        )
+
 

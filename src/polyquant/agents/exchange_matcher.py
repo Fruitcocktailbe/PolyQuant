@@ -193,7 +193,7 @@ class ExchangeMatcher:
         if not config.enable_semantic_matching or get_llm_client() is None:
             reason = "DISABLED by config" if not config.enable_semantic_matching else "LLM KEY MISSING"
             logger.info(f"Stage 2/3: Semantic Matching skipped ({reason}). Returning Stage 1 results only.")
-            return self.mapped_pairs
+            return self.mapped_pairs, pipeline_stats
 
         logger.info("Stage 2: Loading Semantic Embedding Model (all-MiniLM-L6-v2)...")
         logger.info("Note: This may take several minutes if the model is being downloaded for the first time.")
@@ -203,7 +203,7 @@ class ExchangeMatcher:
         except Exception as e:
             logger.error(f"Failed to load semantic model: {e}")
             logger.warning("Proceeding with empty mappings due to model load failure.")
-            return self.mapped_pairs
+            return self.mapped_pairs, pipeline_stats
         
         # Encode corpuses into semantic vectors
         logger.info(f"Encoding {len(p_docs)} Polymarket and {len(l_docs)} Limitless document embeddings...")
@@ -291,6 +291,10 @@ class ExchangeMatcher:
                     await asyncio.sleep(6.0)
                     return res
                 except Exception as e:
+                    # Hold the semaphore slot for the full window even on failure,
+                    # so a 429 or timeout doesn't immediately release capacity and
+                    # trigger a burst of follow-on requests.
+                    await asyncio.sleep(6.0)
                     return e
 
         rate_limited_tasks = [controlled_llm_call(t) for t in eval_tasks]
