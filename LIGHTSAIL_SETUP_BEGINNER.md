@@ -36,6 +36,9 @@ Now we need to log into the computer you just rented. Amazon makes this very eas
 
 **IMPORTANT:** To paste text into this black window, you usually have to **Right-Click** and select "Paste", or press `Ctrl + Shift + V`.
 
+Or via terminal:
+ssh -L 18789:127.0.0.1:18789 -L 8000:127.0.0.1:8000 -L 5173:127.0.0.1:5173 ubuntu@54.75.125.170 -i "C:\Users\Jeroen\Desktop\LightsailDefaultKey-eu-west-1polymarket.pem"
+CHANGE KEY NAME IF NECESSARY
 ---
 
 ## Step 3: Preparing the Server

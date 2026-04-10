@@ -151,9 +151,16 @@ export const PipelineMonitor: React.FC<PipelineMonitorProps> = memo(({ stage, ma
                 className="flex-1 overflow-y-auto custom-scrollbar space-y-1 p-2"
             >
                 {eventCount === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-600 gap-4 opacity-50">
-                        <Loader2 className="w-8 h-8 animate-spin" />
-                        <span className="text-[10px] uppercase tracking-widest font-bold">
+                    <div className="h-full flex flex-col items-center justify-center text-gray-600 gap-4">
+                        <div className="flex items-center gap-2 mb-2 bg-black/40 px-3 py-1 rounded-full border border-neon-green/20 text-neon-green">
+                            <span className="relative flex h-2 w-2">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-neon-green opacity-75" />
+                                <span className="relative inline-flex rounded-full h-2 w-2 bg-neon-green" />
+                            </span>
+                            <span className="text-[9px] uppercase tracking-widest font-bold">Live Feed Connected</span>
+                        </div>
+                        <Loader2 className="w-8 h-8 animate-spin opacity-50" />
+                        <span className="text-[10px] uppercase tracking-widest font-bold opacity-50">
                             Waiting for MapMaker to start...
                         </span>
                     </div>

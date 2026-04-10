@@ -230,10 +230,10 @@ class ExchangeMatcher:
             # Get top 3 indices for this Polymarket market
             top_3_indices = np.argsort(similarity_matrix[p_idx])[-3:][::-1]
             
-            # Require at least a 0.52 semantic similarity score to test with LLM
+            # Require at least a 0.80 semantic similarity score to test with LLM
             for l_idx in top_3_indices:
                 sim_score = float(similarity_matrix[p_idx][l_idx])
-                if sim_score < 0.52:
+                if sim_score < 0.80:
                     continue
                     
                 l_market = limit_markets[l_idx]
@@ -287,14 +287,11 @@ class ExchangeMatcher:
             async with sem:
                 try:
                     res = await task
-                    # Add delay to stay under ~20 RPM (3 seconds per request across 2 workers)
-                    await asyncio.sleep(6.0)
+                    # Bursting is handled gracefully by exponential backoff in llm_client
+                    await asyncio.sleep(1.0)
                     return res
                 except Exception as e:
-                    # Hold the semaphore slot for the full window even on failure,
-                    # so a 429 or timeout doesn't immediately release capacity and
-                    # trigger a burst of follow-on requests.
-                    await asyncio.sleep(6.0)
+                    await asyncio.sleep(1.0)
                     return e
 
         rate_limited_tasks = [controlled_llm_call(t) for t in eval_tasks]
@@ -327,6 +324,19 @@ class ExchangeMatcher:
                     pipeline_stats["vector_fallbacks"] += 1
                 else:
                     logger.error(f"LLM evaluation failed and score ({meta['sim_score']:.2f}) too low for fallback: {resp}")
+                    
+                    # Send failure indication to the UI
+                    ui_pair = {
+                        "polymarket_question": p_market.question,
+                        "limitless_title": f"❌ [LLM ABANDONED] {meta['l_title']}",
+                        "polymarket_id": p_market.market_id,
+                        "limitless_id": meta["l_id"],
+                        "similarity": round(meta["sim_score"], 2)
+                    }
+                    current_pairs = list(monitor.state.mapped_pairs)
+                    current_pairs.append(ui_pair)
+                    asyncio.create_task(monitor.update_status(mapped_pairs=current_pairs))
+                    
                     continue
             else:
                 is_match = resp.get("is_match") is True

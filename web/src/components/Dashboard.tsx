@@ -237,14 +237,33 @@ const ClusterDetailsModal = memo<{ clusterId: string | null; onClose: () => void
                                 </div>
                             </div>
 
-                            {/* Raw Excerpt */}
+                            {/* Markets Map */}
                             <div>
                                 <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
-                                    <Cpu className="w-3 h-3 text-neon-purple" /> Exchanges Map
+                                    <Cpu className="w-3 h-3 text-neon-purple" /> Markets Discovered
                                 </h3>
-                                <pre className="bg-black/60 border border-white/5 p-3 text-[9px] font-mono text-gray-400 overflow-x-auto custom-scrollbar">
-                                    {JSON.stringify(details.market_exchanges || {}, null, 2)}
-                                </pre>
+                                <div className="space-y-2">
+                                    {Object.entries(details.market_exchanges || {}).map(([marketId, exchange]: [string, any]) => {
+                                        const title = details.market_titles?.[marketId] || "Unknown Market";
+                                        const isLimitless = String(exchange).toLowerCase().includes('limitless');
+                                        return (
+                                            <div key={marketId} className="bg-black/40 border border-white/5 p-3 hover:border-white/10 transition-colors flex justify-between items-center">
+                                                <div className="flex flex-col gap-1 w-[70%]">
+                                                    <span className="text-xs text-white truncate" title={title}>{title}</span>
+                                                    <span className="text-[9px] text-gray-500 font-mono select-all">ID: {marketId}</span>
+                                                </div>
+                                                <div className="flex items-center">
+                                                    <span className={`text-[8px] px-2 py-1 border font-bold uppercase tracking-tighter ${isLimitless ? 'bg-neon-purple/20 text-neon-purple border-neon-purple/40' : 'bg-neon-cyan/20 text-neon-cyan border-neon-cyan/40'}`}>
+                                                        {exchange as string}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                    {Object.keys(details.market_exchanges || {}).length === 0 && (
+                                        <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No markets linked yet.</div>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     ) : (

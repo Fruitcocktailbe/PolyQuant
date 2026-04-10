@@ -102,30 +102,44 @@ def call_llm_json(
     print(f"\n--- 🤖 LLM START: {model} | Prompt: {prompt_chars:,} chars ---")
     t0 = time.time()
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-        )
+    max_retries = 3
+    base_wait = 10.0 # Start with 10 seconds wait on first 429
 
-        elapsed = time.time() - t0
-        content = response.choices[0].message.content
-        actual_model = getattr(response, "model", model)
-        logger.debug("LLM response received", model_used=actual_model)
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
 
-        # Parse JSON — handle markdown code blocks if present
-        if content and "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif content and "```" in content:
-            content = content.split("```")[1].split("```")[0]
+            elapsed = time.time() - t0
+            content = response.choices[0].message.content
+            actual_model = getattr(response, "model", model)
+            logger.debug("LLM response received", model_used=actual_model)
 
-        parsed = json.loads(content.strip()) if content else None
-        print(f"--- ✅ LLM SUCCESS [{elapsed:.1f}s] | Model: {actual_model} ---\n")
-        return parsed
+            # Parse JSON — handle markdown code blocks if present
+            if content and "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif content and "```" in content:
+                content = content.split("```")[1].split("```")[0]
 
-    except Exception as e:
-        elapsed = time.time() - t0
-        print(f"--- ❌ LLM FAILED [{elapsed:.1f}s] | Error: {e} ---\n")
-        logger.error("LLM call failed", error=str(e), model=model)
-        return None
+            parsed = json.loads(content.strip()) if content else None
+            print(f"--- ✅ LLM SUCCESS [{elapsed:.1f}s] | Model: {actual_model} ---\n")
+            return parsed
+
+        except Exception as e:
+            error_str = str(e)
+            
+            # Check if this is a rate limit error (429) and we have retries left
+            if "429" in error_str and attempt < max_retries - 1:
+                wait_time = base_wait * (2 ** attempt)  # 10s, 20s...
+                print(f"--- ⚠️ LLM RATE LIMITED (429) | Waiting {wait_time}s before retry ({attempt+1}/{max_retries}) ---\n")
+                logger.warning(f"LLM 429 Rate Limit. Backing off for {wait_time}s", attempt=attempt+1)
+                time.sleep(wait_time)
+                continue
+                
+            elapsed = time.time() - t0
+            print(f"--- ❌ LLM FAILED [{elapsed:.1f}s] | Error: {e} ---\n")
+            logger.error("LLM call failed", error=error_str, model=model)
+            return None

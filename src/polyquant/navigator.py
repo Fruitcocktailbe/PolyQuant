@@ -474,14 +474,14 @@ class Navigator:
         
         # Subscribe cache to WebSocket updates
         # NOTE: This connects the WS client (in PolymarketClient) to our local cache
-        if self._polymarket and self._polymarket._ws_client:
-            # We need to bridge the WS client callback to our cache update
-            # The WS client expects a callback(book: OrderBook)
-            async def on_ws_update(book: OrderBook):
+        # We need to bridge the WS client callback to our cache update
+        # The WS client expects a callback(book: OrderBook)
+        async def on_ws_update(book: OrderBook):
+            if self._price_cache:
                 await self._price_cache.update(book.outcome_id, book)
-            
-            # This will be registered when we subscribe to specific tokens
-            self._ws_update_callback = on_ws_update
+        
+        # This will be registered when we subscribe to specific tokens
+        self._ws_update_callback = on_ws_update
             
         # Start balance refresh task (Rule 1 & 7)
         self._balance_refresh_task = asyncio.create_task(self._refresh_balance_loop())
@@ -832,6 +832,7 @@ class Navigator:
         no_data_ticks = 0  # Track consecutive timeouts
         last_heartbeat = time.monotonic()
         HEARTBEAT_INTERVAL = 30  # seconds
+        was_stale = False
         
         logger.info("🟢 Navigator main loop STARTED — waiting for price data...")
         
@@ -889,16 +890,17 @@ class Navigator:
             # This is deliberately aggressive: we NEVER trade on data older than 200ms.
             if self._polymarket and hasattr(self._polymarket, 'ws_client'):
                 if not self._polymarket.is_ws_healthy(max_age_seconds=config.ws_max_age_ms / 1000.0):
-                    logger.warning(
-                        "Trading blocked: Stale WebSocket connection",
-                        reason=f"No price updates received for >{config.ws_max_age_ms}ms"
-                    )
-                    # Feed to kill switch as potential issue
-                    if self._kill_switch:
-                        self._kill_switch.record_api_error()
-
-                    await asyncio.sleep(1)
+                    if not was_stale:
+                        logger.warning(
+                            "Trading blocked: Stale WebSocket connection",
+                            reason=f"No price updates received for >{config.ws_max_age_ms}ms"
+                        )
+                        was_stale = True
                     continue
+                else:
+                    if was_stale:
+                        logger.info("✅ Data resumed, trading sequence re-armed")
+                        was_stale = False
 
             # Check kill switch
             if self._kill_switch and not await self._kill_switch.can_trade():

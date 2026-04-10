@@ -290,9 +290,9 @@ Output JSON immediately following your `<thinking>` block.
     "dependencies": [
         {
             "source_market_id": "...",
-            "source_outcome": "Yes",
+            "source_outcome": "0x... (USE EXACT 42-CHAR TOKEN ID)",
             "target_market_id": "...",
-            "target_outcome": "Yes",
+            "target_outcome": "0x... (USE EXACT 42-CHAR TOKEN ID)",
             "relationship": "SUBSET",
             "confidence": 0.95,
             "reasoning": "If Trump wins PA, he must win the election (PA is subset)",
@@ -306,7 +306,7 @@ Output JSON immediately following your `<thinking>` block.
         {
             "constraint_id": "c1",
             "description": "NegRisk partition (UNDERPRICED): prices sum to 0.95",
-            "coefficients": {"outcome1": 1.0, "outcome2": 1.0, "outcome3": 1.0},
+            "coefficients": {"0x... (USE EXACT TOKEN ID)": 1.0, "0x... (USE EXACT TOKEN ID)": 1.0},
             "operator": ">=",
             "rhs": 0.95,
             "confidence": 0.98,
@@ -337,8 +337,10 @@ Before outputting JSON, you MUST use a `<thinking>` block:
 7. **Verify Execution**: Ensure tradeable sizes match across constraint legs
 
 ═══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
 CRITICAL RULES:
 ═══════════════════════════════════════════════════════════════
+✓ ALWAYS use EXACT 42-character Token IDs as keys in coefficients and for outcome strings. NEVER use "outcome1", "Yes", etc.
 ✓ ALWAYS check liquidity before creating constraints
 ✓ ALWAYS quantify deviations numerically (percentage)
 ✓ ALWAYS flag NegRisk price sum deviations
@@ -780,22 +782,80 @@ CRITICAL RULES:
         
         return result
     
+    def _sanitize_single_outcome(self, outcome_str: str, market_id: str, cluster: MarketCluster) -> str:
+        """Map a generic outcome string to Token ID for a specific market."""
+        if not outcome_str:
+            return ""
+        
+        for m in cluster.markets:
+            if m.market_id == market_id:
+                for out in m.outcomes:
+                    tid = out.token_id or out.outcome_id
+                    if outcome_str == tid:
+                        return tid
+                    if outcome_str.lower() in out.name.lower() or out.name.lower() in outcome_str.lower():
+                        return tid
+        
+        return outcome_str
+
+    def _sanitize_token_ids(self, coefficients: dict[str, float], cluster: MarketCluster) -> dict[str, float]:
+        """Sanitize LLM output by mapping generic names to real Token IDs (if LLM fails to output them)."""
+        sanitized = {}
+        token_set = set()
+        name_to_token = {}
+
+        for m in cluster.markets:
+            for out in m.outcomes:
+                tid = out.token_id or out.outcome_id
+                token_set.add(tid)
+                name_to_token[out.name.lower()] = tid
+                # Prefix with market context to allow fuzzy matching of 'Yes'/'No'
+                name_to_token[f"{m.market_id}:{out.name.lower()}"] = tid
+
+        for key, value in coefficients.items():
+            key_str = str(key)
+            if key_str in token_set:
+                sanitized[key_str] = value
+                continue
+            
+            # Simple direct fallback
+            key_lower = key_str.lower()
+            if key_lower in name_to_token:
+                sanitized[name_to_token[key_lower]] = value
+                continue
+                
+            # Fuzzy fallback
+            matched = False
+            for name, tid in name_to_token.items():
+                if key_lower in name or name in key_lower:
+                    sanitized[tid] = value
+                    matched = True
+                    break
+                    
+            if not matched:
+                logger.warning("Could not map LLM outcome to Token ID", outcome_str=key_str)
+                sanitized[key_str] = value
+                
+        return sanitized
+
     def _parse_response(
         self,
         response: dict[str, Any],
         cluster: MarketCluster,
     ) -> AnalysisResult:
         """
-        Parse DeepSeek response into typed objects.
+        Parse DeepSeek/Gemini response into typed objects.
         """
         dependencies = []
         for dep_data in response.get("dependencies", []):
             try:
+                dep_source_market = dep_data.get("source_market_id", "")
+                dep_target_market = dep_data.get("target_market_id", "")
                 dep = MarketDependency(
-                    source_market_id=dep_data.get("source_market_id", ""),
-                    source_outcome=dep_data.get("source_outcome", ""),
-                    target_market_id=dep_data.get("target_market_id", ""),
-                    target_outcome=dep_data.get("target_outcome", ""),
+                    source_market_id=dep_source_market,
+                    source_outcome=self._sanitize_single_outcome(dep_data.get("source_outcome", ""), dep_source_market, cluster),
+                    target_market_id=dep_target_market,
+                    target_outcome=self._sanitize_single_outcome(dep_data.get("target_outcome", ""), dep_target_market, cluster),
                     relationship=dep_data.get("relationship", "implies"),
                     confidence=float(dep_data.get("confidence", 0.5)),
                     reasoning=dep_data.get("reasoning", ""),
@@ -814,7 +874,11 @@ CRITICAL RULES:
             try:
                 # Handle sense (default to >= if not present)
                 sense = cons_data.get("sense", ">=")
-                coeffs = cons_data.get("coefficients", {})
+                raw_coeffs = cons_data.get("coefficients", {})
+                
+                # Sanitize coefficients keys to rigorous Token IDs
+                coeffs = self._sanitize_token_ids(raw_coeffs, cluster)
+                
                 rhs = float(cons_data.get("rhs", 0))
 
                 if sense == "<=":

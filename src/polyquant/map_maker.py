@@ -675,6 +675,7 @@ class MapMaker:
             # Create limitless equivalencies
             market_ids = [m.market_id for m in cluster.markets]
             market_exchanges = {m.market_id: "polymarket" for m in cluster.markets}
+            market_titles = {m.market_id: m.question for m in cluster.markets}
             
             if self._exchange_matcher:
                 mapped = self._exchange_matcher.mapped_pairs
@@ -686,6 +687,7 @@ class MapMaker:
                             l_id, l_slug = l_val.split("|", 1)
                         else:
                             l_id = l_val
+                            l_slug = ""
                             
                         if l_id not in market_ids:
                             market_ids.append(l_id)
@@ -695,6 +697,8 @@ class MapMaker:
                             market_exchanges[l_id] = f"limitless:{l_slug}"
                         else:
                             market_exchanges[l_id] = "limitless"
+                            
+                        market_titles[l_id] = f"{m.question} (Limitless)"
                             
                         # Find YES and NO token ids for Polymarket
                         pm_yes = None
@@ -714,13 +718,23 @@ class MapMaker:
                                 c.coefficients[l_yes] = c.coefficients[pm_yes]
                             if pm_no and pm_no in c.coefficients:
                                 c.coefficients[l_no] = c.coefficients[pm_no]
+            # Validate coefficient keys to ensure they are properly mapped
+            for c in stored_constraints:
+                invalid_keys = []
+                for k in c.coefficients.keys():
+                    if not (k.startswith("0x") or "_" in k or len(k) > 20):
+                        invalid_keys.append(k)
+                if invalid_keys:
+                    logger.warning("Constraint has potentially unmapped/invalid token IDs", constraint_id=c.constraint_id, invalid_keys=invalid_keys)
 
             # Create manifest
+
             manifest = ConstraintManifest(
                 cluster_id=cluster.cluster_id,
                 topic=cluster.topic,
                 market_ids=market_ids,
                 market_exchanges=market_exchanges,
+                market_titles=market_titles,
                 constraints=stored_constraints,
                 dependencies=stored_dependencies,
                 correlations=correlations,

@@ -118,7 +118,9 @@ class ApiService {
             newState.opportunities.length !== this.state.opportunities.length ||
             newState.trades_executed.length !== this.state.trades_executed.length ||
             newState.pipeline_stage !== this.state.pipeline_stage ||
-            (newState.pipeline_events?.length || 0) !== (this.state.pipeline_events?.length || 0)
+            (newState.pipeline_events?.length || 0) !== (this.state.pipeline_events?.length || 0) ||
+            ((newState.pipeline_events?.length ? newState.pipeline_events[newState.pipeline_events.length - 1].timestamp : "") !==
+             (this.state.pipeline_events?.length ? this.state.pipeline_events[this.state.pipeline_events.length - 1].timestamp : ""))
         );
     }
 
