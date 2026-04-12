@@ -21,7 +21,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 from pathlib import Path
-from polyquant.api.server import monitor
 
 import numpy as np
 try:
@@ -112,6 +111,39 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _get_monitor() -> Any:
+    try:
+        from polyquant.api.server import monitor as _m
+        return _m
+    except Exception:
+        return None
+
+
+async def _notify_llm_progress(stage: str, *, done: int, total: int | None = None, current: str = "") -> None:
+    m = _get_monitor()
+    if m is None:
+        return
+    try:
+        if total is not None:
+            await m.update_llm_progress(stage, done=done, total=total, current=current)
+        else:
+            await m.update_llm_progress(stage, done=done, current=current)
+    except Exception:
+        pass
+
+
+async def _notify_mapped_pair(ui_pair: dict) -> None:
+    m = _get_monitor()
+    if m is None:
+        return
+    try:
+        current_pairs = list(m.state.mapped_pairs)
+        current_pairs.append(ui_pair)
+        await m.update_status(mapped_pairs=current_pairs)
+    except Exception:
+        pass
+
+
 def _limitless_dollars(market: dict) -> Tuple[float, float]:
     """Return (volume, liquidity) in dollars, handling raw micro-USDC."""
     try:
@@ -130,7 +162,17 @@ class ExchangeMatcher:
     def __init__(self):
         self._accepted: Dict[str, _AcceptedEntry] = {}
         self._rejected: Dict[str, _RejectedEntry] = {}
+        self._model: Any = None
         self._load_cache()
+
+    def _get_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        if SentenceTransformer is None:
+            return None
+        logger.info("Loading semantic embedding model (all-MiniLM-L6-v2)...")
+        self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        return self._model
 
     # ------------------------------------------------------------------ cache
 
@@ -199,8 +241,8 @@ class ExchangeMatcher:
 
     # ----------------------------------------------------------- fetch markets
 
-    async def _fetch_polymarket(self) -> tuple[list, int]:
-        markets: list = []
+    async def _fetch_polymarket(self) -> tuple[list[Any], int]:
+        markets: list[Any] = []
         async with PolymarketClient() as p_client:
             offset = 0
             page_size = 500
@@ -309,11 +351,14 @@ class ExchangeMatcher:
         limit_fps: list[Fingerprint] = [fingerprint_limitless(m) for m in limit_markets]
 
         # ---------- Layer 2: question-only embeddings ----------
-        logger.info("Layer 2: Loading semantic embedding model (all-MiniLM-L6-v2)...")
         try:
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            model = self._get_model()
         except Exception as e:
             logger.error(f"Failed to load semantic model: {e}")
+            pipeline_stats["total_pairs_after"] = len(self._accepted)
+            return self.mapped_pairs, pipeline_stats
+        if model is None:
+            logger.error("Semantic model unavailable; returning cached pairs only.")
             pipeline_stats["total_pairs_after"] = len(self._accepted)
             return self.mapped_pairs, pipeline_stats
 
@@ -353,8 +398,14 @@ class ExchangeMatcher:
         logger.info(f"Bidirectional top-K union: {len(candidate_pairs)} raw candidate pairs")
 
         # ---------- Apply Layer 1 prefilter, rejection cache, accepted skip ----------
-        survivors: list[tuple[int, int, float]] = []  # (p_idx, l_idx, sim)
-        for (p_idx, l_idx), sim in candidate_pairs.items():
+        # Iterate in similarity-desc order and keep only the best candidate per
+        # Polymarket market — subsequent alternates would be discarded anyway by
+        # the post-LLM leader-wins guard, so we save LLM spend up front.
+        survivors: list[tuple[int, int, float]] = []
+        seen_poly: set[str] = set()
+        for (p_idx, l_idx), sim in sorted(
+            candidate_pairs.items(), key=lambda kv: kv[1], reverse=True
+        ):
             p_market = poly_markets[p_idx]
             l_market = limit_markets[l_idx]
             l_id = l_market.get("id") or l_market.get("marketId")
@@ -362,6 +413,8 @@ class ExchangeMatcher:
                 continue
             # Already accepted? (Polymarket id already mapped)
             if p_market.market_id in self._accepted:
+                continue
+            if p_market.market_id in seen_poly:
                 continue
             # Already rejected?
             if f"{p_market.market_id}|{l_id}" in self._rejected:
@@ -372,11 +425,7 @@ class ExchangeMatcher:
                 pipeline_stats["prefilter_dropped"] += 1
                 continue
             survivors.append((p_idx, l_idx, sim))
-
-        # Sort survivors by similarity desc so the highest-confidence pair for each
-        # Polymarket is verified first; subsequent candidates for the same Polymarket
-        # only matter if the leader rejects.
-        survivors.sort(key=lambda x: x[2], reverse=True)
+            seen_poly.add(p_market.market_id)
 
         # Drop pairs below the LLM-verify floor
         to_verify = [(p, l, s) for (p, l, s) in survivors if s >= SIMILARITY_VERIFY]
@@ -396,9 +445,7 @@ class ExchangeMatcher:
         )
         pipeline_stats["llm_verifications_sent"] = len(to_verify)
 
-        await monitor.update_llm_progress(
-            "MATCHING", done=0, total=len(to_verify), current=""
-        )
+        await _notify_llm_progress("MATCHING", done=0, total=len(to_verify), current="")
 
         sem = asyncio.Semaphore(LLM_RPS_SEMAPHORE)
         completed = 0
@@ -423,6 +470,7 @@ class ExchangeMatcher:
                 ),
                 l_end=l_market.get("expirationDate", "")
                 or l_market.get("expirationTimestamp", "")
+                or l_market.get("endDate", "")
                 or "Not specified",
             )
             async with sem:
@@ -439,14 +487,11 @@ class ExchangeMatcher:
                     res = e
             async with completed_lock:
                 completed += 1
-                try:
-                    await monitor.update_llm_progress(
-                        "MATCHING",
-                        done=completed,
-                        current=(l_market.get("title", "") or "")[:60],
-                    )
-                except Exception:
-                    pass
+                await _notify_llm_progress(
+                    "MATCHING",
+                    done=completed,
+                    current=(l_market.get("title", "") or "")[:60],
+                )
             return p_idx, l_idx, sim, res
 
         results = await asyncio.gather(
@@ -496,6 +541,13 @@ class ExchangeMatcher:
                     "similarity": round(sim, 3),
                     "method": "LLM Verified",
                 })
+                await _notify_mapped_pair({
+                    "polymarket_question": p_market.question,
+                    "limitless_title": l_market.get("title", ""),
+                    "polymarket_id": p_market.market_id,
+                    "limitless_id": l_id,
+                    "similarity": round(sim, 2),
+                })
                 logger.info(
                     f"MATCH [{sim:.2f}]: {p_market.question[:40]} == {l_market.get('title', '')[:40]}"
                 )
@@ -508,17 +560,6 @@ class ExchangeMatcher:
                 )
                 pipeline_stats["llm_matches_rejected"] += 1
                 pipeline_stats["new_rejections_cached"] += 1
-
-                ui_pair = {
-                    "polymarket_question": p_market.question,
-                    "limitless_title": l_market.get("title", ""),
-                    "polymarket_id": p_market.market_id,
-                    "limitless_id": l_id,
-                    "similarity": round(sim, 2),
-                }
-                current_pairs = list(monitor.state.mapped_pairs)
-                current_pairs.append(ui_pair)
-                asyncio.create_task(monitor.update_status(mapped_pairs=current_pairs))
 
         if pipeline_stats["new_pairs_found"] or pipeline_stats["new_rejections_cached"]:
             self._save_cache()
