@@ -1,89 +1,139 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::Utc;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::models::JournalEntry;
 
+const JOURNAL_CHANNEL_CAPACITY: usize = 1024;
+const ASYNC_BATCH_LIMIT: usize = 64;
+
 /// Append-only JSONL crash-recovery journal.
 ///
-/// Safety-critical writes (`log_pre_submit`) are synchronous: they flush to
-/// disk before returning so that intent is durable before the HTTP call.
+/// All writes go through a single shared `BufWriter<File>` guarded by a
+/// `Mutex`, so sync and async writers cannot interleave at byte boundaries.
+///
+/// Safety-critical writes (`log_pre_submit`) are synchronous: they take the
+/// lock, write, and flush before returning so intent is durable before the
+/// HTTP call.
 ///
 /// Non-critical writes (`log_post_submit`, `log_nonce`, `log_error`) are
-/// sent through an async mpsc channel to a background writer, unblocking the
-/// Tokio executor threads.
+/// sent through a *bounded* mpsc channel to a background writer thread. If
+/// the channel fills (disk stall), entries are dropped and counted; the
+/// caller can inspect `dropped_count()` to trigger an operator halt.
 pub struct CrashJournal {
-    /// Synchronous writer for safety-critical entries (pre_submit).
-    sync_writer: Mutex<BufWriter<File>>,
-    /// Async channel sender for non-critical entries.
-    async_tx: mpsc::UnboundedSender<JournalEntry>,
+    writer: Arc<Mutex<BufWriter<File>>>,
+    async_tx: mpsc::Sender<JournalEntry>,
+    dropped_count: Arc<AtomicU64>,
 }
 
 impl CrashJournal {
     pub fn open(path: &str) -> Result<Self> {
-        // Sync writer: used only for pre_submit (safety-critical, must fsync before HTTP)
-        let sync_file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        let sync_writer = Mutex::new(BufWriter::new(sync_file));
+        let writer = Arc::new(Mutex::new(BufWriter::new(file)));
 
-        // Async writer: background thread for post_submit, nonce, error entries
-        let async_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        let (async_tx, async_rx) = mpsc::unbounded_channel::<JournalEntry>();
-        Self::spawn_async_writer(async_file, async_rx);
+        let (async_tx, async_rx) = mpsc::channel::<JournalEntry>(JOURNAL_CHANNEL_CAPACITY);
+        let dropped_count = Arc::new(AtomicU64::new(0));
+
+        Self::spawn_async_writer(Arc::clone(&writer), async_rx);
 
         Ok(CrashJournal {
-            sync_writer,
+            writer,
             async_tx,
+            dropped_count,
         })
     }
 
-    /// Spawn a background thread (via spawn_blocking) that drains the async
-    /// channel and writes entries to disk. Flushes after each batch.
-    fn spawn_async_writer(file: File, mut rx: mpsc::UnboundedReceiver<JournalEntry>) {
+    /// Background OS thread that drains the async channel and writes through
+    /// the shared `BufWriter`. Batches up to `ASYNC_BATCH_LIMIT` entries per
+    /// flush to amortize lock + flush cost.
+    fn spawn_async_writer(
+        writer: Arc<Mutex<BufWriter<File>>>,
+        mut rx: mpsc::Receiver<JournalEntry>,
+    ) {
         std::thread::spawn(move || {
-            let mut writer = BufWriter::new(file);
-            // Block on channel recv in a dedicated OS thread (not Tokio worker)
-            while let Some(entry) = rx.blocking_recv() {
-                if let Ok(line) = serde_json::to_string(&entry) {
-                    let _ = writeln!(writer, "{}", line);
-                }
-                // Drain any buffered entries before flushing
-                while let Ok(entry) = rx.try_recv() {
-                    if let Ok(line) = serde_json::to_string(&entry) {
-                        let _ = writeln!(writer, "{}", line);
+            while let Some(first) = rx.blocking_recv() {
+                let mut batch: Vec<JournalEntry> = Vec::with_capacity(ASYNC_BATCH_LIMIT);
+                batch.push(first);
+                while batch.len() < ASYNC_BATCH_LIMIT {
+                    match rx.try_recv() {
+                        Ok(entry) => batch.push(entry),
+                        Err(_) => break,
                     }
                 }
-                let _ = writer.flush();
+
+                match writer.lock() {
+                    Ok(mut w) => {
+                        for entry in &batch {
+                            match serde_json::to_string(entry) {
+                                Ok(line) => {
+                                    if let Err(e) = writeln!(w, "{}", line) {
+                                        error!("journal async writeln failed: {:?}", e);
+                                    }
+                                }
+                                Err(e) => error!("journal async serialize failed: {:?}", e),
+                            }
+                        }
+                        if let Err(e) = w.flush() {
+                            error!("journal async flush failed: {:?}", e);
+                        }
+                    }
+                    Err(e) => {
+                        error!("journal writer lock poisoned in async thread: {:?}", e);
+                        break;
+                    }
+                }
             }
         });
     }
 
-    /// Synchronous write + flush. Used ONLY for safety-critical pre_submit entries.
     fn write_entry_sync(&self, entry: &JournalEntry) -> Result<()> {
         let line = serde_json::to_string(entry)?;
-        let mut writer = self
-            .sync_writer
+        let mut w = self
+            .writer
             .lock()
             .map_err(|e| anyhow::anyhow!("journal lock poisoned: {}", e))?;
-        writeln!(writer, "{}", line)?;
-        writer.flush()?;
+        writeln!(w, "{}", line)?;
+        w.flush()?;
         Ok(())
     }
 
-    /// Async write via mpsc channel. Non-blocking for the caller.
     fn write_entry_async(&self, entry: JournalEntry) {
-        if let Err(e) = self.async_tx.send(entry) {
-            error!("journal async send failed: {:?}", e);
+        match self.async_tx.try_send(entry) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let prev = self.dropped_count.fetch_add(1, Ordering::Relaxed);
+                if prev % 100 == 0 {
+                    warn!(
+                        "journal async channel full; dropped {} entries (cumulative)",
+                        prev + 1
+                    );
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("journal async channel closed");
+            }
+        }
+    }
+
+    /// Number of async entries dropped due to channel backpressure.
+    /// Used by the main loop to trigger a halt if it grows too fast.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_count.load(Ordering::Relaxed)
+    }
+
+    /// Force-flush the underlying writer. Called by the graceful shutdown path.
+    pub fn flush(&self) {
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.flush();
         }
     }
 
@@ -111,6 +161,7 @@ impl CrashJournal {
             error: None,
             http_status: None,
             response_body: None,
+            nonce: None,
         };
         if let Err(e) = self.write_entry_sync(&entry) {
             error!("journal sync write failed: {:?}", e);
@@ -146,6 +197,7 @@ impl CrashJournal {
             error: None,
             http_status,
             response_body: response_body.map(|s| s.to_string()),
+            nonce: None,
         };
         self.write_entry_async(entry);
     }
@@ -159,7 +211,7 @@ impl CrashJournal {
             exchange: exchange.into(),
             outcome_id: outcome_id.into(),
             side: String::new(),
-            size: nonce.to_string(),
+            size: String::new(),
             limit_price: String::new(),
             order_id: None,
             filled_size: None,
@@ -167,6 +219,7 @@ impl CrashJournal {
             error: None,
             http_status: None,
             response_body: None,
+            nonce: Some(nonce),
         };
         self.write_entry_async(entry);
     }
@@ -195,6 +248,7 @@ impl CrashJournal {
             error: Some(error_msg.into()),
             http_status,
             response_body: response_body.map(|s| s.to_string()),
+            nonce: None,
         };
         self.write_entry_async(entry);
     }

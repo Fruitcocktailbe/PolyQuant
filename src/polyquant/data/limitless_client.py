@@ -109,7 +109,7 @@ class LimitlessClient:
                     
         raise last_error # type: ignore
 
-    async def get_markets(self, limit: int = 20) -> List[Dict[str, Any]]:
+    async def get_markets(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Fetch all active markets from Limitless via pagination."""
         all_markets = []
         page = 1

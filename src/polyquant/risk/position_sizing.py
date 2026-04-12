@@ -54,12 +54,10 @@ USAGE:
 
 import math
 from collections import deque
-from decimal import Decimal
 from typing import NamedTuple
 
 from pydantic import BaseModel, Field
 
-from polyquant.data import OrderBook, ProposedTrade
 from polyquant.utils import config, get_logger
 
 logger = get_logger(__name__)
@@ -282,46 +280,6 @@ class PositionSizer:
             probability=probability,
             expected_value=ev,
         )
-    
-    def calculate_for_trade(
-        self,
-        trade: ProposedTrade,
-        order_book: OrderBook,
-        probability: float,
-    ) -> PositionSize:
-        """
-        Calculate position size for a specific proposed trade.
-        
-        Convenience method that extracts odds from the order book.
-        
-        Args:
-            trade: The proposed trade
-            order_book: Current order book
-            probability: Estimated probability
-            
-        Returns:
-            PositionSize recommendation
-        """
-        # Calculate odds from order book prices
-        if trade.side.value == "buy":
-            price = order_book.best_ask or 0.5
-            # Buying at 'price' to win 1: odds = 1/price
-            odds = 1.0 / price if price > 0 else 2.0
-        else:
-            price = order_book.best_bid or 0.5
-            # Selling at 'price': we get price, win (1-price) if outcome doesn't happen
-            odds = price / (1 - price) if price < 1 else 1.0
-        
-        # Get order book depth
-        if trade.side.value == "buy":
-            depth = order_book.total_ask_depth()
-        else:
-            depth = order_book.total_bid_depth()
-        
-        # Convert share depth to dollar depth
-        dollar_depth = depth * price if depth else 0
-        
-        return self.calculate_size(probability, odds, dollar_depth)
     
     def calculate_dutching_sizes(
         self,

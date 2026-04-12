@@ -108,7 +108,11 @@ class TradeExecutor:
             paper_mode=self._paper_mode,
         )
     
-    async def execute_atomic(self, result: OptimizationResult) -> ExecutionResult:
+    async def execute_atomic(
+        self,
+        result: OptimizationResult,
+        signal_timestamp_us: int | None = None,
+    ) -> ExecutionResult:
         """
         Execute all trades atomically or none.
 
@@ -197,7 +201,11 @@ class TradeExecutor:
             )
 
             # Week 4: Execute trades within group in parallel (independent)
-            group_fills = await self._execute_batch(priority_group, leg_counter)
+            group_fills = await self._execute_batch(
+                priority_group,
+                leg_counter,
+                signal_timestamp_us=signal_timestamp_us,
+            )
 
             # Check if any trade in the batch failed
             if len(group_fills) != len(priority_group):
@@ -345,6 +353,7 @@ class TradeExecutor:
         self,
         trades: list[ProposedTrade],
         start_leg_idx: int = 0,
+        signal_timestamp_us: int | None = None,
     ) -> list[Fill]:
         """
         Execute a batch of trades via the Rust OMS Sidecar.
@@ -352,6 +361,10 @@ class TradeExecutor:
         Args:
             trades: List of trades to execute
             start_leg_idx: Starting leg index for logging
+            signal_timestamp_us: Microsecond timestamp of the originating
+                price signal. Forwarded to the Rust sidecar so it can reject
+                stale opportunities. Falls back to dispatch time if None,
+                which effectively disables the staleness check.
 
         Returns:
             List of successful fills (may be shorter than trades if some failed)
@@ -373,7 +386,10 @@ class TradeExecutor:
 
         logger.info("Dispatching to Rust OMS Sidecar", trades=len(trades))
 
-        resp = self._rust_client.dispatch_trades(trades)
+        resp = self._rust_client.dispatch_trades(
+            trades,
+            signal_timestamp_us=signal_timestamp_us,
+        )
 
         if not resp:
             logger.error("No response from Rust OMS (timeout or connection error)")

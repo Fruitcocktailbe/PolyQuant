@@ -39,8 +39,20 @@ pub struct LimitlessConfig {
     pub nonce: AtomicU64,
     /// Cache of EIP-712 domains keyed by verifying contract address.
     pub domain_cache: Mutex<HashMap<Address, Eip712Domain>>,
+    /// P0-1: cached slug → exchange-contract address. Avoids the per-trade
+    /// `GET /markets/{slug}` HTTP round trip (50–200 ms each).
+    pub market_contract_cache: Mutex<HashMap<String, Address>>,
+    /// P0-6: allow-list of legitimate Limitless CTF exchange contracts. If
+    /// non-empty, market lookups whose `exchangeContract` is not in this set
+    /// are rejected. Empty = no allow-listing (legacy behavior).
+    pub exchange_contract_allowlist: Vec<Address>,
     /// Serialize concurrent nonce resync attempts to prevent race conditions.
     pub nonce_resync_lock: tokio::sync::Mutex<()>,
+    /// P0-3: consecutive failure counter. Reset on any successful submit.
+    /// When this exceeds `consecutive_failure_halt_threshold`, the sidecar
+    /// halts itself so an operator can investigate before nonce drift becomes
+    /// catastrophic.
+    pub consecutive_failures: AtomicU64,
 }
 
 /// Cached response entry for idempotency deduplication.
@@ -65,6 +77,9 @@ pub struct SharedState {
     pub halt_tx: watch::Sender<bool>,
     /// Watch channel receiver (clone for each spawned task).
     pub halt_rx: watch::Receiver<bool>,
+    /// P0-3: number of consecutive Limitless failures that trips an automatic
+    /// halt. Default 10. Set via `OMS_CONSECUTIVE_FAILURE_HALT`.
+    pub consecutive_failure_halt_threshold: u64,
 }
 
 impl SharedState {
@@ -137,6 +152,11 @@ pub fn init_shared_state() -> Result<Arc<SharedState>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(500_000); // 500ms default (was 5s — far too generous for HFT)
 
+    let consecutive_failure_halt_threshold: u64 = env::var("OMS_CONSECUTIVE_FAILURE_HALT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
     let (halt_tx, halt_rx) = watch::channel(false);
 
     Ok(Arc::new(SharedState {
@@ -150,6 +170,7 @@ pub fn init_shared_state() -> Result<Arc<SharedState>> {
         dedup_cache: Mutex::new(HashMap::new()),
         halt_tx,
         halt_rx,
+        consecutive_failure_halt_threshold,
     }))
 }
 
@@ -215,6 +236,32 @@ fn init_limitless() -> Result<Option<LimitlessConfig>> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // P0-6: parse the comma-separated allow-list. An empty value disables
+    // allow-listing entirely (legacy behavior). Bad addresses fail startup
+    // loudly rather than silently dropping the protection.
+    let exchange_contract_allowlist: Vec<Address> =
+        match env::var("LIMITLESS_ALLOWED_EXCHANGE_CONTRACTS") {
+            Ok(s) if !s.trim().is_empty() => s
+                .split(',')
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .map(Address::from_str)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
+    if exchange_contract_allowlist.is_empty() {
+        info!(
+            "Limitless exchange-contract allow-list is empty — accepting any \
+             exchangeContract returned by the market API. Set \
+             LIMITLESS_ALLOWED_EXCHANGE_CONTRACTS for production."
+        );
+    } else {
+        info!(
+            "Limitless exchange-contract allow-list: {} entries",
+            exchange_contract_allowlist.len()
+        );
+    }
+
     Ok(Some(LimitlessConfig {
         api_url: env::var("LIMITLESS_API_URL")
             .unwrap_or_else(|_| "https://api.limitless.exchange/v1".to_string()),
@@ -226,6 +273,9 @@ fn init_limitless() -> Result<Option<LimitlessConfig>> {
         rpc_fallback_urls,
         nonce: AtomicU64::new(0),
         domain_cache: Mutex::new(HashMap::new()),
+        market_contract_cache: Mutex::new(HashMap::new()),
+        exchange_contract_allowlist,
         nonce_resync_lock: tokio::sync::Mutex::new(()),
+        consecutive_failures: AtomicU64::new(0),
     }))
 }

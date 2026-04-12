@@ -10,8 +10,8 @@ use alloy::sol_types::SolStruct;
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderValue};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
 use serde_json::Value;
 use sha2::Sha256;
 use tracing::{debug, info};
@@ -21,6 +21,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 
 use crate::config::SharedState;
 use crate::models::{Fill, OrderSide, ProposedTrade};
+use crate::util::truncate_safely;
 
 sol! {
     #[derive(Debug, Default)]
@@ -48,7 +49,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
         .as_ref()
         .ok_or_else(|| anyhow!("Polymarket not configured"))?;
 
-    let side_str = format!("{:?}", trade.side);
+    let side_str = trade.side.as_str();
 
     // Parse price/size with exact decimal arithmetic (no f64 precision loss)
     let price = Decimal::from_str(&trade.limit_price)
@@ -79,16 +80,21 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
     let expiration = now.checked_add(60).ok_or_else(|| anyhow!("timestamp overflow"))?;
     let salt = Uuid::new_v4().as_u128(); // Full 128-bit entropy (was truncated to u64)
 
+    // P1-7: parse tokenId explicitly so we surface a real error instead of
+    // signing an order with tokenId=0 (which the exchange rejects with a
+    // confusing message).
+    let token_id = U256::from_str_radix(
+        trade.outcome_id.trim_start_matches("0x"),
+        if trade.outcome_id.starts_with("0x") { 16 } else { 10 },
+    )
+    .map_err(|e| anyhow!("invalid outcome_id '{}': {}", trade.outcome_id, e))?;
+
     let order = Order {
         salt: U256::from(salt),
         maker: poly.maker_address,
         signer: poly.maker_address,
         taker: Address::ZERO,
-        tokenId: U256::from_str_radix(
-            trade.outcome_id.trim_start_matches("0x"),
-            if trade.outcome_id.starts_with("0x") { 16 } else { 10 },
-        )
-        .unwrap_or(U256::ZERO),
+        tokenId: token_id,
         makerAmount: U256::from(maker_amount),
         takerAmount: U256::from(taker_amount),
         expiration: U256::from(expiration),
@@ -154,7 +160,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
     state.journal.log_pre_submit(
         "polymarket",
         &trade.outcome_id,
-        &side_str,
+        side_str,
         &trade.size,
         &trade.limit_price,
     );
@@ -179,7 +185,7 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
 
     // Check HTTP status
     if http_status >= 400 {
-        let err_msg = format!("http_{}: {}", http_status, &res_text[..res_text.len().min(200)]);
+        let err_msg = format!("http_{}: {}", http_status, truncate_safely(&res_text, 200));
         state.journal.log_error(
             "polymarket",
             &trade.outcome_id,
@@ -201,43 +207,76 @@ pub async fn execute(trade: &ProposedTrade, state: &Arc<SharedState>) -> Result<
     let order_id = res_json["orderID"].as_str().unwrap_or("").to_string();
     let status = res_json["status"].as_str().unwrap_or("");
 
-    let final_filled_size = if status == "matched" {
-        size.to_string()
-    } else {
-        "0".to_string()
+    // P1-6 (Polymarket): trust the response. The CLOB returns takingAmount /
+    // makingAmount in 1e6 USDC units; recover the filled size by dividing by
+    // the scale, and the actual fill price by dividing maker against taker.
+    let taking_amount = res_json["takingAmount"]
+        .as_str()
+        .and_then(|s| Decimal::from_str(s).ok());
+    let making_amount = res_json["makingAmount"]
+        .as_str()
+        .and_then(|s| Decimal::from_str(s).ok());
+    let scale_dec = Decimal::from(1_000_000u64);
+
+    let (final_filled_size, final_filled_price) = match (taking_amount, making_amount, is_buy) {
+        // BUY: makingAmount = USDC paid, takingAmount = tokens received.
+        // size  = takingAmount / 1e6
+        // price = makingAmount / takingAmount
+        (Some(t), Some(m), true) if !t.is_zero() => {
+            let filled_size = (t / scale_dec).to_string();
+            let filled_price = (m / t).to_string();
+            (filled_size, filled_price)
+        }
+        // SELL: makingAmount = tokens sent, takingAmount = USDC received.
+        // size  = makingAmount / 1e6
+        // price = takingAmount / makingAmount
+        (Some(t), Some(m), false) if !m.is_zero() => {
+            let filled_size = (m / scale_dec).to_string();
+            let filled_price = (t / m).to_string();
+            (filled_size, filled_price)
+        }
+        // Fall back to status-based heuristic only if amounts are missing.
+        _ => {
+            if status == "matched" {
+                (size.to_string(), price.to_string())
+            } else {
+                ("0".to_string(), price.to_string())
+            }
+        }
     };
 
     // Journal: result
     state.journal.log_post_submit(
         "polymarket",
         &trade.outcome_id,
-        &side_str,
+        side_str,
         &trade.size,
         &trade.limit_price,
         &order_id,
         &final_filled_size,
-        &price.to_string(),
+        &final_filled_price,
         Some(http_status),
         Some(&res_text),
     );
 
-    let error = if status == "matched" {
+    let filled_dec = Decimal::from_str(&final_filled_size).unwrap_or(Decimal::ZERO);
+    let error = if !filled_dec.is_zero() {
         String::new()
     } else if !order_id.is_empty() {
-        format!("order_status: {}", status)
+        format!("zero_fill_status: {}", status)
     } else {
         "no_order_id_returned".into()
     };
 
     info!(
-        "Polymarket order: id={} status={} filled={}",
-        order_id, status, final_filled_size
+        "Polymarket order: id={} status={} filled={} price={}",
+        order_id, status, final_filled_size, final_filled_price
     );
 
     Ok(Fill {
         trade: trade.clone(),
-        filled_size: final_filled_size.to_string(),
-        filled_price: price.to_string(),
+        filled_size: final_filled_size,
+        filled_price: final_filled_price,
         order_id,
         error,
     })
