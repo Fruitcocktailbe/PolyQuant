@@ -24,17 +24,17 @@ def test_calculate_dutching_sizes_valid_arb():
     depth_list = [500.0, 1000.0]
     
     sizes = sizer.calculate_dutching_sizes(odds_list, depth_list)
-    
+
     assert len(sizes) == 2
-    
-    # Verify Limitless YES stake is exactly 250 (bottleneck hit)
-    assert math.isclose(sizes[0].recommended_size, 250.0, rel_tol=1e-5)
+
+    # Verify Limitless YES: $250 stake at $0.40/share = 625 shares (bottleneck hit)
+    assert math.isclose(sizes[0].recommended_size, 625.0, rel_tol=1e-5)
     assert sizes[0].limited_by == "leg_0_liquidity"
-    
-    # Verify Polymarket NO stake is exactly 312.50
-    # (T = 562.5, NO prob = 0.5, Stake = 562.5 * 0.5 / 0.9 = 312.50)
-    assert math.isclose(sizes[1].recommended_size, 312.50, rel_tol=1e-5)
-    
+
+    # Verify Polymarket NO: $312.50 stake at $0.50/share = 625 shares
+    # (T = 562.5, NO prob = 0.5, Stake = 562.5 * 0.5 / 0.9 = 312.50; shares = 312.50/0.5)
+    assert math.isclose(sizes[1].recommended_size, 625.0, rel_tol=1e-5)
+
     # Verify expected values are 11.11% profit margin
     expected_margin = (1.0 / 0.9) - 1.0
     assert math.isclose(sizes[0].expected_value, expected_margin, rel_tol=1e-5)
@@ -85,13 +85,16 @@ def test_calculate_dutching_roi():
     expected_roi = (1.0 / 0.9) - 1.0
     assert math.isclose(sizes[0].expected_value, expected_roi, rel_tol=1e-5)
 
+    # Reconstruct dollar stakes from shares: dollar_stake = shares * price = shares * probability
     # Total capital deployed = 250 + 312.50 = 562.50
     # Expected profit = 562.50 * 0.1111 = 62.50
     # ROI = 62.50 / 562.50 = 0.1111
-    total_stake = sizes[0].recommended_size + sizes[1].recommended_size
-    expected_profit = total_stake * expected_roi
-    calculated_roi = expected_profit / total_stake
+    dollar_stakes = [s.recommended_size * s.probability for s in sizes]
+    total_dollar_stake = sum(dollar_stakes)
+    expected_profit = total_dollar_stake * expected_roi
+    calculated_roi = expected_profit / total_dollar_stake
     assert math.isclose(calculated_roi, expected_roi, rel_tol=1e-5)
+    assert math.isclose(total_dollar_stake, 562.50, rel_tol=1e-5)
 
 
 def test_dutching_liquidity_cushion():
@@ -111,8 +114,8 @@ def test_dutching_liquidity_cushion():
     sizes = sizer.calculate_dutching_sizes(odds_list, depth_list)
 
     # Verify sizing is constrained by low depth
-    # Max take from leg 0: 300 * 0.3 = 90
-    assert math.isclose(sizes[0].recommended_size, 90.0, rel_tol=1e-5)
+    # Max dollar take from leg 0: 300 * 0.3 = 90 → 90 / 0.40 price = 225 shares
+    assert math.isclose(sizes[0].recommended_size, 225.0, rel_tol=1e-5)
     assert sizes[0].limited_by == "leg_0_liquidity"
 
 
@@ -146,10 +149,14 @@ def test_partition_size_limit():
     for size_res in sizes:
         assert size_res.recommended_size > 0
 
-    # Verify proportional allocation (legs with higher implied prob get more stake)
-    # p_i = 1/(odds_i + 1)
-    # For odds=5.666, p=0.15; for odds=4.0, p=0.20
-    # Ratio of stakes should match ratio of implied probs
-    stake_ratio = sizes[0].recommended_size / sizes[2].recommended_size
+    # Verify equal-shares property of dutching: shares_i = stake_i / p_i and
+    # stake_i = T * (p_i / sum_implied), so shares_i = T / sum_implied — identical for every leg.
+    # This is the core dutching invariant: equal shares → equal $1 payout on any winning outcome.
+    share_ratio = sizes[0].recommended_size / sizes[2].recommended_size
+    assert math.isclose(share_ratio, 1.0, rel_tol=1e-5)
+
+    # Dollar stakes (reconstructed) should still match the probability ratio.
+    dollar_stake_0 = sizes[0].recommended_size * sizes[0].probability
+    dollar_stake_2 = sizes[2].recommended_size * sizes[2].probability
     prob_ratio = 0.15 / 0.20  # 0.75
-    assert math.isclose(stake_ratio, prob_ratio, rel_tol=1e-2)
+    assert math.isclose(dollar_stake_0 / dollar_stake_2, prob_ratio, rel_tol=1e-2)

@@ -180,6 +180,11 @@ class MapMaker:
             # ================================================================
             # Clear previous run's events and emit start banner
             monitor.state.pipeline_events = []
+            # Reset both progress buckets so a fresh run starts from 0/0
+            await monitor.update_status(llm_progress={
+                "LOGIC":    {"done": 0, "total": 0, "current": ""},
+                "MATCHING": {"done": 0, "total": 0, "current": ""},
+            })
             print(f"\n{'='*60}")
             print(f"  \U0001f680 MAP MAKER STARTED — {start_time.strftime('%H:%M:%S UTC')}")
             print(f"{'='*60}")
@@ -243,6 +248,9 @@ class MapMaker:
                 cache_hits = 0
 
                 total_clusters = len(clusters)
+                await monitor.update_llm_progress(
+                    "LOGIC", done=0, total=total_clusters, current=""
+                )
                 
                 # Helper to update a single cluster's status in the UI
                 async def update_ui_cluster_status(cid: str, new_status: str):
@@ -260,8 +268,12 @@ class MapMaker:
                         cluster_id=cluster.cluster_id,
                         topic=cluster.topic,
                     )
-                    
+
                     await update_ui_cluster_status(cluster.cluster_id, "Analyzing (LLM)...")
+                    # Surface which cluster is currently being analyzed (before LLM call starts)
+                    await monitor.update_llm_progress(
+                        "LOGIC", current=cluster.topic[:80]
+                    )
 
                     print(f"\n--- \U0001f9e9 LOGIC [{idx}/{total_clusters}]: '{cluster.topic}' ({len(cluster.markets)} markets) ---")
                     await monitor.emit_pipeline_event(
@@ -315,6 +327,7 @@ class MapMaker:
                     # Progress percentage
                     progress_pct = (idx / total_clusters) * 100
                     logger.info(f"Progress: {progress_pct:.1f}% complete")
+                    await monitor.update_llm_progress("LOGIC", done=idx)
                 
                 return {
                     "manifests_saved": manifests_saved,
@@ -765,21 +778,32 @@ class MapMaker:
 
 async def main() -> None:
     """Main entry point for the Map Maker."""
+    from polyquant.api.server import monitor, start_api_server
+
     print("""
     ===============================================================
                       PolyQuant Map Maker
               Offline Constraint Analysis Engine
     ===============================================================
     """)
-    
-    async with MapMaker() as map_maker:
-        result = await map_maker.build_map(
-            limit=500,
-            min_liquidity=1000,
-        )
-        
-        report_path = result.get("report_path", "N/A")
-        print(f"\n  Report saved to: {report_path}")
+
+    server, server_task = await start_api_server()
+    await monitor.update_status(status="MAPPING")
+
+    try:
+        async with MapMaker() as map_maker:
+            result = await map_maker.build_map(
+                limit=500,
+                min_liquidity=1000,
+            )
+
+            report_path = result.get("report_path", "N/A")
+            print(f"\n  Report saved to: {report_path}")
+            await monitor.update_status(status="MAPPING_COMPLETE")
+            await asyncio.sleep(5)  # let final WS frames flush to dashboard
+    finally:
+        server.should_exit = True
+        await server_task
 
 
 if __name__ == "__main__":

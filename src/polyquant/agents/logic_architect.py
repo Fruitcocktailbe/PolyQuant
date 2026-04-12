@@ -93,13 +93,6 @@ class LogicalConstraint(BaseModel):
     source_markets: list[str] = Field(default_factory=list)
     reasoning: str = ""
 
-    # Phase 6: Execution metadata
-    liquidity_score: str | None = None         # "high", "medium", "low"
-    min_tradeable_size: float | None = None    # USD, based on order book depth
-    urgency: str | None = None                 # "high", "medium", "low"
-    arbitrage_type: str | None = None          # "buy_all", "sell_all", "price_violation"
-    expected_profit_pct: float | None = None   # Expected profit percentage
-
 
 class AnalysisResult(BaseModel):
     """
@@ -151,11 +144,28 @@ class LogicArchitect:
     # Uses Chain-of-Thought structure for better reasoning
     # System prompt explaining the task to DeepSeek-R1 / Gemini 2.0 Flash Thinking
     # Uses Chain-of-Thought structure for better reasoning
-    ANALYSIS_PROMPT = """You are the **Logic Architect** for a high-frequency arbitrage system trading on Polymarket.
+    ANALYSIS_PROMPT = """You are the **Logic Architect** for a prediction market arbitrage system.
 
 YOUR GOAL:
-Identify **TRADEABLE Logical Constraints** between prediction market outcomes that create arbitrage opportunities.
-Focus on constraints with sufficient liquidity to execute profitably.
+Identify **STRUCTURAL Logical Constraints** between prediction market outcomes —
+mathematical relationships that are TRUE regardless of today's prices.
+
+A constraint like `P(A) + P(B) <= 1` is a structural fact about how A and B
+relate. Whether it's currently profitable to trade against, or whether the
+order book has enough depth right now, is NOT your concern. Live conditions
+(spread, depth, urgency) are evaluated downstream by the execution engine
+when an opportunity actually appears. Your job is to enumerate the structure.
+
+DO NOT filter constraints based on:
+- Current bid-ask spread
+- Current order book depth
+- Time-to-resolution / urgency
+- Whether the current price snapshot looks profitable
+
+DO use prices as a STRUCTURAL inference signal:
+- If you think A implies B, but Price(A) > Price(B), the implication is wrong
+- Use NegRisk price sums to detect partition structure
+- Use SUBSET inequalities (P(A) <= P(B)) to confirm implication direction
 
 ═══════════════════════════════════════════════════════════════
 SECTION 1: POLYMARKET MECHANICS (READ THIS FIRST)
@@ -164,16 +174,15 @@ SECTION 1: POLYMARKET MECHANICS (READ THIS FIRST)
 **NegRisk Markets:**
 - Special market type where outcomes are MUTUALLY EXCLUSIVE + EXHAUSTIVE
 - Prices MUST sum to exactly 1.0 (e.g., all presidential candidates)
-- If price sum < 0.98: **BUY ARBITRAGE opportunity** (underpriced)
-- If price sum > 1.02: **SELL ARBITRAGE opportunity** (overpriced)
 - You will see "TYPE: NegRisk Group <ID>" in market metadata
-- NegRisk markets are the HIGHEST CONFIDENCE constraints (confidence: 0.95+)
+- NegRisk markets are STRUCTURAL partitions — the strongest constraint type
+- Emit them ALWAYS, regardless of whether the current sum deviates from 1.0
 
 **Conditional Markets:**
 - Markets that depend on a parent market resolving first
 - Example: "Will X win IF Y happens?" depends on Y
 - Check for "CONDITIONAL PARENT" in metadata
-- If A is conditional on B, then: P(A) <= P(B) MUST hold
+- If A is conditional on B, then: P(A) <= P(B) MUST hold structurally
 
 **Resolution Mechanics:**
 - Markets resolve based on OFFICIAL sources (not projections)
@@ -182,105 +191,48 @@ SECTION 1: POLYMARKET MECHANICS (READ THIS FIRST)
 - "By end of 2024" means different things for different markets
 
 ═══════════════════════════════════════════════════════════════
-SECTION 2: LIQUIDITY FILTERING (CRITICAL)
-═══════════════════════════════════════════════════════════════
-
-You will receive ORDER BOOK data for each outcome:
-- **Bid/Ask**: Top of the order book (best prices)
-- **Spread**: Ask - Bid (smaller = more liquid)
-- **Depth**: $ available to trade
-
-**LIQUIDITY THRESHOLDS:**
-- **IGNORE** outcomes with "NO ORDER BOOK" or "ILLIQUID" status
-- **IGNORE** outcomes with Spread > 0.10 (too wide, can't profit)
-- **REQUIRE** at least $500 depth on BOTH sides for constraints
-- **PRIORITIZE** constraints where all outcomes have >$2000 depth
-
-**Output Liquidity Scores:**
-For each constraint, include:
-```json
-"liquidity_score": "high",  // "high" (>$2K), "medium" ($500-$2K), "low" (<$500)
-"min_tradeable_size": 1000.00  // USD, based on min depth across all legs
-```
-
-═══════════════════════════════════════════════════════════════
-SECTION 3: RELATIONSHIP TAXONOMY (Enhanced)
+SECTION 2: RELATIONSHIP TAXONOMY
 ═══════════════════════════════════════════════════════════════
 
 **A. MUTUALLY_EXCLUSIVE (Disjoint)**
 Two outcomes cannot BOTH be TRUE.
 Constraint: `z[A] + z[B] <= 1`
-Price Hint: Sum <= 1.0 (e.g., $0.60 + $0.35 = $0.95)
-Liquidity Check: Both outcomes must be tradeable
+Structural test: Reading the descriptions, can both resolve YES simultaneously?
 
 **B. PARTITION (Exhaustive)**
 Outcomes are mutually exclusive AND cover all possibilities.
 Constraint: `sum(z[i]) == 1`
-Price Hint: Sum ~1.0 (tolerance: 0.98-1.02 for FAIR, outside = ARBITRAGE)
-
-**CRITICAL - NegRisk Deviation Detection:**
-For NegRisk markets, ALWAYS flag deviations from 1.0:
-- If sum = 0.95 → "UNDERPRICED_PARTITION, arbitrage_type: buy_all_outcomes, deviation: -5.0%"
-- If sum = 1.04 → "OVERPRICED_PARTITION, arbitrage_type: sell_all_outcomes, deviation: +4.0%"
+Structural test: Do these outcomes form a complete cover of the event space?
+NegRisk markets are always PARTITION — emit unconditionally.
 
 **C. SUBSET (Implication)**
 If A happens, B MUST happen.
-Constraint: `z[A] <= z[B]` or `z[B] - z[A] >= 0`
-Price Hint: P(A) <= P(B) MUST hold (with 2% tolerance for noise)
+Constraint: `z[A] <= z[B]` (equivalently `z[B] - z[A] >= 0`)
+Structural test: Does the description of A logically imply the description of B?
+Sanity check: Price(A) should be <= Price(B). If not, reconsider direction.
 
-**VIOLATION CHECK:**
-If P(A) > P(B) + 0.02, this is INVALID or an arbitrage signal.
-
-Liquidity Check: Sizes must match (can't buy $10k of A if only $2k of B available)
-
-**D. NUMERICAL_DEVIATION (NEW)**
-Price deviations from theoretical relationships.
-Example: "Trump wins PA" at 0.60, "Trump wins election" at 0.55
-Theoretical: P(election) >= P(PA), so this is a 5% violation
-
-Output:
-```json
-{
-    "relationship": "NUMERICAL_DEVIATION",
-    "expected_relationship": "P(election) >= P(PA)",
-    "actual_prices": {"election": 0.55, "PA": 0.60},
-    "price_deviation_pct": 8.3,  // (0.60-0.55)/0.60
-    "arbitrage_signal": "buy election, sell PA"
-}
-```
-
-**E. CAUSAL_GROUP**
+**D. CAUSAL_GROUP**
 Complex multi-market dependencies.
 Example: "Dems win Senate" + "Dems win House" → higher P("Dems win both chambers")
 Use when simple SUBSET/PARTITION doesn't capture the logic.
 
 ═══════════════════════════════════════════════════════════════
-SECTION 4: TIME-TO-RESOLUTION URGENCY
+SECTION 3: USING PRICE/VOLUME DATA (FOR STRUCTURE, NOT FILTERING)
 ═══════════════════════════════════════════════════════════════
 
-Markets closing soon have higher urgency:
-- **<24 hours**: HIGH urgency (immediate arbitrage)
-- **1-7 days**: MEDIUM urgency
-- **>7 days**: LOW urgency (prices may converge naturally)
+You will receive PRICE, VOLUME, and (optionally) ORDER BOOK data.
 
-Include in output:
-```json
-"urgency": "high",  // or "medium" or "low"
-"closes_in_hours": 12.5
-```
-
-═══════════════════════════════════════════════════════════════
-SECTION 5: REAL-WORLD DATA HINTS
-═══════════════════════════════════════════════════════════════
-
-You will receive market data including **PRICE**, **VOLUME**, and **ORDER BOOKS**.
-- **Use Price Checks**: If you think A implies B, but Price(A) > Price(B), **YOU ARE WRONG**. Reject it.
-- **Use Volume**: High volume markets are "truth anchors". Trust them more.
-- **Use Liquidity**: Only create constraints for tradeable outcomes (see SECTION 2)
-- **Ignore Small Gaps**: Prices are noisy. $0.99 + $0.02 = $1.01 might still be a Partition.
+- **Price as a structural signal**: If you think A implies B but Price(A) > Price(B),
+  your hypothesis is probably wrong — reconsider the direction.
+- **Volume as confidence**: High volume markets are "truth anchors". Trust their
+  descriptions over thinly-traded ones when resolving ambiguity.
+- **Ignore small gaps**: Prices are noisy. $0.99 + $0.02 = $1.01 might still be a
+  partition.
+- **DO NOT filter on depth or spread**: Even if a market is currently illiquid,
+  emit the constraint. Future price movement may bring liquidity.
 
 ═══════════════════════════════════════════════════════════════
-SECTION 6: OUTPUT FORMAT
+SECTION 4: OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════════
 
 Output JSON immediately following your `<thinking>` block.
@@ -295,24 +247,18 @@ Output JSON immediately following your `<thinking>` block.
             "target_outcome": "0x... (USE EXACT 42-CHAR TOKEN ID)",
             "relationship": "SUBSET",
             "confidence": 0.95,
-            "reasoning": "If Trump wins PA, he must win the election (PA is subset)",
-            "liquidity_score": "high",
-            "min_tradeable_size": 2000.0,
-            "urgency": "high",
-            "price_deviation_pct": 5.2
+            "reasoning": "If Trump wins PA, he must win the election (PA is subset)"
         }
     ],
     "constraints": [
         {
             "constraint_id": "c1",
-            "description": "NegRisk partition (UNDERPRICED): prices sum to 0.95",
+            "description": "NegRisk partition: outcomes sum to 1",
             "coefficients": {"0x... (USE EXACT TOKEN ID)": 1.0, "0x... (USE EXACT TOKEN ID)": 1.0},
-            "operator": ">=",
-            "rhs": 0.95,
+            "operator": "==",
+            "rhs": 1.0,
             "confidence": 0.98,
-            "arbitrage_type": "buy_all_outcomes",
-            "expected_profit_pct": 5.0,
-            "liquidity_score": "high"
+            "reasoning": "All candidates in NegRisk group X — exhaustive partition"
         }
     ],
     "edge_cases": [
@@ -323,30 +269,23 @@ Output JSON immediately following your `<thinking>` block.
 ```
 
 ═══════════════════════════════════════════════════════════════
-SECTION 7: REASONING PROCESS (Chain-of-Thought)
+SECTION 5: REASONING PROCESS (Chain-of-Thought)
 ═══════════════════════════════════════════════════════════════
 
 Before outputting JSON, you MUST use a `<thinking>` block:
 
-1. **Identify NegRisk Groups**: Find all "TYPE: NegRisk" markets
-2. **Calculate Price Sums**: For each group, sum all outcome prices
-3. **Detect Deviations**: Flag any sums outside 0.98-1.02 range
-4. **Check Liquidity**: Verify min $500 depth on all sides (reject ILLIQUID outcomes)
-5. **Find Implications**: Look for A→B relationships, validate P(A) <= P(B)
-6. **Check Time Urgency**: Flag markets closing <24h
-7. **Verify Execution**: Ensure tradeable sizes match across constraint legs
+1. **Identify NegRisk Groups**: Find all "TYPE: NegRisk" markets — emit a PARTITION constraint for each, unconditionally.
+2. **Find Mutual Exclusions**: Look for outcomes that cannot both resolve YES.
+3. **Find Implications**: Look for A→B relationships. Validate direction with the P(A) <= P(B) sanity check.
+4. **Build constraints**: For each structural relationship, write the linear inequality and the token IDs involved.
 
-═══════════════════════════════════════════════════════════════
 ═══════════════════════════════════════════════════════════════
 CRITICAL RULES:
 ═══════════════════════════════════════════════════════════════
 ✓ ALWAYS use EXACT 42-character Token IDs as keys in coefficients and for outcome strings. NEVER use "outcome1", "Yes", etc.
-✓ ALWAYS check liquidity before creating constraints
-✓ ALWAYS quantify deviations numerically (percentage)
-✓ ALWAYS flag NegRisk price sum deviations
-✓ REJECT constraints with any ILLIQUID outcome or spread > 0.10
-✓ PRIORITIZE constraints with urgency="high"
-✓ Include execution guidance (which direction to trade)
+✓ ALWAYS emit NegRisk partitions unconditionally, regardless of current price sum.
+✓ ALWAYS use prices as a structural sanity check on implication direction.
+✗ NEVER drop a constraint because of current spread, depth, or time-to-resolution. Those are evaluated downstream.
 
 """
 
@@ -424,8 +363,21 @@ CRITICAL RULES:
 
         try:
             response = await self._call_gemini(market_descriptions)
+        except ValueError as e:
+            # Raised by _call_gemini when the LLM returned empty/unparseable JSON
+            # (distinct from transport/network errors below)
+            logger.warning(
+                "LLM returned empty/unparseable JSON - using fallback heuristics",
+                error=str(e),
+                cluster_id=cluster.cluster_id,
+            )
+            return self._apply_fallback_heuristics(cluster)
         except Exception as e:
-            logger.error("Gemini API call failed - using fallback heuristics", error=str(e))
+            logger.error(
+                "LLM transport/network error - using fallback heuristics",
+                error=str(e),
+                cluster_id=cluster.cluster_id,
+            )
             return self._apply_fallback_heuristics(cluster)
         
         # Step 3: Parse the response
@@ -473,90 +425,56 @@ CRITICAL RULES:
     
     def _format_markets(self, markets: list[Market]) -> str:
         """
-        Format market data with comprehensive arbitrage information.
+        Format market data for structural reasoning.
 
-        Phase 3 Enhancement: Includes order books, full resolution criteria (500+ chars),
-        temporal data, and cluster-level hints for better LLM reasoning.
-
-        Includes:
-        - Order book data (bid/ask/spread/depth) for liquidity filtering
-        - Full resolution criteria (500+ chars vs 300)
-        - Temporal data (end_date, hours remaining, urgency)
-        - Market type and conditional parent
-        - Pre-calculated cluster hints (price sums, deviations)
+        Includes prices (for structural sanity checks like P(A) <= P(B)),
+        market type/NegRisk metadata, resolution criteria, and cluster-level
+        price-sum hints. Does NOT include depth/spread filtering signals —
+        liquidity is evaluated downstream by the Navigator at trade time.
         """
         from datetime import datetime
 
         formatted = []
 
-        # Pre-calculate cluster hints (price sums, deviations, urgency)
         cluster_hints = self._calculate_cluster_hints(markets)
 
         for market in markets:
             # === HEADER ===
             header = f"MARKET ID: {market.market_id}"
 
-            # NegRisk + Type metadata
             if market.negrisk:
                 header += f" (TYPE: NegRisk Group {market.group_id or 'Unknown'})"
             if hasattr(market, 'market_type') and market.market_type:
                 header += f" [Type: {market.market_type}]"
 
-            # === TEMPORAL DATA ===
+            # === TEMPORAL DATA (informational, not for filtering) ===
             time_info = f"VOLUME: ${market.volume:,.0f}"
             if market.end_date:
                 now = datetime.utcnow()
                 hours_remaining = (market.end_date - now).total_seconds() / 3600
                 if hours_remaining > 0:
-                    urgency = "HIGH" if hours_remaining < 24 else "MEDIUM" if hours_remaining < 168 else "LOW"
-                    time_info += f"\nCLOSES: {market.end_date.isoformat()} ({hours_remaining:.1f}h remaining, URGENCY: {urgency})"
+                    time_info += f"\nCLOSES: {market.end_date.isoformat()} ({hours_remaining:.1f}h remaining)"
 
-            # === RESOLUTION CRITERIA (Enhanced - 500+ chars) ===
             resolution = self._extract_resolution_criteria(market.description)
 
-            # === CONDITIONAL PARENT (if applicable) ===
             conditional_info = ""
             if hasattr(market, 'conditional_parent_id') and market.conditional_parent_id:
                 conditional_info = f"\nCONDITIONAL PARENT: {market.conditional_parent_id}"
 
-            # === OUTCOMES WITH ORDER BOOK DATA ===
+            # === OUTCOMES (price for structural inference, no depth/spread gating) ===
             outcomes_list = []
             for o in market.outcomes:
                 ob = self._get_order_book_cached(o.token_id or o.outcome_id)
-
                 if ob:
-                    # Extract order book data
                     bid = getattr(ob, 'best_bid', None) or 0.0
                     ask = getattr(ob, 'best_ask', None) or 0.0
-                    spread = getattr(ob, 'spread', None) or (ask - bid if ask and bid else 0.0)
-
-                    # Calculate depth
-                    if hasattr(ob, 'total_bid_depth'):
-                        bid_depth = ob.total_bid_depth()
-                    elif hasattr(ob, 'bids'):
-                        bid_depth = sum(level.size for level in ob.bids) if ob.bids else 0.0
-                    else:
-                        bid_depth = 0.0
-
-                    if hasattr(ob, 'total_ask_depth'):
-                        ask_depth = ob.total_ask_depth()
-                    elif hasattr(ob, 'asks'):
-                        ask_depth = sum(level.size for level in ob.asks) if ob.asks else 0.0
-                    else:
-                        ask_depth = 0.0
-
-                    # Liquidity status
-                    status = "LIQUID" if spread < 0.05 and min(bid_depth, ask_depth) > 500 else "ILLIQUID"
-
                     outcomes_list.append(
-                        f"  - {o.name} (Token: {o.token_id or o.outcome_id}):\n"
-                        f"    Mid: ${o.price:.3f} | Bid: ${bid:.3f} | Ask: ${ask:.3f} | Spread: {spread:.3f}\n"
-                        f"    Depth: ${bid_depth:,.0f} bid / ${ask_depth:,.0f} ask | Status: {status}"
+                        f"  - {o.name} (Token: {o.token_id or o.outcome_id}): "
+                        f"Mid ${o.price:.3f} | Bid ${bid:.3f} | Ask ${ask:.3f}"
                     )
                 else:
-                    # No order book data available
                     outcomes_list.append(
-                        f"  - {o.name} (Token: {o.token_id or o.outcome_id}): ${o.price:.3f} [NO ORDER BOOK]"
+                        f"  - {o.name} (Token: {o.token_id or o.outcome_id}): ${o.price:.3f}"
                     )
 
             outcomes_str = "\n".join(outcomes_list)
@@ -586,55 +504,29 @@ CRITICAL RULES:
 
     def _calculate_cluster_hints(self, markets: list[Market]) -> dict[str, Any]:
         """
-        Pre-calculate cluster-level hints to reduce LLM cognitive load.
-
-        Returns:
-            Dict with:
-            - NegRisk group price sums + deviations
-            - High urgency market list (<24h)
-            - Price violation flags
+        Pre-calculate cluster-level structural hints (NegRisk price sums).
+        These help the LLM identify partition structure; they do not gate
+        constraint emission.
         """
-        from datetime import datetime, timedelta
-
         hints = {
             "total_markets": len(markets),
             "negrisk_groups": {},
-            "high_urgency_markets": [],
         }
 
-        # Group NegRisk markets
         negrisk_by_group = {}
         for m in markets:
             if m.negrisk and m.group_id:
-                if m.group_id not in negrisk_by_group:
-                    negrisk_by_group[m.group_id] = []
-                negrisk_by_group[m.group_id].append(m)
+                negrisk_by_group.setdefault(m.group_id, []).append(m)
 
-        # Calculate price sums for NegRisk groups
         for group_id, group_markets in negrisk_by_group.items():
             total = sum(
                 m.outcomes[0].price for m in group_markets
                 if m.outcomes
             )
-            deviation = total - 1.0
             hints["negrisk_groups"][group_id] = {
                 "market_count": len(group_markets),
                 "price_sum": round(total, 4),
-                "deviation_pct": round(deviation * 100, 2),
-                "status": "UNDERPRICED" if total < 0.98 else "OVERPRICED" if total > 1.02 else "FAIR",
             }
-
-        # Detect high urgency markets
-        now = datetime.utcnow()
-        for m in markets:
-            if m.end_date:
-                hours_remaining = (m.end_date - now).total_seconds() / 3600
-                if hours_remaining < 24 and hours_remaining > 0:
-                    hints["high_urgency_markets"].append({
-                        "market_id": m.market_id,
-                        "question": m.question[:60],
-                        "hours_remaining": round(hours_remaining, 1),
-                    })
 
         return hints
 
@@ -642,21 +534,13 @@ CRITICAL RULES:
         """Format cluster hints for the prompt."""
         lines = [f"Total Markets: {hints['total_markets']}"]
 
-        # NegRisk groups
         if hints["negrisk_groups"]:
             lines.append("\nNegRisk Groups Detected:")
             for group_id, data in hints["negrisk_groups"].items():
                 lines.append(
                     f"  - Group {group_id}: {data['market_count']} markets, "
-                    f"Sum={data['price_sum']:.4f} ({data['status']}), "
-                    f"Deviation={data['deviation_pct']:+.2f}%"
+                    f"Sum={data['price_sum']:.4f}"
                 )
-
-        # High urgency
-        if hints["high_urgency_markets"]:
-            lines.append("\nHigh Urgency Markets (closing <24h):")
-            for m in hints["high_urgency_markets"][:5]:  # Limit to 5
-                lines.append(f"  - {m['question']} ({m['hours_remaining']:.1f}h)")
 
         return "\n".join(lines)
 
@@ -859,11 +743,6 @@ CRITICAL RULES:
                     relationship=dep_data.get("relationship", "implies"),
                     confidence=float(dep_data.get("confidence", 0.5)),
                     reasoning=dep_data.get("reasoning", ""),
-                    # Phase 6: Execution metadata from enhanced LLM output
-                    liquidity_score=dep_data.get("liquidity_score"),
-                    min_tradeable_size=float(dep_data["min_tradeable_size"]) if dep_data.get("min_tradeable_size") else None,
-                    urgency=dep_data.get("urgency"),
-                    price_deviation_pct=float(dep_data["price_deviation_pct"]) if dep_data.get("price_deviation_pct") else None,
                 )
                 dependencies.append(dep)
             except Exception as e:
@@ -897,12 +776,6 @@ CRITICAL RULES:
                     confidence=float(cons_data.get("confidence", 0.99)),
                     reasoning=cons_data.get("reasoning", ""),
                     source_markets=[m.market_id for m in cluster.markets],
-                    # Phase 6: Execution metadata from enhanced LLM output
-                    liquidity_score=cons_data.get("liquidity_score"),
-                    min_tradeable_size=float(cons_data["min_tradeable_size"]) if cons_data.get("min_tradeable_size") else None,
-                    urgency=cons_data.get("urgency"),
-                    arbitrage_type=cons_data.get("arbitrage_type"),
-                    expected_profit_pct=float(cons_data["expected_profit_pct"]) if cons_data.get("expected_profit_pct") else None,
                 )
                 constraints.append(cons)
             except Exception as e:
@@ -945,11 +818,12 @@ CRITICAL RULES:
         """
         logger.debug("Validating constraints", cluster_id=cluster.cluster_id)
 
-        # Build price lookup
+        # Build price lookup. Outcome.price is Decimal upstream, but validation math
+        # (actual_sum += price, abs(rhs - sum)) mixes in floats, so coerce once here.
         price_map: dict[str, float] = {}
         for market in cluster.markets:
             for outcome in market.outcomes:
-                price_map[outcome.outcome_id] = outcome.price
+                price_map[outcome.outcome_id] = float(outcome.price)
 
         # Filter dependencies based on price consistency
         valid_dependencies = []

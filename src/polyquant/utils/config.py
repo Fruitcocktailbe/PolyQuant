@@ -363,8 +363,16 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
 
     llm_model: str = Field(
-        default="openrouter/free",
-        description="LLM Model identifier (e.g., 'openrouter/free', 'google/gemini-2.0-flash-exp:free')"
+        default="z-ai/glm-4.5-air:free",
+        description="Primary LLM Model identifier (pinned; avoid opaque pools like 'openrouter/free')"
+    )
+
+    llm_fallback_models: list[str] = Field(
+        default_factory=lambda: [
+            "google/gemma-3n-e2b-it:free",
+            "openrouter/free",
+        ],
+        description="Models to try if the primary returns empty/invalid JSON (in order)"
     )
 
     llm_temperature: float = Field(

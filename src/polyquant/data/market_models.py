@@ -257,12 +257,6 @@ class MarketDependency(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reasoning: str = ""
 
-    # Phase 6: Execution metadata
-    liquidity_score: str | None = None         # "high", "medium", "low"
-    min_tradeable_size: float | None = None    # USD, based on order book depth
-    urgency: str | None = None                 # "high", "medium", "low"
-    price_deviation_pct: float | None = None   # For NUMERICAL_DEVIATION type
-
 
 class ProposedTrade(BaseModel):
     """

@@ -78,8 +78,8 @@ class PositionSize(BaseModel):
     Calculated position size with explanation.
     
     Attributes:
-        recommended_size: The recommended position size in dollars
-        kelly_size: What full Kelly would suggest
+        recommended_size: The recommended position size in shares (number of tokens to buy/sell)
+        kelly_size: What full Kelly would suggest (dollars, internal pre-conversion value)
         limited_by: What constraint limited the size
         probability: The input probability
         expected_value: Expected value of the trade
@@ -112,7 +112,7 @@ class PositionSizer:
             order_book_depth=5000,
         )
         
-        print(f"Recommended: ${result.recommended_size}")
+        print(f"Recommended: {result.recommended_size} shares")
         print(f"Limited by: {result.limited_by}")
     """
     
@@ -255,19 +255,26 @@ class PositionSizer:
             "orderbook_limit": order_book_depth * self.limits.max_orderbook_depth_pct,
         }
         
-        # Find the binding constraint
+        # Find the binding constraint (still in dollars at this point)
         limiting_constraint = min(constraints.items(), key=lambda x: x[1])
-        recommended_size = max(0, limiting_constraint[1])
-        
+        dollar_size = max(0.0, limiting_constraint[1])
+
+        # Convert dollar stake → shares. price_per_share = 1 / (odds + 1) works for both
+        # BUY (buy YES at ask, odds = 1/price - 1) and SELL (buy NO at 1-bid, odds = bid/(1-bid))
+        # because fw_solver maps each side's per-share cost into `odds` consistently.
+        price_per_share = 1.0 / (odds + 1.0) if odds > 0 else 0.5
+        recommended_size = dollar_size / price_per_share if price_per_share > 0 else 0.0
+
         logger.debug(
             "Position size calculated",
             probability=probability,
             odds=odds,
             kelly_size=kelly_size,
+            dollar_size=dollar_size,
             recommended_size=recommended_size,
             limited_by=limiting_constraint[0],
         )
-        
+
         return PositionSize(
             recommended_size=recommended_size,
             kelly_size=kelly_size,

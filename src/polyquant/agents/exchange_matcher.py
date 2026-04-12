@@ -279,22 +279,44 @@ class ExchangeMatcher:
         pipeline_stats["llm_verifications_sent"] = len(eval_tasks)
         logger.info(f"Firing {len(eval_tasks)} LLM verification requests (Rate limited to 20 RPM)...")
 
+        # Initialize MATCHING progress so the UI can tick down as each verification returns
+        await monitor.update_llm_progress(
+            "MATCHING", done=0, total=len(eval_tasks), current=""
+        )
+
         # OpenRouter free tier limits to 20 requests per minute
         # We will use a semaphore of 2 and a sleep to restrict throughput
         sem = asyncio.Semaphore(2)
 
-        async def controlled_llm_call(task):
+        completed = 0
+        completed_lock = asyncio.Lock()
+
+        async def controlled_llm_call(task, meta):
+            nonlocal completed
             async with sem:
                 try:
                     res = await task
                     # Bursting is handled gracefully by exponential backoff in llm_client
                     await asyncio.sleep(1.0)
-                    return res
                 except Exception as e:
                     await asyncio.sleep(1.0)
-                    return e
+                    res = e
+            # Tick the progress counter outside the semaphore so we don't block other calls
+            async with completed_lock:
+                completed += 1
+                try:
+                    await monitor.update_llm_progress(
+                        "MATCHING",
+                        done=completed,
+                        current=(meta["l_title"] or "")[:60],
+                    )
+                except Exception:
+                    pass  # Progress reporting must never break the pipeline
+            return res
 
-        rate_limited_tasks = [controlled_llm_call(t) for t in eval_tasks]
+        rate_limited_tasks = [
+            controlled_llm_call(t, m) for t, m in zip(eval_tasks, task_meta)
+        ]
         results = await asyncio.gather(*rate_limited_tasks, return_exceptions=True)
         
         # Process results, grouping by Polymarket market_id so we only map the first true match

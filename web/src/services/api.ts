@@ -1,3 +1,9 @@
+export interface LLMPhaseProgress {
+    done: number;
+    total: number;
+    current: string;
+}
+
 export interface SystemState {
     status: string;
     net_liquidation_value: number;
@@ -11,6 +17,7 @@ export interface SystemState {
     trades_executed: any[];
     pipeline_stage: string;
     pipeline_events: any[];
+    llm_progress: Record<string, LLMPhaseProgress>;
     logs: string[];
 }
 
@@ -48,6 +55,10 @@ class ApiService {
         trades_executed: [],
         pipeline_stage: "IDLE",
         pipeline_events: [],
+        llm_progress: {
+            LOGIC:    { done: 0, total: 0, current: "" },
+            MATCHING: { done: 0, total: 0, current: "" },
+        },
         logs: [],
     };
 
@@ -105,6 +116,14 @@ class ApiService {
     }
 
     private hasStateChanged(newState: SystemState): boolean {
+        const newProg = newState.llm_progress || {};
+        const oldProg = this.state.llm_progress || {};
+        const progChanged = ["LOGIC", "MATCHING"].some(phase => {
+            const a = newProg[phase] || { done: 0, total: 0, current: "" };
+            const b = oldProg[phase] || { done: 0, total: 0, current: "" };
+            return a.done !== b.done || a.total !== b.total || a.current !== b.current;
+        });
+
         // Quick check on primitive values (most common changes)
         return (
             newState.status !== this.state.status ||
@@ -120,7 +139,8 @@ class ApiService {
             newState.pipeline_stage !== this.state.pipeline_stage ||
             (newState.pipeline_events?.length || 0) !== (this.state.pipeline_events?.length || 0) ||
             ((newState.pipeline_events?.length ? newState.pipeline_events[newState.pipeline_events.length - 1].timestamp : "") !==
-             (this.state.pipeline_events?.length ? this.state.pipeline_events[this.state.pipeline_events.length - 1].timestamp : ""))
+             (this.state.pipeline_events?.length ? this.state.pipeline_events[this.state.pipeline_events.length - 1].timestamp : "")) ||
+            progChanged
         );
     }
 

@@ -324,6 +324,10 @@ const INITIAL_STATE: SystemState = {
     trades_executed: [],
     pipeline_stage: 'IDLE',
     pipeline_events: [],
+    llm_progress: {
+        LOGIC:    { done: 0, total: 0, current: '' },
+        MATCHING: { done: 0, total: 0, current: '' },
+    },
     logs: [],
 };
 
@@ -457,7 +461,7 @@ export const Dashboard: React.FC = () => {
                                     </div>
                                 )}
                                 {activeTab === 'pipeline' && (
-                                    <PipelineMonitor stage={state.pipeline_stage} mappedPairs={state.mapped_pairs} pipelineEvents={state.pipeline_events || []} />
+                                    <PipelineMonitor stage={state.pipeline_stage} mappedPairs={state.mapped_pairs} pipelineEvents={state.pipeline_events || []} llmProgress={state.llm_progress} />
                                 )}
                             </div>
                         </div>

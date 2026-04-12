@@ -50,16 +50,62 @@ from polyquant.risk import KillSwitch, PositionSizer
 from polyquant.solver import ArbitrageDetector, SCIPSolver
 from polyquant.solver.scip_solver import OptimizationResult
 from polyquant.data import ArbitrageOpportunity
+from polyquant.data.market_models import MarketDependency
 from polyquant.agents import MicrostructureAgent
+from polyquant.agents.validator import ValidatedResult
+from polyquant.agents.logic_architect import LogicalConstraint, AnalysisResult
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
 from polyquant.data.trade_store import TradeStore
-from polyquant.api.server import monitor, app, set_trade_store, set_constraint_store, setup_web_logging
+from polyquant.api.server import monitor, set_trade_store, set_constraint_store, start_api_server
 from polyquant.utils import config, get_logger
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
-import uvicorn
 
 logger = get_logger(__name__)
+
+
+def _manifest_to_validated(manifest: ConstraintManifest) -> ValidatedResult:
+    """Adapter: wrap a persisted manifest as the ValidatedResult the solver expects.
+
+    On-disk manifests are MapMaker's post-validation output, but the solver's
+    ValidatedResult contract predates the persistence layer. StoredConstraint and
+    StoredDependency are near-identical to LogicalConstraint and MarketDependency,
+    so this is a direct field copy with no logic.
+    """
+    logical_constraints = [
+        LogicalConstraint(
+            constraint_id=c.constraint_id,
+            description=c.description,
+            coefficients=dict(c.coefficients),
+            rhs=c.rhs,
+            confidence=c.confidence,
+            source_markets=list(c.source_markets),
+            reasoning=c.reasoning,
+        )
+        for c in manifest.constraints
+    ]
+    logical_deps = [
+        MarketDependency(
+            source_market_id=d.source_market_id,
+            source_outcome=d.source_outcome,
+            target_market_id=d.target_market_id,
+            target_outcome=d.target_outcome,
+            relationship=d.relationship,
+            confidence=d.confidence,
+        )
+        for d in manifest.dependencies
+    ]
+    return ValidatedResult(
+        original=AnalysisResult(
+            cluster_id=manifest.cluster_id,
+            dependencies=logical_deps,
+            constraints=logical_constraints,
+        ),
+        is_valid=True,
+        validated_constraints=logical_constraints,
+        validated_dependencies=logical_deps,
+        market_exchanges=dict(manifest.market_exchanges),
+    )
 
 
 class LatencyTracker:
@@ -149,33 +195,51 @@ class ExecutionGuard:
         """Initialize the ExecutionGuard."""
         self._manifests: dict[str, ConstraintManifest] = {}
         self._constraint_matrix: dict[str, list[dict[str, Any]]] = {}  # Pre-computed matrix
-        
+        # Guards _manifests + _constraint_matrix against hot-reload races.
+        # Detection holds it across a tick; hot-reload waits one tick.
+        self._manifests_lock = asyncio.Lock()
+
         logger.info("ExecutionGuard initialized")
     
     def load_manifests(self, manifests: list[ConstraintManifest]) -> None:
         """
         Load constraint manifests into memory.
-        
+
+        Idempotent: re-loading a cluster_id replaces its prior constraint
+        matrix entries instead of appending. This lets the hot-reload loop
+        re-inject updated manifests without doubling up rules.
+
         Args:
             manifests: List of ConstraintManifests to load.
         """
         for manifest in manifests:
+            # If this cluster_id was already loaded, strip its old matrix
+            # entries before adding the new ones.
+            if manifest.cluster_id in self._manifests:
+                old_constraint_ids = {
+                    str(c.constraint_id)
+                    for c in self._manifests[manifest.cluster_id].constraints
+                }
+                for outcome_id in list(self._constraint_matrix.keys()):
+                    self._constraint_matrix[outcome_id] = [
+                        e for e in self._constraint_matrix[outcome_id]
+                        if e["constraint_id"] not in old_constraint_ids
+                    ]
+
             self._manifests[manifest.cluster_id] = manifest
-            
-            # Pre-compute constraint matrix for O(1) lookups
+
             for constraint in manifest.constraints:
                 for outcome_id, coeff in constraint.coefficients.items():
                     if outcome_id not in self._constraint_matrix:
                         self._constraint_matrix[outcome_id] = []
-                    
-                    # Use local variable for data dictionary to help inference
+
                     matrix_entry: dict[str, Any] = {
                         "constraint_id": str(constraint.constraint_id),
                         "coefficient": float(coeff),
                         "rhs": float(constraint.rhs),
                     }
                     self._constraint_matrix[outcome_id].append(matrix_entry)
-        
+
         logger.info(
             "Loaded manifests into ExecutionGuard",
             manifest_count=len(manifests),
@@ -366,7 +430,12 @@ class Navigator:
         self._bayesian_updater = None   # BayesianUpdater (phantom arb prevention)
         self._correlation_engine = None  # CorrelationEngine (leader-laggard pairs)
         self._previous_prices: dict[str, float] = {}  # For correlation delta tracking
-        
+        self._previous_prices_ts: float | None = None  # monotonic ts of last snapshot
+        # Skip correlation deltas if WS gap exceeds this — prevents treating
+        # cross-outage moves as one-tick signals.
+        self._correlation_max_gap_s: float = 1.0
+
+
         self._is_running = False
         self._server_task: asyncio.Task | None = None
 
@@ -386,6 +455,7 @@ class Navigator:
         # Hot-reloading attributes
         self._hot_reload_task: asyncio.Task | None = None
         self._loaded_cluster_ids: set[str] = set()
+        self._loaded_manifest_mtimes: dict[str, float] = {}
 
         logger.info("Navigator initialized")
     
@@ -394,13 +464,7 @@ class Navigator:
         logger.info("Starting Navigator...")
         
         # Start Sidecar UI Server
-        config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
-        server = uvicorn.Server(config_uv)
-        self._uvicorn_server = server  # Store reference for graceful shutdown
-        self._server_task = asyncio.create_task(server.serve())
-        await asyncio.sleep(0.5)  # Give uvicorn a moment to bind to port
-        logger.info("🌐 API server started on http://0.0.0.0:8000 — endpoints: /status, /api/status, /ws")
-        setup_web_logging()
+        self._uvicorn_server, self._server_task = await start_api_server()
         await monitor.update_status(status="STARTING")
         
         # Initialize Polymarket client
@@ -524,52 +588,81 @@ class Navigator:
             await asyncio.sleep(60) # Refresh every minute
     
     async def _hot_reload_loop(self) -> None:
-        """Background loop to dynamically load new markets from ConstraintStore."""
+        """
+        Background loop to dynamically load new and updated manifests from
+        ConstraintStore.
+
+        Picks up two cases:
+        1. NEW cluster_ids (e.g. fresh LLM clusters with timestamp ids).
+        2. UPDATED manifests (e.g. NegRisk clusters which reuse stable
+           cluster_ids across MapMaker runs). Detected via on-disk mtime.
+        """
         while self._is_running:
             try:
-                await asyncio.sleep(60) # Modest polling interval
-                
+                await asyncio.sleep(60)  # Modest polling interval
+
                 if not self._store or not self._guard:
                     continue
-                    
-                current_clusters = await self._store.list_clusters()
-                new_clusters = [cid for cid in current_clusters if cid not in self._loaded_cluster_ids]
-                
-                if new_clusters:
-                    logger.info(f"Hot-reloading {len(new_clusters)} new market clusters...")
-                    
-                    new_token_ids: set[str] = set()
-                    new_manifests = []
-                    
-                    for cid in new_clusters:
-                        manifest = await self._store.load_manifest(cid)
-                        if manifest:
-                            # Extract token IDs from constraint coefficients
-                            for constraint in manifest.constraints:
-                                new_token_ids.update(constraint.coefficients.keys())
-                            new_manifests.append(manifest)
-                            
-                    if not new_token_ids:
-                        continue
-                        
-                    # Subscribe to WebSockets
-                    token_ids = list(new_token_ids)
-                    if self._polymarket and hasattr(self._polymarket, "ws_client") and self._polymarket.ws_client:
-                        logger.info(f"Subscribing to {len(token_ids)} new tokens via WebSocket")
-                        await self._polymarket.ws_client.subscribe(
-                            token_ids,
-                            self._ws_update_callback
-                        )
-                        
-                    # Inject into guard
-                    guard = self._guard
-                    if guard is not None:
-                        guard.load_manifests(new_manifests)
-                    
-                    # Update local state
-                    self._loaded_cluster_ids.update(new_clusters)
-                    logger.info(f"Successfully hot-reloaded {len(new_clusters)} clusters.")
-                    
+
+                current_mtimes = self._store.list_clusters_with_mtimes()
+                changed_cluster_ids: list[str] = []
+                for cid, mtime in current_mtimes.items():
+                    prev_mtime = self._loaded_manifest_mtimes.get(cid)
+                    if prev_mtime is None or mtime > prev_mtime:
+                        changed_cluster_ids.append(cid)
+
+                if not changed_cluster_ids:
+                    continue
+
+                new_count = sum(1 for cid in changed_cluster_ids if cid not in self._loaded_cluster_ids)
+                updated_count = len(changed_cluster_ids) - new_count
+                logger.info(
+                    f"Hot-reloading {len(changed_cluster_ids)} clusters "
+                    f"({new_count} new, {updated_count} updated)"
+                )
+
+                new_token_ids: set[str] = set()
+                changed_manifests = []
+                for cid in changed_cluster_ids:
+                    manifest = await self._store.load_manifest(cid)
+                    if manifest:
+                        for constraint in manifest.constraints:
+                            new_token_ids.update(constraint.coefficients.keys())
+                        changed_manifests.append(manifest)
+
+                if not changed_manifests:
+                    continue
+
+                # Subscribe to any token IDs we don't already follow.
+                # Re-subscribing to existing tokens is a harmless no-op.
+                token_ids = list(new_token_ids)
+                if (
+                    token_ids
+                    and self._polymarket
+                    and hasattr(self._polymarket, "ws_client")
+                    and self._polymarket.ws_client
+                ):
+                    logger.info(f"Subscribing to {len(token_ids)} tokens via WebSocket")
+                    await self._polymarket.ws_client.subscribe(
+                        token_ids,
+                        self._ws_update_callback,
+                    )
+
+                # Inject into guard (under lock to avoid races with detection).
+                # load_manifests is idempotent: re-loading a cluster_id replaces
+                # its prior matrix entries.
+                guard = self._guard
+                if guard is not None:
+                    async with guard._manifests_lock:
+                        guard.load_manifests(changed_manifests)
+
+                # Update local state
+                self._loaded_cluster_ids.update(cid for cid in changed_cluster_ids)
+                self._loaded_manifest_mtimes.update(
+                    {cid: current_mtimes[cid] for cid in changed_cluster_ids}
+                )
+                logger.info(f"Successfully hot-reloaded {len(changed_manifests)} clusters.")
+
             except Exception as e:
                 logger.error("Failed to hot-reload markets", error=str(e))
 
@@ -734,13 +827,11 @@ class Navigator:
             raise RuntimeError("ConstraintStore not initialized")
         
         cluster_ids = await self._store.list_clusters()
-        
+
         if not cluster_ids:
-            logger.warning("No constraint manifests found. Run Map Maker first.")
-            from polyquant.api.server import monitor
-            await monitor.update_status(status="NO_CONSTRAINTS")
-            return
-        
+            logger.warning("No constraint manifests yet — entering WAITING mode. Hot-reload will pick them up.")
+            await monitor.update_status(status="WAITING_FOR_CONSTRAINTS")
+
         # Load all manifests and extract unique token IDs from constraint coefficients.
         # NOTE: market_ids in manifests are often empty for NegRisk markets.
         # The token IDs in constraint coefficients are the REAL identifiers we need.
@@ -757,15 +848,13 @@ class Navigator:
                     if mid:
                         all_token_ids.add(mid)
                 market_exchanges.update(manifest.market_exchanges)
-                
-        # Initialize the set of loaded clusters
+
+        # Initialize the set of loaded clusters and seed mtime tracking so the
+        # hot-reload loop only fires on subsequent on-disk changes.
         self._loaded_cluster_ids = set(cluster_ids)
-        
+        self._loaded_manifest_mtimes = self._store.list_clusters_with_mtimes()
+
         token_id_list = list(all_token_ids)
-        if not token_id_list:
-            logger.warning("No token IDs found in constraint manifests")
-            return
-        
         logger.info(f"Monitoring {len(token_id_list)} unique tokens across {len(cluster_ids)} clusters")
         
         # Format clusters for the UI Dashboard
@@ -795,16 +884,16 @@ class Navigator:
         # WS is the PRIMARY data source — subscribe all tokens from constraints.
         # Resolved tokens are silently ignored.
 
-        if self._polymarket:
+        if self._polymarket and token_id_list:
             logger.info(f"Subscribing to {len(token_id_list)} tokens via WebSocket")
             # Create WS client if not exists
             if not getattr(self._polymarket, "ws_client", None):
                  from polyquant.data.polymarket_client import PolymarketWSClient
                  self._polymarket.ws_client = PolymarketWSClient()
                  await self._polymarket.ws_client.connect()
-            
+
             await self._polymarket.ws_client.subscribe(
-                token_id_list, 
+                token_id_list,
                 self._ws_update_callback
             )
             
@@ -1025,10 +1114,21 @@ class Navigator:
             if mid and mid > 0:
                 current_mid_prices[token_id] = mid
 
-        # Group order books by cluster
+        # Snapshot manifests under lock so hot-reload can't change cluster
+        # attribution mid-tick. The lock is held only for the snapshot copy
+        # (no awaits inside) — hot-reload waits only microseconds.
+        async with self._guard._manifests_lock:
+            manifest_snapshot: dict[str, ConstraintManifest] = dict(self._guard._manifests)
+            outcome_to_cluster: dict[str, str] = {}
+            for cid, m in manifest_snapshot.items():
+                for constraint in m.constraints:
+                    for oid in constraint.coefficients:
+                        outcome_to_cluster[oid] = cid
+
+        # Group order books by cluster (using snapshot lookup)
         cluster_books: dict[str, dict[str, OrderBook]] = {}
         for token_id, book in order_books.items():
-            cluster_id = self._guard.get_cluster_for_outcome(token_id)
+            cluster_id = outcome_to_cluster.get(token_id)
             if cluster_id:
                 if cluster_id not in cluster_books:
                     cluster_books[cluster_id] = {}
@@ -1072,17 +1172,16 @@ class Navigator:
                         for adj in adjustments:
                             logger.debug(adj.reason)
 
-                # 3. Run Arbitrage Detector (using manifest)
-                if not self._guard:
-                    continue
-                manifest = self._guard._manifests.get(cluster_id)
+                # 3. Run Arbitrage Detector (using snapshot manifest)
+                manifest = manifest_snapshot.get(cluster_id)
                 if not manifest:
                     continue
 
                 try:
+                    validated = _manifest_to_validated(manifest)
                     arb_opportunity = await self._arbitrage_detector.detect(
-                        validated=manifest,
-                        order_books=cluster_books,
+                        validated=validated,
+                        order_books=books,
                         min_profit=config.fw_min_profit
                     )
                 except Exception as e:
@@ -1128,30 +1227,37 @@ class Navigator:
                     error=str(e),
                 )
 
-        # ── Correlation-based signals (cross-cluster, after constraint detection) ──
+        # ── Correlation-based signals (cross-cluster, observation only) ──
+        # TODO: wire correlation signals into _execute_opportunity once a
+        # trade-construction path exists. Until then we surface them via
+        # logger only — emitting them as opportunities would just be dropped
+        # downstream because they have no arb_object/trades.
         correlation = self._correlation_engine
-        if (correlation is not None and
-            self._previous_prices and current_mid_prices):
+        prev_prices = self._previous_prices
+        prev_ts = self._previous_prices_ts
+        now_ts = time.monotonic()
+        if (correlation is not None and prev_prices and current_mid_prices
+                and prev_ts is not None
+                and (now_ts - prev_ts) <= self._correlation_max_gap_s):
             try:
                 corr_signals = correlation.check_for_signals(
                     current_prices=current_mid_prices,
-                    previous_prices=self._previous_prices,
+                    previous_prices=prev_prices,
                 )
                 for sig in corr_signals:
-                    opportunities.append({
-                        "cluster_id": f"corr_{sig.pair.leader_id[:8]}",
-                        "source": "correlation",
-                        "expected_profit": abs(sig.expected_laggard_move) * 100,
-                        "leader": sig.pair.leader_question[:60],
-                        "laggard": sig.pair.laggard_question[:60],
-                        "deviation_sigma": sig.deviation_sigma,
-                        "timestamp": datetime.utcnow().isoformat(),
-                    })
+                    logger.info(
+                        "Correlation signal observed (not executed)",
+                        leader=sig.pair.leader_question[:60],
+                        laggard=sig.pair.laggard_question[:60],
+                        deviation_sigma=sig.deviation_sigma,
+                        expected_laggard_move=float(sig.expected_laggard_move),
+                    )
             except Exception as e:
                 logger.error("Correlation signal check failed", error=str(e))
 
         # Update previous prices for next tick's correlation delta
         self._previous_prices = current_mid_prices
+        self._previous_prices_ts = now_ts
 
         return opportunities
     
@@ -1194,6 +1300,67 @@ class Navigator:
 
         except Exception as e:
             logger.debug("Balance reconciliation skipped", error=str(e))
+
+    async def _has_live_depth(self, trades: list[Any], cluster_id: str = "") -> bool:
+        """
+        Min-viable live depth check.
+
+        For each trade leg, fetch the live order book and confirm there is at
+        least one resting order on the side we want to hit. Blocks obvious
+        zero-fill cases. Does NOT attempt to size against depth or enforce a
+        numeric threshold — that's intentionally left to a follow-up
+        (solver-native sizing).
+
+        This is the only place "current liquidity" gates execution. MapMaker
+        is structural-only; live conditions live here.
+        """
+        for trade in trades:
+            exchange = getattr(trade, "exchange", None)
+            token_id = trade.outcome_id
+            try:
+                if exchange == "polymarket" and self._polymarket:
+                    ob = await self._polymarket.get_order_book(token_id)
+                elif exchange == "limitless" and self._limitless:
+                    ob = await self._limitless.get_order_book(token_id)
+                else:
+                    logger.warning(
+                        "Depth check: unknown exchange or client unavailable, skipping trade",
+                        exchange=exchange,
+                        token_id=token_id,
+                        cluster_id=cluster_id,
+                    )
+                    return False
+            except Exception as e:
+                logger.warning(
+                    "Depth check failed; skipping trade",
+                    token_id=token_id,
+                    exchange=exchange,
+                    error=str(e),
+                )
+                return False
+
+            if ob is None:
+                logger.info(
+                    "Depth check: no order book, skipping trade",
+                    token_id=token_id,
+                    exchange=exchange,
+                    cluster_id=cluster_id,
+                )
+                return False
+
+            side_value = trade.side.value if hasattr(trade.side, "value") else trade.side
+            book_side = ob.asks if str(side_value).upper() == "BUY" else ob.bids
+            if not book_side or float(book_side[0].size) <= 0:
+                logger.info(
+                    "Depth check: zero depth on target side, skipping trade",
+                    token_id=token_id,
+                    side=side_value,
+                    exchange=exchange,
+                    cluster_id=cluster_id,
+                )
+                return False
+
+        return True
 
     async def _execute_opportunity(self, opportunity: Any, signal_timestamp_us: int = 0) -> None:
         """Execute a trading opportunity through the TradeExecutor.
@@ -1255,6 +1422,13 @@ class Navigator:
                         cluster_id=cluster_id,
                     )
                     return
+
+        # ── Pre-flight: min-viable live depth check ──
+        # Block trades where any leg has zero depth on the side we want to hit.
+        # This is the only place "current liquidity" gates execution — MapMaker
+        # emits constraints regardless of snapshot conditions.
+        if not await self._has_live_depth(arb.trades, cluster_id=cluster_id):
+            return
 
         # ── Wrap in OptimizationResult (what TradeExecutor expects) ──
         opt_result = OptimizationResult(
