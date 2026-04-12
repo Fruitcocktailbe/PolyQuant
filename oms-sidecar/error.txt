@@ -1,7 +1,0 @@
-    Checking oms-sidecar v0.1.0 (D:\GithubLocal\PolyQuant\oms-sidecar)
-src\exchanges\limitless.rs:2:5: error[E0432]: unresolved import `anyhow`: use of unresolved module or unlinked crate `anyhow`
-src\exchanges\polymarket.rs:2:5: error[E0432]: unresolved import `anyhow`: use of unresolved module or unlinked crate `anyhow`
-src\exchanges\limitless.rs:3:21: warning: unused import: `error`
-src\exchanges\polymarket.rs:3:21: warning: unused import: `error`
-warning: `oms-sidecar` (lib) generated 2 warnings
-error: could not compile `oms-sidecar` (lib) due to 2 previous errors; 2 warnings emitted
