@@ -10,6 +10,7 @@ This matched schema is cached to avoid repeated LLM API costs.
 """
 
 import os
+import gc
 import json
 import asyncio
 from typing import Any, Dict, List
@@ -18,10 +19,9 @@ from polyquant.api.server import monitor
 
 import numpy as np
 try:
-    from sentence_transformers import SentenceTransformer, util
+    from sentence_transformers import SentenceTransformer
 except ImportError:
     SentenceTransformer = None
-    util = None
 
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
@@ -205,15 +205,44 @@ class ExchangeMatcher:
             logger.warning("Proceeding with empty mappings due to model load failure.")
             return self.mapped_pairs, pipeline_stats
         
-        # Encode corpuses into semantic vectors
-        logger.info(f"Encoding {len(p_docs)} Polymarket and {len(l_docs)} Limitless document embeddings...")
-        p_embeddings = model.encode(p_docs, convert_to_tensor=True)
-        l_embeddings = model.encode(l_docs, convert_to_tensor=True)
-        
-        # Compute cosine similarity
+        # Encode corpora in chunks so at most ENCODE_CHUNK_SIZE docs are tokenized at
+        # once. Keeps peak RAM bounded on the 2 GB Lightsail VM where the model itself
+        # already costs ~300 MB.
+        ENCODE_CHUNK_SIZE = 500
+        logger.info(
+            f"Encoding {len(p_docs)} Polymarket and {len(l_docs)} Limitless documents "
+            f"(chunk size={ENCODE_CHUNK_SIZE})..."
+        )
+
+        def _encode_chunked(docs: list[str]) -> np.ndarray:
+            chunks: list[np.ndarray] = []
+            for start in range(0, len(docs), ENCODE_CHUNK_SIZE):
+                chunk = docs[start:start + ENCODE_CHUNK_SIZE]
+                chunks.append(
+                    model.encode(chunk, convert_to_numpy=True, show_progress_bar=False)
+                )
+            if not chunks:
+                return np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+            return np.vstack(chunks)
+
+        p_embeddings = _encode_chunked(p_docs)
+        l_embeddings = _encode_chunked(l_docs)
+
+        # Pure-numpy cosine similarity so we can drop all torch tensors before Phase 3.
         logger.info("Computing similarity matrix...")
-        similarity_matrix = util.cos_sim(p_embeddings, l_embeddings).cpu().numpy()
+        p_norms = np.linalg.norm(p_embeddings, axis=1, keepdims=True)
+        l_norms = np.linalg.norm(l_embeddings, axis=1, keepdims=True)
+        p_normed = p_embeddings / np.where(p_norms == 0, 1.0, p_norms)
+        l_normed = l_embeddings / np.where(l_norms == 0, 1.0, l_norms)
+        similarity_matrix = p_normed @ l_normed.T
         logger.info("Similarity matrix computed.")
+
+        # Phase 3 only needs similarity_matrix (tiny — len(p)*len(l)*4 bytes). Release
+        # the model and all intermediate embeddings so the ~300 MB SentenceTransformer
+        # footprint doesn't stay resident while we wait on slow LLM verification calls.
+        del model, p_embeddings, l_embeddings, p_normed, l_normed, p_norms, l_norms
+        gc.collect()
+        logger.info("Released SentenceTransformer model and embeddings from memory.")
         
         # Stage 3: LLM Semantic Verification
         logger.info("Stage 3: Verifying Top-N neighbors using LLM Semantic Matching (Concurrent Async)...")

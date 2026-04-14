@@ -89,6 +89,9 @@ class PriceCache:
             token_id: The token ID (outcome) being updated.
             book: The new order book snapshot.
         """
+        if not isinstance(token_id, str) or not token_id:
+            logger.error("Invalid token_id in PriceCache.update", token_id=repr(token_id))
+            return
         async with self._lock:
             self._books[token_id] = book
             self._last_update[token_id] = time.monotonic()  # Fast monotonic time
@@ -154,6 +157,17 @@ class PriceCache:
         if last is None:
             return True
         return time.monotonic() - last > self._stale_threshold
+
+    def age_ms(self, token_id: str) -> float | None:
+        """Return the age of this token's last WS update in milliseconds.
+
+        Returns None if the token has never been seen. Used by the dutching
+        solver to apply a soft staleness penalty to ring confidence.
+        """
+        last = self._last_update.get(token_id)
+        if last is None:
+            return None
+        return (time.monotonic() - last) * 1000.0
     
     @property
     def size(self) -> int:

@@ -39,6 +39,7 @@ USAGE:
 import asyncio
 import argparse
 import signal
+import sys
 from typing import Any
 
 from polyquant.utils import get_logger
@@ -47,7 +48,7 @@ logger = get_logger(__name__)
 
 
 async def run_map_maker(
-    limit: int = 500,
+    limit: int = 0,
     min_liquidity: float = 1000,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -103,6 +104,11 @@ async def run_map_maker(
             return result
     except Exception as e:
         logger.error("Map Maker failed", error=str(e), exc_info=True)
+        try:
+            server.should_exit = True
+            await asyncio.wait_for(server_task, timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
         return {"status": "failed", "error": str(e)}
 
 
@@ -170,8 +176,8 @@ Examples:
     parser.add_argument(
         "--limit",
         type=int,
-        default=500,
-        help="Maximum markets to scan in 'map' mode (default: 500, 0 for all)",
+        default=0,
+        help="Maximum events to scan in 'map' mode (default: 0 = all events above --min-liquidity)",
     )
     parser.add_argument(
         "--min-liquidity",
@@ -196,11 +202,13 @@ Examples:
     """)
 
     if args.mode == "map":
-        await run_map_maker(
+        result = await run_map_maker(
             limit=args.limit,
             min_liquidity=args.min_liquidity,
             force=args.force,
         )
+        if result.get("status") in ("failed", "error"):
+            sys.exit(1)
     elif args.mode == "trade":
         await run_navigator()
     else:

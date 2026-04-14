@@ -361,17 +361,27 @@ class PositionSizer:
         max_single_trade_exposure = self.capital * self.limits.max_single_trade_pct # Treating the entire ring as one synthetic 'trade'
         max_t = min(max_total_exposure, max_single_trade_exposure)
         
-        # 2. Liquidity constraints (bottleneck detection)
+        # 2. Liquidity constraints (bottleneck detection) with adaptive depth caps.
+        # Illiquid legs (< $1k depth) get a smaller slice because unwind slippage is
+        # nonlinear in size; liquid legs (> $10k depth) can take a larger slice.
+        def _pick_depth_cap(depth_i: float) -> float:
+            if depth_i >= 10_000.0:
+                return config.orderbook_depth_cap_liquid
+            if depth_i <= 1_000.0:
+                return config.orderbook_depth_cap_illiquid
+            return config.orderbook_depth_cap
+
         # stake_i = T * (p_i / sum_implied)
-        # We require stake_i <= depth_i * limit  =>  T <= (depth_i * limit * sum_implied) / p_i
+        # We require stake_i <= depth_i * cap  =>  T <= (depth_i * cap * sum_implied) / p_i
         limiting_constraint = "capital_limits"
         for i, (p_i, depth_i) in enumerate(zip(implied_probs, depth_list)):
-            leg_max_stake = depth_i * self.limits.max_orderbook_depth_pct
+            depth_cap = _pick_depth_cap(depth_i)
+            leg_max_stake = depth_i * depth_cap
             max_t_for_leg = (leg_max_stake * sum_implied) / p_i
-            
+
             if max_t_for_leg < max_t:
                 max_t = max_t_for_leg
-                limiting_constraint = f"leg_{i}_liquidity"
+                limiting_constraint = f"leg_{i}_liquidity_cap{depth_cap:.1f}"
                 
         # Generate final sizes
         final_sizes = []

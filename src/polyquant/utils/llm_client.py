@@ -52,7 +52,7 @@ def get_llm_client() -> OpenAI | None:
     client = OpenAI(
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
-        timeout=45.0,  # CRITICAL: Allow enough time for LLM JSON generation
+        timeout=20.0,  # Fail fast on hung free models so the auto-router can rotate
         default_headers={
             "HTTP-Referer": "https://github.com/polyquant",
             "X-OpenRouter-Title": "PolyQuant",
@@ -130,15 +130,22 @@ def call_llm_json(
 
         except Exception as e:
             error_str = str(e)
-            
-            # Check if this is a rate limit error (429) and we have retries left
-            if "429" in error_str and attempt < max_retries - 1:
-                wait_time = base_wait * (2 ** attempt)  # 10s, 20s...
-                print(f"--- ⚠️ LLM RATE LIMITED (429) | Waiting {wait_time}s before retry ({attempt+1}/{max_retries}) ---\n")
-                logger.warning(f"LLM 429 Rate Limit. Backing off for {wait_time}s", attempt=attempt+1)
+            error_lower = error_str.lower()
+            is_rate_limit = "429" in error_str
+            is_timeout = "timeout" in error_lower or "timed out" in error_lower
+
+            if (is_rate_limit or is_timeout) and attempt < max_retries - 1:
+                if is_rate_limit:
+                    wait_time = base_wait * (2 ** attempt)  # 10s, 20s...
+                    print(f"--- ⚠️ LLM RATE LIMITED (429) | Waiting {wait_time}s before retry ({attempt+1}/{max_retries}) ---\n")
+                    logger.warning(f"LLM 429 Rate Limit. Backing off for {wait_time}s", attempt=attempt+1)
+                else:
+                    wait_time = 2.0
+                    print(f"--- ⏱️ LLM TIMEOUT | Retrying ({attempt+1}/{max_retries}) to rotate auto-router ---\n")
+                    logger.warning(f"LLM timeout on {model}. Retrying for fresh routing", attempt=attempt+1)
                 time.sleep(wait_time)
                 continue
-                
+
             elapsed = time.time() - t0
             print(f"--- ❌ LLM FAILED [{elapsed:.1f}s] | Error: {e} ---\n")
             logger.error("LLM call failed", error=error_str, model=model)

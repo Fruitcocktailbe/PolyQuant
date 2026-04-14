@@ -36,9 +36,14 @@ Now we need to log into the computer you just rented. Amazon makes this very eas
 
 **IMPORTANT:** To paste text into this black window, you usually have to **Right-Click** and select "Paste", or press `Ctrl + Shift + V`.
 
-Or via terminal:
-ssh -L 18789:127.0.0.1:18789 -L 8000:127.0.0.1:8000 -L 5173:127.0.0.1:5173 ubuntu@54.75.125.170 -i "C:\Users\Jeroen\Desktop\LightsailDefaultKey-eu-west-1polymarket.pem"
-CHANGE KEY NAME IF NECESSARY
+Or via terminal (replace `<YOUR-SERVER-IP>` with the Public IP from your Lightsail dashboard, and `<PATH-TO-YOUR-KEY>` with the local path to the `.pem` file you downloaded from Lightsail):
+
+```
+ssh -L 18789:127.0.0.1:18789 -L 8000:127.0.0.1:8000 -L 5173:127.0.0.1:5173 ubuntu@<YOUR-SERVER-IP> -i "<PATH-TO-YOUR-KEY>.pem"
+```
+
+The three `-L` flags forward the Navigator API (18789), dashboard API (8000), and web UI (5173) from the server to your local machine, so you can view them in your browser at `http://127.0.0.1:5173`.
+
 ---
 
 ## Step 3: Preparing the Server
@@ -74,6 +79,15 @@ source $HOME/.cargo/env
 sudo apt install -y scip
 ```
 
+**Start Redis and make it survive reboots:**
+*(This turns Redis into a "system service" so it starts automatically whenever the server restarts — you will not have to remember to start it yourself.)*
+```bash
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+```
+
+You can verify it is running with `redis-cli ping` — it should reply `PONG`.
+
 **Create "Swap" Memory (This gives your cheap server extra breathing room so it doesn't crash):**
 *(Copy all these lines at once, paste them, and press Enter)*
 ```bash
@@ -92,8 +106,9 @@ Now we will download the actual PolyQuant code from the internet using a tool ca
 
 1. Paste this command and press Enter:
 ```bash
-git clone https://github.com/yourusername/PolyQuant.git
+git clone https://github.com/Fruitcocktailbe/PolyQuant.git
 ```
+*(If the repo is private, Git will ask for your GitHub username and a Personal Access Token — not your password. Create a token at https://github.com/settings/tokens if you don't have one.)*
 2. Go "inside" the PolyQuant folder by typing:
 ```bash
 cd PolyQuant
@@ -137,7 +152,21 @@ cp .env.example .env
 nano .env
 ```
 3. You are now inside the text editor. You can use your keyboard arrows (Up, Down, Left, Right) to move around.
-4. Fill in your API keys (e.g., your Limitless key, OpenRouter key, etc.).
+4. Fill in your API keys. Here is the checklist of what you need:
+
+   **Required for the Map Maker (Step 7) to work at all:**
+   - `GEMINI_API_KEY` — despite the name, this is actually your **OpenRouter** key (`sk-or-v1-...`). Get a free one at https://openrouter.ai/keys. It is used for every LLM call in the Map Maker.
+
+   **Strongly recommended (map quality will be worse without them):**
+   - `LIMITLESS_API_KEY` — your Limitless API key (starts with `lmts_`). Needed so the Map Maker can verify cross-exchange arbitrage pairs between Polymarket and Limitless. If you leave this blank, Limitless matching falls back to a public HTTP fetch, which may miss markets.
+
+   **Required only when you move on to trading (Step 8 Tab 2 — `python -m polyquant.main trade`):**
+   - `POLYGON_PRIVATE_KEY` — your Polygon wallet private key (`0x...`), used to sign Polymarket orders.
+   - `BASE_PRIVATE_KEY` — your Base wallet private key (`0x...`), used to sign Limitless orders.
+   - `ALCHEMY_API_KEY` — your Alchemy key for Polygon RPC. Get one at https://www.alchemy.com.
+
+   **Optional (safe to leave as the defaults):** everything else in `.env.example` — endpoints, timeouts, trading parameters, etc.
+
 5. **How to Save and Exit:**
    - Press `Ctrl + O` (the letter O, not zero) to Save.
    - Press **Enter** to confirm the file name.
@@ -151,9 +180,16 @@ Before the robot can trade, it needs to scan the market and create a map.
 
 Run this command:
 ```bash
-python -m polyquant.map_maker
+python -m polyquant.main map
 ```
-*Note: If it asks to download a model, let it. This takes a moment. Once it says it has finished making constraints, it will stop.*
+*Note: The first time you run this, the program will download a semantic model (~80 MB) into `~/.cache/huggingface/`. This takes 1–5 minutes — let it finish. On later runs the model is already cached and starts instantly.*
+
+*This scan can take 20–60 minutes depending on how many active markets there are. When it's done it will print a "Map Building Result" summary and exit on its own.*
+
+*If you want a quick smoke test first to make sure everything is wired up correctly, run a tiny scan:*
+```bash
+python -m polyquant.main map --limit 50
+```
 
 ---
 
@@ -169,13 +205,17 @@ tmux new -s polyquant
 ```
 *(You will see a green bar appear at the bottom of your screen. You are now inside Tmux!)*
 
-### 2. Tab 0: Run the Database (Redis) and Map Maker
+### 2. Tab 0: Re-run the Map Maker (whenever you want to refresh the market map)
 Every time you open a new tab, you need to go into the folder and activate Python.
+
+Redis is already running as a system service from Step 3, so you do **not** need to start it here. Just check that it responds and kick off a map build:
 ```bash
 cd ~/PolyQuant
 source venv/bin/activate
-redis-server --daemonize yes
+redis-cli ping
+python -m polyquant.main map
 ```
+*(You can leave this tab alone between map runs — the Map Maker exits on its own when it finishes, and you can re-run the last command whenever you want a fresh scan.)*
 
 ### 3. Tab 1: Run the Execution Engine (Rust)
 Let's make a new tab to run the next part of the program.

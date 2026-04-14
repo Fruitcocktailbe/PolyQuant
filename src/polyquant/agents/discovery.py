@@ -611,8 +611,8 @@ The YES Price is the current market probability (0.00 to 1.00).
             # asyncio.wait_for provides a hard upper bound.
             # Retry once on timeout/failure — OpenRouter rotates to a different
             # free model on each call, so the second attempt often succeeds.
-            LLM_CLUSTERING_TIMEOUT = 60  # seconds — generous but finite
-            MAX_ATTEMPTS = 2
+            LLM_CLUSTERING_TIMEOUT = 25  # seconds — just above inner client timeout (20s)
+            MAX_ATTEMPTS = 5  # More rotation chances on openrouter/free auto-router
             result = None
 
             for attempt in range(MAX_ATTEMPTS):

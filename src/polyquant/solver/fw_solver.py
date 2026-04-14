@@ -38,6 +38,7 @@ USAGE:
 
 import asyncio
 import numpy as np
+from datetime import datetime
 from typing import List, Dict, Tuple, Set, Optional, Any, TYPE_CHECKING
 from decimal import Decimal
 
@@ -884,6 +885,21 @@ class ArbitrageDetector:
                 logger.debug("Skipping: RHS is not 1.0", rhs=constraint.rhs)
                 continue
 
+            # P3.2 — partition integrity: every token must belong to the same market.
+            # Without this check, the Logic Architect could emit a "partition" made of
+            # outcomes from several independent markets whose prices happen to sum to
+            # < 1.0. Sizing it as risk-free would produce uncorrelated directional bets
+            # that could all lose simultaneously.
+            token_market_ids = {extract_market_id(tid) for tid in constraint.coefficients.keys()}
+            if len(token_market_ids) != 1:
+                logger.warning(
+                    "Skipping multi-market 'partition' — outcomes span multiple markets, not a real risk-free arb",
+                    constraint_id=constraint.constraint_id,
+                    market_ids=list(token_market_ids),
+                    token_count=len(constraint.coefficients),
+                )
+                continue
+
             # We found a potential Dutching ring!
             outcome_ids = list(constraint.coefficients.keys())
 
@@ -1080,8 +1096,44 @@ class ArbitrageDetector:
             # Liquidity confidence: 0.7 if tight (1.1x), 1.0 if ample (5x+)
             liquidity_confidence = min(1.0, 0.7 + (min_liquidity_ratio - 1.0) * 0.15)
 
-            # Staleness penalty (assume 0ms staleness for now, can be enhanced with order book age)
-            staleness_confidence = 1.0  # Placeholder for future enhancement
+            # P3.3: Staleness-based confidence penalty.
+            # Two-layer defense: hard reject if any leg exceeds ws_max_age_ms (dead
+            # man's switch), soft linear decay from 1.0 at soft_staleness_start_ms to
+            # 0.0 at ws_max_age_ms. OrderBook.timestamp is refreshed on every WS tick
+            # by the Polymarket client, so wall-clock comparison is correct here.
+            soft_start_ms = float(config.soft_staleness_start_ms)
+            hard_cut_ms = float(config.ws_max_age_ms)
+            now_dt = datetime.utcnow()
+            ring_staleness_factor = 1.0
+            ring_stale_reject = False
+            worst_age_ms = 0.0
+            for t in ring_trades:
+                ob = order_books.get(t.outcome_id)
+                if not ob:
+                    ring_stale_reject = True
+                    break
+                age_ms = (now_dt - ob.timestamp).total_seconds() * 1000.0
+                worst_age_ms = max(worst_age_ms, age_ms)
+                if age_ms > hard_cut_ms:
+                    logger.debug(
+                        "Ring rejected — quote exceeds hard staleness cutoff",
+                        token=t.outcome_id,
+                        age_ms=age_ms,
+                        hard_cut_ms=hard_cut_ms,
+                    )
+                    ring_stale_reject = True
+                    break
+                if age_ms > soft_start_ms:
+                    leg_factor = max(
+                        0.0,
+                        1.0 - (age_ms - soft_start_ms) / (hard_cut_ms - soft_start_ms),
+                    )
+                    ring_staleness_factor = min(ring_staleness_factor, leg_factor)
+
+            if ring_stale_reject:
+                continue
+
+            staleness_confidence = ring_staleness_factor
 
             # Combined confidence (80% liquidity, 20% staleness)
             confidence = min(1.0, liquidity_confidence * 0.8 + staleness_confidence * 0.2)

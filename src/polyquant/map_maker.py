@@ -136,7 +136,7 @@ class MapMaker:
     
     async def build_map(
         self,
-        limit: int = 500,
+        limit: int = 0,
         min_liquidity: float = 1000,
         skip_processed: bool = True,
     ) -> dict[str, Any]:

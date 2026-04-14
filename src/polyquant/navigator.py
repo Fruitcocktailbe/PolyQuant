@@ -56,6 +56,7 @@ from polyquant.data.limitless_client import LimitlessClient
 from polyquant.data.trade_store import TradeStore
 from polyquant.api.server import monitor, app, set_trade_store, set_constraint_store, setup_web_logging
 from polyquant.utils import config, get_logger
+from polyquant.utils.market_utils import extract_market_id
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
 import uvicorn
 
@@ -808,18 +809,30 @@ class Navigator:
                 self._ws_update_callback
             )
             
-        # 3. Limitless REST Polling Task (since no WS exists yet)
-        limitless_tokens = [tid for tid in token_id_list if "_" in tid and not tid.startswith("0x")]
-        # Identify matched cross-exchange tokens for fast-tier polling (250ms)
-        matched_limitless_tokens: set[str] = set()
+        # 3. Limitless REST Polling Task (since no WS exists yet).
+        # Build an authoritative token_id -> exchange map from manifests, replacing the
+        # earlier `"_" in tid` string heuristic with a deterministic lookup that matches
+        # what the solvers already do (see scip_solver.py:328, fw_solver.py:734).
+        token_exchange: dict[str, str] = {}
         for _cid in cluster_ids:
             _manifest = await self._store.load_manifest(_cid)
-            if _manifest and _manifest.market_exchanges:
-                for mid, exch in _manifest.market_exchanges.items():
-                    if exch.startswith("limitless"):
-                        # Build the token IDs for this Limitless market
-                        matched_limitless_tokens.add(f"{mid}_0")
-                        matched_limitless_tokens.add(f"{mid}_1")
+            if not (_manifest and _manifest.market_exchanges):
+                continue
+            for tid in token_id_list:
+                mid = extract_market_id(tid)
+                if mid in _manifest.market_exchanges:
+                    token_exchange[tid] = _manifest.market_exchanges[mid]
+
+        limitless_tokens = [tid for tid, exch in token_exchange.items() if exch.startswith("limitless")]
+        matched_limitless_tokens: set[str] = set(limitless_tokens)
+
+        unrouted = [tid for tid in token_id_list if tid not in token_exchange]
+        if unrouted:
+            logger.warning(
+                "Token IDs with no exchange mapping in manifests",
+                count=len(unrouted),
+                sample=unrouted[:5],
+            )
 
         if hasattr(self, "_limitless") and self._limitless and limitless_tokens:
              logger.info(f"Starting background REST polling for {len(limitless_tokens)} Limitless tokens ({len(matched_limitless_tokens)} fast-tier)")

@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from polyquant.utils import config, get_logger
 
@@ -49,6 +49,18 @@ class StoredConstraint(BaseModel):
     confidence: float
     reasoning: str
     source_markets: list[str] = Field(default_factory=list)
+
+    @field_validator("coefficients")
+    @classmethod
+    def _validate_token_id_types(cls, v: dict) -> dict:
+        for tid in v.keys():
+            if not isinstance(tid, str):
+                raise TypeError(
+                    f"Token ID must be str, got {type(tid).__name__}: {tid!r}"
+                )
+            if not tid:
+                raise ValueError("Token ID cannot be empty")
+        return v
 
 
 class StoredDependency(BaseModel):
