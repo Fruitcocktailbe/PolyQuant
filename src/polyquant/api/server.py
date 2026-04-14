@@ -248,18 +248,76 @@ def setup_web_logging():
     logging.getLogger("asyncio").addFilter(cancelled_filter)
 
 
+# Module-level singletons so repeat calls in the same process reuse one server.
+# The supervisor (`run` mode) calls start_api_server() directly, and Navigator's
+# __aenter__ / MapMaker's standalone main() also each call it. With this guard,
+# the second+ call returns the existing (server, task) tuple instead of trying
+# to bind a second uvicorn to the same port.
+_running_server: "uvicorn.Server | None" = None  # type: ignore[name-defined]
+_running_task: "asyncio.Task[None] | None" = None
+
+
 async def start_api_server(
-    host: str = "0.0.0.0",
-    port: int = 8000,
+    host: str | None = None,
+    port: int | None = None,
 ):
-    """Boot the dashboard server. Returns (server, task) for graceful shutdown."""
+    """
+    Boot the dashboard server. Returns (server, task) for graceful shutdown.
+
+    Idempotent within a process: if already running, returns the existing
+    handles unchanged. Host/port default to config.api_server_host /
+    config.api_server_port; explicit args override for tests.
+    """
+    global _running_server, _running_task
     import uvicorn
-    config_uv = uvicorn.Config(app, host=host, port=port, log_level="warning")
+
+    if _running_server is not None and _running_task is not None and not _running_task.done():
+        return _running_server, _running_task
+
+    # Resolve bind target. Import locally so tests can monkeypatch config.
+    from polyquant.utils.config import config as _cfg
+    resolved_host = host if host is not None else _cfg.api_server_host
+    resolved_port = port if port is not None else _cfg.api_server_port
+
+    config_uv = uvicorn.Config(app, host=resolved_host, port=resolved_port, log_level="warning")
     server = uvicorn.Server(config_uv)
-    task = asyncio.create_task(server.serve())
-    await asyncio.sleep(0.5)  # give uvicorn time to bind
+    task = asyncio.create_task(server.serve(), name="uvicorn_server")
+
+    # Observe startup instead of blindly sleeping: poll server.started and
+    # re-raise any exception from the server task (bind errors, etc.) in the
+    # caller's frame — uvicorn otherwise swallows them into a SystemExit(1)
+    # that kills the whole interpreter with no actionable message.
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while not server.started:
+        if task.done():
+            # server.serve() exited before signalling started — surface the cause.
+            exc = task.exception()
+            if isinstance(exc, OSError) and getattr(exc, "errno", None) in (48, 98, 10048):
+                raise RuntimeError(
+                    f"API server cannot bind to {resolved_host}:{resolved_port} — address already in use.\n"
+                    f"Another PolyQuant process is probably still holding the port. Stop it with:\n"
+                    f"    lsof -iTCP:{resolved_port} -sTCP:LISTEN    # find the PID\n"
+                    f"    kill <pid>\n"
+                    f"Or pick a different port:\n"
+                    f"    API_SERVER_PORT=8001 python -m polyquant.main run"
+                ) from exc
+            if exc is not None:
+                raise RuntimeError(
+                    f"API server failed to start on {resolved_host}:{resolved_port}: {exc}"
+                ) from exc
+            raise RuntimeError(
+                f"API server task exited during startup on {resolved_host}:{resolved_port} with no exception"
+            )
+        if asyncio.get_running_loop().time() > deadline:
+            raise RuntimeError(
+                f"API server did not become ready within 5s on {resolved_host}:{resolved_port}"
+            )
+        await asyncio.sleep(0.05)
+
     setup_web_logging()
-    logger.info(f"🌐 API server started on http://{host}:{port}")
+    logger.info(f"🌐 API server started on http://{resolved_host}:{resolved_port}")
+    _running_server = server
+    _running_task = task
     return server, task
 
 # Global instance

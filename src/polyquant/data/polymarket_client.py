@@ -307,40 +307,32 @@ class PolymarketClient:
             raise RuntimeError("Client not initialized. Use 'async with client:'")
         
         logger.debug("Fetching active markets", limit=limit, min_liquidity=min_liquidity)
-        
-        try:
-            # Fetch markets from GAMMA API (not CLOB!) — with retry
-            response = await self._retry_get(
-                self._gamma_client,
-                "/markets",
-                params={
-                    "limit": limit,
-                    "offset": offset,
-                    "active": True,
-                },
-            )
-            data = response.json()
-            
-            markets = []
-            for item in data:
-                # Parse market data
-                market = self._parse_market(item)
-                
-                # Apply liquidity filter
-                if market.liquidity >= min_liquidity:
-                    markets.append(market)
-            
-            logger.info(
-                f"Fetched {len(data)} markets ({len(markets)} after filtering)",
-                total=len(data),
-                after_filter=len(markets),
-            )
-            
-            return markets, len(data)
-            
-        except httpx.HTTPError as e:
-            logger.error("Failed to fetch markets", error=str(e))
-            return [], 0
+
+        # Fetch markets from GAMMA API (not CLOB!) — with retry
+        response = await self._retry_get(
+            self._gamma_client,
+            "/markets",
+            params={
+                "limit": limit,
+                "offset": offset,
+                "active": True,
+            },
+        )
+        data = response.json()
+
+        markets = []
+        for item in data:
+            market = self._parse_market(item)
+            if market.liquidity >= min_liquidity:
+                markets.append(market)
+
+        logger.info(
+            f"Fetched {len(data)} markets ({len(markets)} after filtering)",
+            total=len(data),
+            after_filter=len(markets),
+        )
+
+        return markets, len(data)
     
     async def get_active_events(
         self,

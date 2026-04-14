@@ -109,22 +109,18 @@ class LimitlessClient:
                     
         raise last_error # type: ignore
 
-    async def get_markets(self, limit: int = 200) -> List[Dict[str, Any]]:
+    async def get_markets(self, limit: int = 20) -> List[Dict[str, Any]]:
         """Fetch all active markets from Limitless via pagination."""
         all_markets = []
         page = 1
-        
+
         while True:
             path = "/markets/active"
-            try:
-                res = await self._retry_request("GET", path, params={
-                    "limit": limit,
-                    "page": page
-                })
-            except Exception as e:
-                logger.error(f"Failed to fetch Limitless markets: {e}")
-                break
-                
+            res = await self._retry_request("GET", path, params={
+                "limit": limit,
+                "page": page
+            })
+
             data = res.json()
             batch = data.get("data", []) or data.get("markets", [])
             

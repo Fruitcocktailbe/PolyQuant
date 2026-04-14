@@ -88,6 +88,7 @@ def _try_once(
     messages: list[dict],
     temperature: float,
     use_json_mode: bool,
+    max_tokens: int,
 ) -> tuple[dict[str, Any] | None, str]:
     """
     Single attempt against a specific model.
@@ -106,6 +107,7 @@ def _try_once(
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": max_tokens,
         }
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -197,6 +199,7 @@ def call_llm_json(
     system_prompt: str = "",
     model: str | None = None,
     temperature: float | None = None,
+    max_tokens: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Call the LLM and parse a JSON response.
@@ -220,6 +223,7 @@ def call_llm_json(
 
     primary = model or config.llm_model
     temperature = temperature if temperature is not None else config.llm_temperature
+    effective_max_tokens = max_tokens if max_tokens is not None else getattr(config, "llm_max_tokens", 4096)
 
     # Build the model chain: primary first, then fallbacks (deduped, primary excluded)
     fallbacks = list(getattr(config, "llm_fallback_models", []) or [])
@@ -254,6 +258,7 @@ def call_llm_json(
                 messages=messages,
                 temperature=temperature,
                 use_json_mode=use_json_mode,
+                max_tokens=effective_max_tokens,
             )
 
             if status == "ok":

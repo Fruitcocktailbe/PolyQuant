@@ -46,7 +46,7 @@ CACHE_DIR = Path(".polyquant/constraints")
 CACHE_FILE = CACHE_DIR / "market_pairs.json"
 
 MIN_LIQUIDITY = 2500.0
-LIMITLESS_PAGE_SIZE = 200
+LIMITLESS_PAGE_SIZE = 20
 EMBEDDING_TOP_K = 5
 SIMILARITY_FLOOR = 0.50      # absolute floor — below this we don't even consider
 SIMILARITY_VERIFY = 0.65     # threshold for sending to LLM

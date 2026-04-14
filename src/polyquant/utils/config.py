@@ -402,22 +402,29 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
 
     llm_model: str = Field(
-        default="z-ai/glm-4.5-air:free",
-        description="Primary LLM Model identifier (pinned; avoid opaque pools like 'openrouter/free')"
+        default="meta-llama/llama-3.3-70b-instruct:free",
+        description="Primary LLM Model identifier. Non-reasoning instruct model preferred for structured JSON."
     )
 
     llm_fallback_models: list[str] = Field(
         default_factory=lambda: [
-            "google/gemma-3n-e2b-it:free",
-            "openrouter/free",
+            "google/gemma-3-27b-it:free",
+            "qwen/qwen3-next-80b-a3b-instruct:free",
         ],
-        description="Models to try if the primary returns empty/invalid JSON (in order)"
+        description="Models to try if the primary returns empty/invalid JSON (in order). All non-reasoning instruct models."
     )
 
     llm_temperature: float = Field(
         default=0.3,
         ge=0.0, le=2.0,
         description="LLM Temperature for generation"
+    )
+
+    llm_max_tokens: int = Field(
+        default=4096,
+        ge=256,
+        le=32768,
+        description="Hard cap on LLM output tokens per call. Prevents reasoning models from burning the budget on hidden thinking."
     )
 
     validator_confidence_threshold: float = Field(
@@ -468,6 +475,48 @@ class PolyQuantConfig(BaseSettings):
     private_rpc_url: str | None = Field(
         default=None,
         description="Optional private RPC for low-latency submission"
+    )
+
+    # =========================================================================
+    # Dashboard API Server
+    # =========================================================================
+
+    api_server_host: str = Field(
+        default="0.0.0.0",
+        description="Bind host for the dashboard API server"
+    )
+
+    api_server_port: int = Field(
+        default=8000,
+        ge=1, le=65535,
+        description="Bind port for the dashboard API server"
+    )
+
+    # =========================================================================
+    # Supervisor (`run` mode) - periodic MapMaker inside the Navigator loop
+    # =========================================================================
+
+    map_interval_seconds: int = Field(
+        default=3600,
+        ge=1,
+        description="Seconds between MapMaker runs in supervisor (`run`) mode"
+    )
+
+    map_run_on_start: bool = Field(
+        default=True,
+        description="Run MapMaker immediately on supervisor startup, before the first interval"
+    )
+
+    map_limit: int = Field(
+        default=500,
+        ge=0,
+        description="Markets per MapMaker run in supervisor mode (0 = no limit)"
+    )
+
+    map_min_liquidity: float = Field(
+        default=1000.0,
+        ge=0.0,
+        description="Minimum liquidity filter for MapMaker in supervisor mode"
     )
 
 

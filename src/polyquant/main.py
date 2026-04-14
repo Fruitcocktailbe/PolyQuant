@@ -38,6 +38,7 @@ USAGE:
 
 import asyncio
 import argparse
+import contextlib
 import signal
 from typing import Any
 
@@ -100,6 +101,89 @@ async def run_map_maker(
         return {"status": "failed", "error": str(e)}
 
 
+async def run_supervisor() -> None:
+    """
+    Run the Navigator and MapMaker together in one process.
+
+    Owns a single uvicorn server for the whole lifetime so MapMaker and
+    Navigator share the in-memory monitor and one dashboard at port 8000.
+    MapMaker is invoked on a timer (config.map_interval_seconds); Navigator
+    hot-reloads new manifests from disk as they land. On shutdown, cancels
+    the timer, stops Navigator, and drains uvicorn.
+
+    Note on shared state: MapMaker drives monitor.state.pipeline_stage
+    (DISCOVERY/LOGIC/MATCHING/COMPLETE) during each cycle. Navigator sets
+    pipeline_stage=COMPLETE once at startup; after that, MapMaker owns it.
+    """
+    from polyquant.api.server import monitor, start_api_server
+    from polyquant.map_maker import MapMaker
+    from polyquant.navigator import Navigator
+    from polyquant.utils.config import config
+
+    logger.info("Starting supervisor (Navigator + periodic MapMaker)...")
+
+    # Own the dashboard server for the whole supervisor lifetime. start_api_server
+    # is idempotent, so Navigator.__aenter__'s own call becomes a no-op.
+    server, server_task = await start_api_server()
+
+    async def map_maker_timer() -> None:
+        if not config.map_run_on_start:
+            await asyncio.sleep(config.map_interval_seconds)
+        while True:
+            try:
+                logger.info(
+                    "Supervisor: starting MapMaker cycle",
+                    limit=config.map_limit,
+                    min_liquidity=config.map_min_liquidity,
+                )
+                await monitor.update_status(status="MAPPING")
+                async with MapMaker() as mm:
+                    result = await mm.build_map(
+                        limit=config.map_limit,
+                        min_liquidity=config.map_min_liquidity,
+                        skip_processed=True,
+                    )
+                logger.info("Supervisor: MapMaker cycle finished", result=result)
+                await monitor.update_status(status="MAPPING_COMPLETE")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("Supervisor: MapMaker cycle failed", error=str(e), exc_info=True)
+                await monitor.update_status(status="MAPPING_FAILED")
+            await asyncio.sleep(config.map_interval_seconds)
+
+    navigator: Navigator | None = None
+    map_task: asyncio.Task[None] = asyncio.create_task(
+        map_maker_timer(), name="map_maker_timer"
+    )
+
+    def _graceful(sig: int, frame: Any) -> None:
+        print("\nShutdown signal received...")
+        if navigator is not None:
+            navigator.stop()
+        map_task.cancel()
+
+    signal.signal(signal.SIGINT, _graceful)
+    signal.signal(signal.SIGTERM, _graceful)
+
+    try:
+        navigator = Navigator()
+        async with navigator:
+            await navigator.run()
+    except KeyboardInterrupt:
+        logger.info("Supervisor stopped by user")
+    except Exception as e:
+        logger.error("Supervisor failed", error=str(e), exc_info=True)
+        raise
+    finally:
+        map_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await map_task
+        server.should_exit = True
+        with contextlib.suppress(asyncio.CancelledError):
+            await server_task
+
+
 async def run_navigator() -> None:
     """
     Run the Navigator for real-time trading.
@@ -139,22 +223,25 @@ async def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  map       Run the Map Maker (offline constraint analysis)
-  trade     Run the Navigator (real-time trading)
+  map       Run the Map Maker once (offline constraint analysis)
+  trade     Run the Navigator alone (real-time trading; assumes a map exists)
+  run       Supervisor: Navigator + periodic MapMaker in one process
+            (recommended for production — shares one dashboard server)
 
 Typical Workflow:
-  1. Run 'map' mode to build constraint manifests (first time or periodically)
-  2. Run 'trade' mode to start real-time trading
+  1. Run 'run' mode for continuous operation (supervisor manages map refreshes).
+  2. Use 'map' / 'trade' for one-shot debugging.
 
 Examples:
-  python -m polyquant.main map      # Build constraint map
-  python -m polyquant.main trade    # Start trading
+  python -m polyquant.main run      # Continuous supervisor (production)
+  python -m polyquant.main map      # Build constraint map (one-shot)
+  python -m polyquant.main trade    # Start trading (one-shot)
         """,
     )
 
     parser.add_argument(
         "mode",
-        choices=["map", "trade"],
+        choices=["map", "trade", "run"],
         nargs="?",
         default="map",
         help="Execution mode (default: map)",
@@ -197,6 +284,8 @@ Examples:
         )
     elif args.mode == "trade":
         await run_navigator()
+    elif args.mode == "run":
+        await run_supervisor()
     else:
         # This shouldn't happen due to argparse choices, but just in case
         logger.error(f"Unknown mode: {args.mode}")
