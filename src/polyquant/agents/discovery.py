@@ -676,6 +676,7 @@ The YES Price is the current market probability (0.00 to 1.00).
                             prompt=f"Analyze these {len(markets)} markets for arbitrage opportunities:\n\n{market_descriptions}",
                             system_prompt=self.CLUSTERING_PROMPT,
                             temperature=0.2,
+                            model=config.llm_model_discovery,
                         ),
                         timeout=LLM_CLUSTERING_TIMEOUT,
                     )

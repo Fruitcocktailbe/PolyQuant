@@ -513,6 +513,7 @@ class ExchangeMatcher:
                         prompt=prompt,
                         system_prompt="Answer JSON only.",
                         temperature=0.1,
+                        model=config.llm_model_matcher,
                     )
                     await asyncio.sleep(LLM_PACING_SECONDS)
                 except Exception as e:

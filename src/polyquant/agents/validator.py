@@ -349,6 +349,7 @@ Be thorough and conservative. Flag anything that could cause issues."""
             prompt=f"ANALYSIS TO VALIDATE:\n\n{analysis_text}",
             system_prompt=self.VALIDATION_PROMPT,
             temperature=0.1,
+            model=config.llm_model_validator,
         )
         
         if not result:

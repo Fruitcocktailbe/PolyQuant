@@ -408,16 +408,36 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
 
     llm_model: str = Field(
-        default="meta-llama/llama-3.3-70b-instruct:free",
-        description="Primary LLM Model identifier. Non-reasoning instruct model preferred for structured JSON."
+        default="gemini-2.5-flash-lite",
+        description="Primary LLM model (Google AI Studio). Default for any caller that doesn't specify a per-agent model."
+    )
+
+    llm_model_discovery: str = Field(
+        default="gemini-2.5-flash-lite",
+        description="Model for DiscoveryAgent clustering (hot path, 15 RPM / 1000 RPD on free tier)."
+    )
+
+    llm_model_logic: str = Field(
+        default="gemini-2.5-pro",
+        description="Model for LogicArchitect constraint extraction (reasoning-heavy, 5 RPM / 100 RPD on free tier)."
+    )
+
+    llm_model_validator: str = Field(
+        default="gemini-2.5-flash",
+        description="Model for ValidatorAgent (balanced quality/quota, 10 RPM / 250 RPD on free tier)."
+    )
+
+    llm_model_matcher: str = Field(
+        default="gemini-2.5-flash-lite",
+        description="Model for ExchangeMatcher Polymarket<->Limitless LLM matching (high volume, shares flash-lite pool with discovery)."
     )
 
     llm_fallback_models: list[str] = Field(
         default_factory=lambda: [
-            "google/gemma-3-27b-it:free",
-            "qwen/qwen3-next-80b-a3b-instruct:free",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
         ],
-        description="Models to try if the primary returns empty/invalid JSON (in order). All non-reasoning instruct models."
+        description="Fallback chain when primary returns empty/invalid JSON. Ordered by free-tier quota headroom."
     )
 
     llm_temperature: float = Field(

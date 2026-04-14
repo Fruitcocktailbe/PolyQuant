@@ -665,6 +665,7 @@ CRITICAL RULES:
             prompt=f"Analyze these markets for logical dependencies:\n\n{market_descriptions}",
             system_prompt=self.ANALYSIS_PROMPT,
             temperature=0.1,
+            model=config.llm_model_logic,
         )
         
         if not result:

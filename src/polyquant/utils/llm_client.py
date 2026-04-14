@@ -1,8 +1,9 @@
 """
 Shared LLM Client for PolyQuant 2.0
 
-Uses OpenRouter's OpenAI-compatible API to route requests to free models.
-This replaces direct Google Gemini SDK calls across all agents.
+Calls Google AI Studio directly via its OpenAI-compatible endpoint. Each agent
+passes its own model id (see config.llm_model_*) so per-tier free quotas can
+be exploited independently.
 
 USAGE:
 ------
@@ -10,7 +11,7 @@ USAGE:
 
     client = get_llm_client()
     response = client.chat.completions.create(
-        model="google/gemini-2.0-flash-exp:free",
+        model="gemini-2.5-flash-lite",
         messages=[{"role": "user", "content": "Hello"}],
     )
 """
@@ -26,19 +27,19 @@ from polyquant.utils import config, get_logger
 
 logger = get_logger(__name__)
 
-# OpenRouter base URL (OpenAI-compatible)
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Google AI Studio OpenAI-compatible endpoint
+GOOGLE_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 @lru_cache(maxsize=1)
 def get_llm_client() -> OpenAI | None:
     """
-    Get a shared OpenAI-compatible client pointed at OpenRouter.
+    Get a shared OpenAI-compatible client pointed at Google AI Studio.
 
     Returns:
-        OpenAI client configured for OpenRouter, or None if no API key.
+        OpenAI client configured for Google's OpenAI-compat endpoint, or None
+        if the configured key is missing/invalid.
     """
-    # Use config value, fall back to empty if missing
     try:
         api_key_wrapped = getattr(config, "gemini_api_key", None)
         api_key = api_key_wrapped.get_secret_value() if api_key_wrapped else ""
@@ -49,17 +50,22 @@ def get_llm_client() -> OpenAI | None:
         logger.warning("LLM keys not configured — LLM clustering/matching disabled")
         return None
 
+    if api_key.startswith("sk-or-"):
+        logger.error(
+            "GEMINI_API_KEY looks like an OpenRouter key (sk-or-...). "
+            "PolyQuant now calls Google AI Studio directly — generate a new key "
+            "at https://aistudio.google.com/apikey (format: AIzaSy...) and put "
+            "it in .env as GEMINI_API_KEY. LLM features disabled until fixed."
+        )
+        return None
+
     client = OpenAI(
-        base_url=OPENROUTER_BASE_URL,
+        base_url=GOOGLE_OPENAI_BASE_URL,
         api_key=api_key,
-        timeout=45.0,  # CRITICAL: Allow enough time for LLM JSON generation
-        default_headers={
-            "HTTP-Referer": "https://github.com/polyquant",
-            "X-OpenRouter-Title": "PolyQuant",
-        },
+        timeout=45.0,
     )
 
-    logger.info("OpenRouter LLM client initialized", base_url=OPENROUTER_BASE_URL)
+    logger.info("Google AI Studio LLM client initialized", base_url=GOOGLE_OPENAI_BASE_URL)
     return client
 
 
