@@ -40,6 +40,12 @@ from polyquant.utils import config, get_logger
 logger = get_logger(__name__)
 
 
+# Bumped from "1.0" → "1.1" when MapMaker stopped filtering constraints by
+# snapshot-time liquidity/spread. v1.0 manifests are missing structurally
+# valid constraints and are auto-quarantined on load.
+CURRENT_MANIFEST_VERSION = "1.1"
+
+
 class StoredConstraint(BaseModel):
     """A single constraint stored in the ConstraintStore."""
     constraint_id: str
@@ -88,7 +94,7 @@ class ConstraintManifest(BaseModel):
     dependencies: list[StoredDependency] = Field(default_factory=list)
     correlations: list[Any] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    version: str = "1.0"
+    version: str = CURRENT_MANIFEST_VERSION
     
     @property
     def constraint_count(self) -> int:
@@ -192,6 +198,59 @@ class ConstraintStore:
             logger.error("Failed to load manifest", cluster_id=cluster_id, error=str(e))
             return None
     
+    def quarantine_legacy_manifests(self) -> int:
+        """
+        Move pre-CURRENT_MANIFEST_VERSION manifests to _legacy/.
+
+        Pre-1.1 manifests were generated under MapMaker logic that filtered
+        constraints by snapshot-time liquidity, so they're missing structurally
+        valid constraints. Forcing a re-map yields correct manifests.
+
+        Returns:
+            Count of manifests moved.
+        """
+        legacy_dir = self.base_path / "_legacy"
+        moved: list[str] = []
+
+        for path in self.base_path.glob("*.json"):
+            if path.name == "_index.json":
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except Exception as e:
+                logger.warning("Could not inspect manifest for quarantine", file=path.name, error=str(e))
+                continue
+            version = data.get("version", "1.0")
+            if version < CURRENT_MANIFEST_VERSION:
+                legacy_dir.mkdir(exist_ok=True)
+                path.rename(legacy_dir / path.name)
+                moved.append(path.stem)
+
+        if moved:
+            # Drop quarantined cluster_ids from the index so list_clusters() stays consistent.
+            index_path = self.base_path / "_index.json"
+            if index_path.exists():
+                try:
+                    idx_data = json.loads(index_path.read_text())
+                    idx_data["clusters"] = [
+                        cid for cid in idx_data.get("clusters", []) if cid not in moved
+                    ]
+                    idx_data["updated_at"] = datetime.utcnow().isoformat()
+                    temp_path = index_path.with_suffix(".tmp")
+                    temp_path.write_text(json.dumps(idx_data, indent=2))
+                    temp_path.replace(index_path)
+                except Exception as e:
+                    logger.warning("Could not update index after quarantine", error=str(e))
+
+            logger.warning(
+                f"Quarantined {len(moved)} pre-{CURRENT_MANIFEST_VERSION} manifests to _legacy/. "
+                "These were generated under MapMaker logic that filtered constraints by "
+                "snapshot liquidity and are missing structurally valid constraints. "
+                "Run `python -m polyquant.map_maker` to regenerate fresh manifests."
+            )
+
+        return len(moved)
+
     async def load_all_manifests(self) -> list[ConstraintManifest]:
         """
         Load all stored constraint manifests.
@@ -202,6 +261,9 @@ class ConstraintStore:
             List of all stored ConstraintManifests.
         """
         import aiofiles
+
+        # First-pass quarantine: move pre-1.1 manifests aside before loading.
+        self.quarantine_legacy_manifests()
 
         # Get all manifest files (excluding index)
         manifest_files = [
@@ -263,20 +325,39 @@ class ConstraintStore:
     async def list_clusters(self) -> list[str]:
         """
         List all stored cluster IDs.
-        
+
         Returns:
             List of cluster IDs.
         """
         index_path = self.base_path / "_index.json"
-        
+
         if not index_path.exists():
             return []
-        
+
         try:
             data = json.loads(index_path.read_text())
             return data.get("clusters", [])
         except Exception:
             return []
+
+    def list_clusters_with_mtimes(self) -> dict[str, float]:
+        """
+        Return cluster_id → on-disk mtime for every manifest file.
+
+        Used by the hot-reload loop to detect content updates: if MapMaker
+        rewrites an existing manifest (e.g. NegRisk clusters reuse stable
+        cluster_ids across runs), the mtime advances and the navigator can
+        re-inject the updated constraints.
+        """
+        result: dict[str, float] = {}
+        for path in self.base_path.glob("*.json"):
+            if path.name == "_index.json":
+                continue
+            try:
+                result[path.stem] = path.stat().st_mtime
+            except OSError:
+                continue
+        return result
     
     async def _update_index(self, cluster_id: str) -> None:
         """Update the index file with a new cluster ID."""

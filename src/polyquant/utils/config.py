@@ -338,6 +338,45 @@ class PolyQuantConfig(BaseSettings):
     )
 
     # =========================================================================
+    # Correlation Trading (statistical leader-laggard signals)
+    # =========================================================================
+
+    correlation_execution_enabled: bool = Field(
+        default=False,
+        description="Master switch for correlation-signal trade execution. "
+                    "When False, signals are logged but never executed."
+    )
+
+    correlation_kelly_fraction: float = Field(
+        default=0.25,
+        ge=0.0, le=1.0,
+        description="Extra multiplicative fraction applied to Kelly size for correlation "
+                    "trades (stacks on top of kelly_fraction). Conservative because "
+                    "correlation is statistical, not guaranteed arbitrage."
+    )
+
+    correlation_max_probability: float = Field(
+        default=0.75,
+        ge=0.5, le=0.99,
+        description="Hard cap on the effective probability fed to the position sizer "
+                    "for correlation trades, regardless of signal strength."
+    )
+
+    correlation_outcome_delay_minutes: float = Field(
+        default=10.0,
+        ge=0.1,
+        description="Minutes to wait after a correlation trade before resolving the signal "
+                    "outcome (laggard caught up = correct) and updating pair accuracy."
+    )
+
+    correlation_max_signal_gap_s: float = Field(
+        default=5.0,
+        ge=0.1,
+        description="Max seconds between the previous and current tick for correlation "
+                    "signal deltas to be trusted. Longer gaps mean stale price info."
+    )
+
+    # =========================================================================
     # Market Discovery & Filtering
     # =========================================================================
 
@@ -369,8 +408,16 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
 
     llm_model: str = Field(
-        default="openrouter/free",
-        description="LLM Model identifier (e.g., 'openrouter/free', 'google/gemini-2.0-flash-exp:free')"
+        default="z-ai/glm-4.5-air:free",
+        description="Primary LLM Model identifier (pinned; avoid opaque pools like 'openrouter/free')"
+    )
+
+    llm_fallback_models: list[str] = Field(
+        default_factory=lambda: [
+            "google/gemma-3n-e2b-it:free",
+            "openrouter/free",
+        ],
+        description="Models to try if the primary returns empty/invalid JSON (in order)"
     )
 
     llm_temperature: float = Field(

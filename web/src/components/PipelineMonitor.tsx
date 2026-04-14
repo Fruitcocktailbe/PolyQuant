@@ -13,11 +13,48 @@ interface PipelineEvent {
     duration?: number;
 }
 
+interface LLMPhaseProgress {
+    done: number;
+    total: number;
+    current: string;
+}
+
 interface PipelineMonitorProps {
     stage: string;
     mappedPairs: any[];
     pipelineEvents: PipelineEvent[];
+    llmProgress?: Record<string, LLMPhaseProgress>;
 }
+
+/** Compact per-phase progress bar shown in the header */
+const PhaseProgressBar: React.FC<{
+    phase: 'LOGIC' | 'MATCHING';
+    progress: LLMPhaseProgress;
+}> = ({ phase, progress }) => {
+    const { done, total, current } = progress;
+    if (!total || total <= 0) return null;
+    const pct = Math.min(100, Math.max(0, (done / total) * 100));
+    const barColor = phase === 'LOGIC' ? 'bg-neon-purple' : 'bg-neon-green';
+    const textColor = phase === 'LOGIC' ? 'text-neon-purple' : 'text-neon-green';
+    const isDone = done >= total;
+
+    return (
+        <div className="flex items-center gap-1.5 min-w-fit" title={current || phase}>
+            <span className={`text-[8px] font-black uppercase tracking-widest ${textColor}`}>
+                {phase}
+            </span>
+            <span className={`text-[9px] font-mono tabular-nums ${isDone ? 'text-neon-green' : textColor}`}>
+                {done}/{total}
+            </span>
+            <div className="w-16 h-1 bg-white/10 rounded-none overflow-hidden">
+                <div
+                    className={`h-full ${barColor} transition-all duration-300`}
+                    style={{ width: `${pct}%` }}
+                />
+            </div>
+        </div>
+    );
+};
 
 const STAGES = [
     { key: 'DISCOVERY', label: 'Discovery', icon: Search },
@@ -98,7 +135,7 @@ const EventCard = memo<{ event: PipelineEvent }>(({ event }) => {
 EventCard.displayName = 'EventCard';
 
 
-export const PipelineMonitor: React.FC<PipelineMonitorProps> = memo(({ stage, mappedPairs: _mappedPairs, pipelineEvents }) => {
+export const PipelineMonitor: React.FC<PipelineMonitorProps> = memo(({ stage, mappedPairs: _mappedPairs, pipelineEvents, llmProgress }) => {
     const scrollRef = useRef<HTMLDivElement>(null);
 
     // Auto-scroll when new events arrive (only if user is near bottom)
@@ -112,37 +149,54 @@ export const PipelineMonitor: React.FC<PipelineMonitorProps> = memo(({ stage, ma
     }, [pipelineEvents.length]);
 
     const eventCount = pipelineEvents.length;
+    const logicProg = llmProgress?.LOGIC ?? { done: 0, total: 0, current: '' };
+    const matchProg = llmProgress?.MATCHING ?? { done: 0, total: 0, current: '' };
+    const anyProgress = (logicProg.total > 0) || (matchProg.total > 0);
+    const currentLabel = matchProg.total > 0 && matchProg.current
+        ? matchProg.current
+        : logicProg.current || '';
 
     return (
         <div className="bg-charcoal/50 border border-white/5 backdrop-blur-sm flex-1 flex flex-col min-h-0 relative overflow-hidden group">
             {/* Header / Stepper */}
-            <div className="p-3 border-b border-white/5 bg-black/20 flex gap-3 overflow-x-auto custom-scrollbar items-center">
-                {STAGES.map((s, idx) => {
-                    const isActive = stage === s.key;
-                    const isCompleted = STAGES.findIndex(st => st.key === stage) > idx;
-                    const Icon = s.icon;
+            <div className="border-b border-white/5 bg-black/20">
+                <div className="p-3 flex gap-3 overflow-x-auto custom-scrollbar items-center">
+                    {STAGES.map((s, idx) => {
+                        const isActive = stage === s.key;
+                        const isCompleted = STAGES.findIndex(st => st.key === stage) > idx;
+                        const Icon = s.icon;
 
-                    return (
-                        <div key={s.key} className="flex items-center gap-1.5 min-w-fit">
-                            <div className={`p-1 rounded-none border ${isActive ? 'bg-neon-cyan/20 border-neon-cyan text-neon-cyan animate-pulse' :
-                                    isCompleted ? 'bg-neon-green/10 border-neon-green/30 text-neon-green' :
-                                        'bg-white/5 border-white/10 text-gray-600'
-                                }`}>
-                                <Icon className="w-2.5 h-2.5" />
+                        return (
+                            <div key={s.key} className="flex items-center gap-1.5 min-w-fit">
+                                <div className={`p-1 rounded-none border ${isActive ? 'bg-neon-cyan/20 border-neon-cyan text-neon-cyan animate-pulse' :
+                                        isCompleted ? 'bg-neon-green/10 border-neon-green/30 text-neon-green' :
+                                            'bg-white/5 border-white/10 text-gray-600'
+                                    }`}>
+                                    <Icon className="w-2.5 h-2.5" />
+                                </div>
+                                <span className={`text-[9px] font-bold uppercase tracking-widest ${isActive ? 'text-white' : isCompleted ? 'text-neon-green/70' : 'text-gray-600'
+                                    }`}>
+                                    {s.label}
+                                </span>
+                                {idx < STAGES.length - 1 && <div className="ml-1 w-3 h-[1px] bg-white/5" />}
                             </div>
-                            <span className={`text-[9px] font-bold uppercase tracking-widest ${isActive ? 'text-white' : isCompleted ? 'text-neon-green/70' : 'text-gray-600'
-                                }`}>
-                                {s.label}
-                            </span>
-                            {idx < STAGES.length - 1 && <div className="ml-1 w-3 h-[1px] bg-white/5" />}
-                        </div>
-                    );
-                })}
+                        );
+                    })}
 
-                <div className="ml-auto flex items-center gap-2">
-                    <Database className="w-3 h-3 text-gray-600" />
-                    <span className="text-[9px] text-gray-500 font-mono">{eventCount} events</span>
+                    <div className="ml-auto flex items-center gap-3">
+                        <PhaseProgressBar phase="LOGIC" progress={logicProg} />
+                        <PhaseProgressBar phase="MATCHING" progress={matchProg} />
+                        <div className="flex items-center gap-2">
+                            <Database className="w-3 h-3 text-gray-600" />
+                            <span className="text-[9px] text-gray-500 font-mono">{eventCount} events</span>
+                        </div>
+                    </div>
                 </div>
+                {anyProgress && currentLabel && (
+                    <div className="px-3 pb-1.5 -mt-1 text-[9px] text-gray-500 font-mono truncate">
+                        <span className="text-gray-600">&rarr;&nbsp;</span>{currentLabel}
+                    </div>
+                )}
             </div>
 
             {/* Timeline Feed */}

@@ -13,6 +13,7 @@ from polyquant.agents.validator import ValidatedResult
 from polyquant.agents.logic_architect import LogicalConstraint, AnalysisResult
 from polyquant.data import OrderBook, OrderSide, ProposedTrade, OrderLevel
 from polyquant.risk.position_sizing import PositionSizer
+from polyquant.utils.config import config
 
 class TestUtils(unittest.TestCase):
     def test_extract_market_id(self):
@@ -74,31 +75,39 @@ class TestSolvers(unittest.IsolatedAsyncioTestCase):
         solver._solve_with_scip.assert_called_once()
 
     async def test_arbitrage_detector_async_call(self):
-        scip = SCIPSolver()
-        sizer = PositionSizer()
-        detector = ArbitrageDetector(scip_solver=scip, position_sizer=sizer)
-        
-        # Mock fw_solver.find_opportunity
-        detector.fw_solver.find_opportunity = AsyncMock(return_value={
-            "m1_yes": 0.7,
-            "m1_no": 0.35,
-        })
-        
-        opp = await detector.detect(self.validated, self.order_books)
-        
-        self.assertIsNotNone(opp)
-        self.assertGreater(len(opp.trades), 0)
-        detector.fw_solver.find_opportunity.assert_called_once()
-        
-        trades = {t.outcome_id: t for t in opp.trades}
-        print(f"TRADES FOUND: {trades}")
-        self.assertIn("m1_yes", trades)
-        self.assertEqual(trades["m1_yes"].side, OrderSide.BUY)
-        self.assertEqual(trades["m1_yes"].limit_price, Decimal("0.6"))
-        
-        self.assertIn("m1_no", trades)
-        self.assertEqual(trades["m1_no"].side, OrderSide.BUY)
-        self.assertEqual(trades["m1_no"].limit_price, Decimal("0.3"))
+        # This test mocks fw_solver.find_opportunity (the Kelly path). Override the
+        # default sizing_strategy ("dutching") so detect() routes to the Kelly code path
+        # and actually hits the mock. Restore after to avoid leaking into other tests.
+        orig_sizing = config.sizing_strategy
+        config.sizing_strategy = "kelly"
+        try:
+            scip = SCIPSolver()
+            sizer = PositionSizer()
+            detector = ArbitrageDetector(scip_solver=scip, position_sizer=sizer)
+
+            # Mock fw_solver.find_opportunity
+            detector.fw_solver.find_opportunity = AsyncMock(return_value={
+                "m1_yes": 0.7,
+                "m1_no": 0.35,
+            })
+
+            opp = await detector.detect(self.validated, self.order_books)
+
+            self.assertIsNotNone(opp)
+            self.assertGreater(len(opp.trades), 0)
+            detector.fw_solver.find_opportunity.assert_called_once()
+
+            trades = {t.outcome_id: t for t in opp.trades}
+            print(f"TRADES FOUND: {trades}")
+            self.assertIn("m1_yes", trades)
+            self.assertEqual(trades["m1_yes"].side, OrderSide.BUY)
+            self.assertEqual(trades["m1_yes"].limit_price, Decimal("0.6"))
+
+            self.assertIn("m1_no", trades)
+            self.assertEqual(trades["m1_no"].side, OrderSide.BUY)
+            self.assertEqual(trades["m1_no"].limit_price, Decimal("0.3"))
+        finally:
+            config.sizing_strategy = orig_sizing
 
 if __name__ == "__main__":
     unittest.main()

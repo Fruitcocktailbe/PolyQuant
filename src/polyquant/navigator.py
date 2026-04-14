@@ -41,26 +41,72 @@ if TYPE_CHECKING:
     from polyquant.data.constraint_store import ConstraintManifest
     from polyquant.data import OrderBook
     from polyquant.agents.bayesian_updater import BayesianUpdater
-    from polyquant.agents.correlation import CorrelationEngine
+    from polyquant.agents.correlation import CorrelationEngine, CorrelationSignal
 
-from polyquant.data import OrderBook
+from polyquant.data import OrderBook, OrderSide, ProposedTrade
 from polyquant.data.constraint_store import ConstraintStore, ConstraintManifest
 from polyquant.data.price_cache import PriceCache
 from polyquant.risk import KillSwitch, PositionSizer
 from polyquant.solver import ArbitrageDetector, SCIPSolver
 from polyquant.solver.scip_solver import OptimizationResult
 from polyquant.data import ArbitrageOpportunity
+from polyquant.data.market_models import MarketDependency
 from polyquant.agents import MicrostructureAgent
+from polyquant.agents.validator import ValidatedResult
+from polyquant.agents.logic_architect import LogicalConstraint, AnalysisResult
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
 from polyquant.data.trade_store import TradeStore
-from polyquant.api.server import monitor, app, set_trade_store, set_constraint_store, setup_web_logging
+from polyquant.api.server import monitor, set_trade_store, set_constraint_store, start_api_server
 from polyquant.utils import config, get_logger
 from polyquant.utils.market_utils import extract_market_id
 from polyquant.utils.profiling import timed_operation, async_timed, print_latency_report  # Week 4
-import uvicorn
 
 logger = get_logger(__name__)
+
+
+def _manifest_to_validated(manifest: ConstraintManifest) -> ValidatedResult:
+    """Adapter: wrap a persisted manifest as the ValidatedResult the solver expects.
+
+    On-disk manifests are MapMaker's post-validation output, but the solver's
+    ValidatedResult contract predates the persistence layer. StoredConstraint and
+    StoredDependency are near-identical to LogicalConstraint and MarketDependency,
+    so this is a direct field copy with no logic.
+    """
+    logical_constraints = [
+        LogicalConstraint(
+            constraint_id=c.constraint_id,
+            description=c.description,
+            coefficients=dict(c.coefficients),
+            rhs=c.rhs,
+            confidence=c.confidence,
+            source_markets=list(c.source_markets),
+            reasoning=c.reasoning,
+        )
+        for c in manifest.constraints
+    ]
+    logical_deps = [
+        MarketDependency(
+            source_market_id=d.source_market_id,
+            source_outcome=d.source_outcome,
+            target_market_id=d.target_market_id,
+            target_outcome=d.target_outcome,
+            relationship=d.relationship,
+            confidence=d.confidence,
+        )
+        for d in manifest.dependencies
+    ]
+    return ValidatedResult(
+        original=AnalysisResult(
+            cluster_id=manifest.cluster_id,
+            dependencies=logical_deps,
+            constraints=logical_constraints,
+        ),
+        is_valid=True,
+        validated_constraints=logical_constraints,
+        validated_dependencies=logical_deps,
+        market_exchanges=dict(manifest.market_exchanges),
+    )
 
 
 class LatencyTracker:
@@ -150,33 +196,51 @@ class ExecutionGuard:
         """Initialize the ExecutionGuard."""
         self._manifests: dict[str, ConstraintManifest] = {}
         self._constraint_matrix: dict[str, list[dict[str, Any]]] = {}  # Pre-computed matrix
-        
+        # Guards _manifests + _constraint_matrix against hot-reload races.
+        # Detection holds it across a tick; hot-reload waits one tick.
+        self._manifests_lock = asyncio.Lock()
+
         logger.info("ExecutionGuard initialized")
     
     def load_manifests(self, manifests: list[ConstraintManifest]) -> None:
         """
         Load constraint manifests into memory.
-        
+
+        Idempotent: re-loading a cluster_id replaces its prior constraint
+        matrix entries instead of appending. This lets the hot-reload loop
+        re-inject updated manifests without doubling up rules.
+
         Args:
             manifests: List of ConstraintManifests to load.
         """
         for manifest in manifests:
+            # If this cluster_id was already loaded, strip its old matrix
+            # entries before adding the new ones.
+            if manifest.cluster_id in self._manifests:
+                old_constraint_ids = {
+                    str(c.constraint_id)
+                    for c in self._manifests[manifest.cluster_id].constraints
+                }
+                for outcome_id in list(self._constraint_matrix.keys()):
+                    self._constraint_matrix[outcome_id] = [
+                        e for e in self._constraint_matrix[outcome_id]
+                        if e["constraint_id"] not in old_constraint_ids
+                    ]
+
             self._manifests[manifest.cluster_id] = manifest
-            
-            # Pre-compute constraint matrix for O(1) lookups
+
             for constraint in manifest.constraints:
                 for outcome_id, coeff in constraint.coefficients.items():
                     if outcome_id not in self._constraint_matrix:
                         self._constraint_matrix[outcome_id] = []
-                    
-                    # Use local variable for data dictionary to help inference
+
                     matrix_entry: dict[str, Any] = {
                         "constraint_id": str(constraint.constraint_id),
                         "coefficient": float(coeff),
                         "rhs": float(constraint.rhs),
                     }
                     self._constraint_matrix[outcome_id].append(matrix_entry)
-        
+
         logger.info(
             "Loaded manifests into ExecutionGuard",
             manifest_count=len(manifests),
@@ -367,7 +431,22 @@ class Navigator:
         self._bayesian_updater = None   # BayesianUpdater (phantom arb prevention)
         self._correlation_engine = None  # CorrelationEngine (leader-laggard pairs)
         self._previous_prices: dict[str, float] = {}  # For correlation delta tracking
-        
+        self._previous_prices_ts: float | None = None  # monotonic ts of last snapshot
+        # Skip correlation deltas if WS gap exceeds this — prevents treating
+        # cross-outage moves as one-tick signals.
+        self._correlation_max_gap_s: float = config.correlation_max_signal_gap_s
+
+        # token_id → exchange name (polymarket|limitless). Rebuilt whenever
+        # manifests are loaded. Used by correlation trade construction.
+        self._token_to_exchange: dict[str, str] = {}
+
+        # Pending correlation trade outcomes awaiting delayed resolution.
+        # key: internal uid, value: dict(pair_leader_id, laggard_id, direction,
+        # expected_laggard_price, submit_ts_monotonic).
+        self._pending_corr_outcomes: dict[str, dict[str, Any]] = {}
+        self._correlation_resolver_task: asyncio.Task | None = None
+
+
         self._is_running = False
         self._server_task: asyncio.Task | None = None
 
@@ -387,6 +466,7 @@ class Navigator:
         # Hot-reloading attributes
         self._hot_reload_task: asyncio.Task | None = None
         self._loaded_cluster_ids: set[str] = set()
+        self._loaded_manifest_mtimes: dict[str, float] = {}
 
         logger.info("Navigator initialized")
     
@@ -395,13 +475,7 @@ class Navigator:
         logger.info("Starting Navigator...")
         
         # Start Sidecar UI Server
-        config_uv = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="warning")
-        server = uvicorn.Server(config_uv)
-        self._uvicorn_server = server  # Store reference for graceful shutdown
-        self._server_task = asyncio.create_task(server.serve())
-        await asyncio.sleep(0.5)  # Give uvicorn a moment to bind to port
-        logger.info("🌐 API server started on http://0.0.0.0:8000 — endpoints: /status, /api/status, /ws")
-        setup_web_logging()
+        self._uvicorn_server, self._server_task = await start_api_server()
         await monitor.update_status(status="STARTING")
         
         # Initialize Polymarket client
@@ -443,6 +517,10 @@ class Navigator:
         # Initialize execution guard with pre-computed constraints
         self._guard = ExecutionGuard()
         self._guard.load_manifests(manifests)
+
+        # Build token_id → exchange map used by correlation trade construction.
+        # Rebuilt on every hot-reload so it stays in sync with manifests.
+        self._rebuild_token_exchange_map(manifests)
 
         # Bayesian Updater: load dependency graph from manifests
         from polyquant.agents.bayesian_updater import BayesianUpdater
@@ -525,54 +603,377 @@ class Navigator:
             await asyncio.sleep(60) # Refresh every minute
     
     async def _hot_reload_loop(self) -> None:
-        """Background loop to dynamically load new markets from ConstraintStore."""
+        """
+        Background loop to dynamically load new and updated manifests from
+        ConstraintStore.
+
+        Picks up two cases:
+        1. NEW cluster_ids (e.g. fresh LLM clusters with timestamp ids).
+        2. UPDATED manifests (e.g. NegRisk clusters which reuse stable
+           cluster_ids across MapMaker runs). Detected via on-disk mtime.
+        """
         while self._is_running:
             try:
-                await asyncio.sleep(60) # Modest polling interval
-                
+                await asyncio.sleep(60)  # Modest polling interval
+
                 if not self._store or not self._guard:
                     continue
-                    
-                current_clusters = await self._store.list_clusters()
-                new_clusters = [cid for cid in current_clusters if cid not in self._loaded_cluster_ids]
-                
-                if new_clusters:
-                    logger.info(f"Hot-reloading {len(new_clusters)} new market clusters...")
-                    
-                    new_token_ids: set[str] = set()
-                    new_manifests = []
-                    
-                    for cid in new_clusters:
-                        manifest = await self._store.load_manifest(cid)
-                        if manifest:
-                            # Extract token IDs from constraint coefficients
-                            for constraint in manifest.constraints:
-                                new_token_ids.update(constraint.coefficients.keys())
-                            new_manifests.append(manifest)
-                            
-                    if not new_token_ids:
-                        continue
-                        
-                    # Subscribe to WebSockets
-                    token_ids = list(new_token_ids)
-                    if self._polymarket and hasattr(self._polymarket, "ws_client") and self._polymarket.ws_client:
-                        logger.info(f"Subscribing to {len(token_ids)} new tokens via WebSocket")
-                        await self._polymarket.ws_client.subscribe(
-                            token_ids,
-                            self._ws_update_callback
-                        )
-                        
-                    # Inject into guard
-                    guard = self._guard
-                    if guard is not None:
-                        guard.load_manifests(new_manifests)
-                    
-                    # Update local state
-                    self._loaded_cluster_ids.update(new_clusters)
-                    logger.info(f"Successfully hot-reloaded {len(new_clusters)} clusters.")
-                    
+
+                current_mtimes = self._store.list_clusters_with_mtimes()
+                changed_cluster_ids: list[str] = []
+                for cid, mtime in current_mtimes.items():
+                    prev_mtime = self._loaded_manifest_mtimes.get(cid)
+                    if prev_mtime is None or mtime > prev_mtime:
+                        changed_cluster_ids.append(cid)
+
+                if not changed_cluster_ids:
+                    continue
+
+                new_count = sum(1 for cid in changed_cluster_ids if cid not in self._loaded_cluster_ids)
+                updated_count = len(changed_cluster_ids) - new_count
+                logger.info(
+                    f"Hot-reloading {len(changed_cluster_ids)} clusters "
+                    f"({new_count} new, {updated_count} updated)"
+                )
+
+                new_token_ids: set[str] = set()
+                changed_manifests = []
+                for cid in changed_cluster_ids:
+                    manifest = await self._store.load_manifest(cid)
+                    if manifest:
+                        for constraint in manifest.constraints:
+                            new_token_ids.update(constraint.coefficients.keys())
+                        changed_manifests.append(manifest)
+
+                if not changed_manifests:
+                    continue
+
+                # Subscribe to any token IDs we don't already follow.
+                # Re-subscribing to existing tokens is a harmless no-op.
+                token_ids = list(new_token_ids)
+                if (
+                    token_ids
+                    and self._polymarket
+                    and hasattr(self._polymarket, "ws_client")
+                    and self._polymarket.ws_client
+                ):
+                    logger.info(f"Subscribing to {len(token_ids)} tokens via WebSocket")
+                    await self._polymarket.ws_client.subscribe(
+                        token_ids,
+                        self._ws_update_callback,
+                    )
+
+                # Inject into guard (under lock to avoid races with detection).
+                # load_manifests is idempotent: re-loading a cluster_id replaces
+                # its prior matrix entries.
+                guard = self._guard
+                if guard is not None:
+                    async with guard._manifests_lock:
+                        guard.load_manifests(changed_manifests)
+                        # Rebuild token→exchange map from the full manifest set
+                        # so changed clusters pick up new exchange attribution
+                        # without stale entries from prior reloads.
+                        all_manifests = list(guard._manifests.values())
+                        self._rebuild_token_exchange_map(all_manifests)
+
+                # Update local state
+                self._loaded_cluster_ids.update(cid for cid in changed_cluster_ids)
+                self._loaded_manifest_mtimes.update(
+                    {cid: current_mtimes[cid] for cid in changed_cluster_ids}
+                )
+                logger.info(f"Successfully hot-reloaded {len(changed_manifests)} clusters.")
+
             except Exception as e:
                 logger.error("Failed to hot-reload markets", error=str(e))
+
+    async def _build_correlation_opportunity(
+        self,
+        sig: "CorrelationSignal",
+        order_books: dict[str, OrderBook],
+    ) -> dict | None:
+        """Construct an executable opportunity dict from a correlation signal.
+
+        Returns None when: execution is disabled, the laggard book is missing
+        or one-sided, sizing returns zero, or VWAP can't be computed. A non-None
+        return can be handed straight to `_execute_opportunity` like any other
+        ArbitrageOpportunity-based dict.
+
+        Shape matches the dicts produced in `_tick` so the execution path is
+        a single code path regardless of signal source.
+        """
+        if not config.correlation_execution_enabled:
+            return None
+
+        laggard_id = sig.pair.laggard_id
+        ob = order_books.get(laggard_id)
+        if ob is None:
+            return None
+
+        current_p = float(sig.current_laggard_price)
+        expected_p = float(sig.expected_laggard_price)
+        if current_p <= 0 or expected_p <= 0:
+            return None
+
+        # Direction: BUY if we expect the laggard to rise toward the leader,
+        # SELL (short via buying the opposite outcome, in line with fw_solver's
+        # convention) if we expect it to fall.
+        if expected_p > current_p:
+            side = OrderSide.BUY
+            top_price = float(ob.best_ask) if ob.best_ask else 0.0
+            top_size = float(ob.asks[0].size) if ob.asks else 0.0
+            if top_price <= 0 or top_size <= 0:
+                return None
+            # Sanity: target must still represent a profit after fees/slippage.
+            if expected_p <= top_price:
+                return None
+            # Kelly odds convention used by fw_solver: odds = (1/price) - 1.
+            odds = (1.0 / top_price) - 1.0
+        else:
+            side = OrderSide.SELL
+            top_price = float(ob.best_bid) if ob.best_bid else 0.0
+            top_size = float(ob.bids[0].size) if ob.bids else 0.0
+            if top_price <= 0 or top_size <= 0:
+                return None
+            if expected_p >= top_price:
+                return None
+            # For SELL: odds = bid / (1 - bid), matching fw_solver's Kelly SELL path.
+            if top_price >= 1.0:
+                return None
+            odds = top_price / (1.0 - top_price)
+
+        # Conservative effective probability: lean heavily on historical accuracy
+        # (which defaults to 0.5 on untested pairs), nudge upward only when the
+        # deviation is large AND the underlying correlation is tight. Hard-cap
+        # at the configured ceiling so no single signal can size up catastrophically.
+        avg_r = (float(sig.pair.correlation_7d) + float(sig.pair.correlation_30d)) / 2.0
+        accuracy_prior = max(0.5, float(sig.pair.accuracy))
+        sigma_confidence = min(1.0, float(sig.deviation_sigma) / 4.0)
+        effective_probability = accuracy_prior + (sigma_confidence * avg_r * 0.1)
+        effective_probability = min(config.correlation_max_probability, effective_probability)
+        effective_probability = max(0.5, effective_probability)
+
+        sizer = self._position_sizer
+        if sizer is None:
+            return None
+
+        depth_usd = top_size * top_price
+        size_result = sizer.calculate_size(
+            probability=effective_probability,
+            odds=odds,
+            order_book_depth=depth_usd,
+        )
+        # Apply correlation-specific additional shrinkage on top of kelly_fraction.
+        raw_shares = float(size_result.recommended_size) * config.correlation_kelly_fraction
+        if raw_shares <= 0:
+            return None
+
+        vwap = ob.get_vwap(side, Decimal(str(raw_shares)))
+        if vwap is None:
+            return None
+
+        # Guard: don't trade if the realistic fill price no longer beats the target.
+        if side == OrderSide.BUY and float(vwap) >= expected_p:
+            return None
+        if side == OrderSide.SELL and float(vwap) <= expected_p:
+            return None
+
+        # Expected profit, discounted by pair accuracy to reflect statistical
+        # (not guaranteed) nature of the signal.
+        price_gap = abs(expected_p - float(vwap))
+        raw_profit = Decimal(str(price_gap * raw_shares))
+        expected_profit = raw_profit * Decimal(str(max(0.5, float(sig.pair.accuracy))))
+
+        exchange_name = self._token_to_exchange.get(laggard_id, "polymarket")
+        market_id = extract_market_id(laggard_id)
+        reason = f"correlation:{sig.pair.leader_id}"
+
+        trade = ProposedTrade(
+            market_id=market_id,
+            outcome_id=laggard_id,
+            side=side,
+            size=Decimal(str(raw_shares)),
+            limit_price=vwap,
+            exchange=exchange_name,
+            reason=reason,
+        )
+
+        arb_opportunity = ArbitrageOpportunity(
+            markets=[market_id],
+            trades=[trade],
+            expected_profit=expected_profit,
+            confidence=float(sig.pair.accuracy) if sig.pair.accuracy > 0 else 0.5,
+        )
+
+        cluster_id = f"correlation:{sig.pair.leader_id}->{sig.pair.laggard_id}"
+        return {
+            "cluster_id": cluster_id,
+            "source": "correlation",
+            "expected_profit": float(expected_profit),
+            "arb_object": arb_opportunity,
+            "trades": [
+                {
+                    "outcome_id": trade.outcome_id,
+                    "side": trade.side.value,
+                    "size": float(trade.size),
+                    "limit_price": float(trade.limit_price),
+                    "exchange": trade.exchange,
+                }
+            ],
+            "timestamp": datetime.utcnow().isoformat(),
+            # Hand-off metadata so the tick loop can register an outcome tracker.
+            "_correlation_meta": {
+                "pair_leader_id": sig.pair.leader_id,
+                "laggard_id": laggard_id,
+                "direction": side.value,
+                "expected_laggard_price": expected_p,
+                "current_laggard_price": current_p,
+            },
+        }
+
+    async def _correlation_resolver_loop(self) -> None:
+        """Background task: resolve pending correlation trade outcomes.
+
+        For each pending entry older than config.correlation_outcome_delay_minutes,
+        fetch the current laggard mid-price, decide whether the signal was correct
+        (laggard moved in the expected direction by at least half the expected gap),
+        and feed the verdict back to the CorrelationEngine so pair.accuracy stays
+        calibrated. Entries whose laggard price can't be fetched are retried
+        until a 4× overall deadline, then dropped with a warning.
+        """
+        check_interval_s = 30.0
+        delay_s = config.correlation_outcome_delay_minutes * 60.0
+        drop_after_s = delay_s * 4.0
+
+        while self._is_running:
+            try:
+                await asyncio.sleep(check_interval_s)
+            except asyncio.CancelledError:
+                return
+
+            if not self._pending_corr_outcomes:
+                continue
+
+            engine = self._correlation_engine
+            if engine is None:
+                continue
+
+            now = time.monotonic()
+            ripe_uids = [
+                uid for uid, meta in self._pending_corr_outcomes.items()
+                if (now - meta["submit_ts_monotonic"]) >= delay_s
+            ]
+            for uid in ripe_uids:
+                meta = self._pending_corr_outcomes[uid]
+                age = now - meta["submit_ts_monotonic"]
+                try:
+                    current_price = await self._fetch_current_price(meta["laggard_id"])
+                except Exception as e:
+                    logger.debug(
+                        "Correlation outcome fetch failed; will retry",
+                        uid=uid, error=str(e),
+                    )
+                    current_price = None
+
+                if current_price is None:
+                    if age >= drop_after_s:
+                        logger.warning(
+                            "Correlation outcome dropped: price unavailable past deadline",
+                            uid=uid,
+                            laggard_id=meta["laggard_id"],
+                        )
+                        self._pending_corr_outcomes.pop(uid, None)
+                    continue
+
+                expected_p = float(meta["expected_laggard_price"])
+                entry_p = float(meta["current_laggard_price"])
+                actual_p = float(current_price)
+                target_gap = expected_p - entry_p  # signed
+                actual_gap = actual_p - entry_p
+
+                # "Correct" if the laggard moved at least halfway toward
+                # the expected target in the predicted direction.
+                if target_gap == 0:
+                    was_correct = False
+                elif (target_gap > 0 and actual_gap >= target_gap * 0.5) or \
+                     (target_gap < 0 and actual_gap <= target_gap * 0.5):
+                    was_correct = True
+                else:
+                    was_correct = False
+
+                try:
+                    engine.record_signal_outcome(
+                        pair_leader_id=meta["pair_leader_id"],
+                        was_correct=was_correct,
+                    )
+                    logger.info(
+                        "Correlation outcome resolved",
+                        uid=uid,
+                        pair_leader_id=meta["pair_leader_id"],
+                        was_correct=was_correct,
+                        entry_price=entry_p,
+                        expected_price=expected_p,
+                        actual_price=actual_p,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to record correlation outcome", uid=uid, error=str(e)
+                    )
+                finally:
+                    self._pending_corr_outcomes.pop(uid, None)
+
+    async def _fetch_current_price(self, token_id: str) -> float | None:
+        """Fetch current mid-price for a token via the appropriate exchange client.
+
+        Returns None when the book is unavailable or lacks a mid.
+        """
+        exchange = self._token_to_exchange.get(token_id, "polymarket")
+        try:
+            if exchange == "polymarket" and self._polymarket:
+                ob = await self._polymarket.get_order_book(token_id)
+            elif exchange == "limitless" and self._limitless:
+                ob = await self._limitless.get_order_book(token_id)
+            else:
+                return None
+        except Exception:
+            return None
+
+        if ob is None:
+            return None
+        mid = getattr(ob, "mid_price", None)
+        if mid is None or float(mid) <= 0:
+            return None
+        return float(mid)
+
+    def _rebuild_token_exchange_map(
+        self, manifests: list["ConstraintManifest"]
+    ) -> None:
+        """Rebuild self._token_to_exchange from the given manifests.
+
+        Walks every constraint's coefficients to collect token_ids, then
+        resolves each to an exchange label via manifest.market_exchanges
+        (keyed by market_id, so we strip the token suffix first).
+
+        Unknown tokens default to "polymarket" — matches the fallback used
+        in fw_solver's per-cluster exchange lookup.
+        """
+        mapping: dict[str, str] = {}
+        for manifest in manifests:
+            me = dict(manifest.market_exchanges or {})
+            for constraint in manifest.constraints:
+                for token_id in constraint.coefficients.keys():
+                    market_id = extract_market_id(token_id)
+                    exchange_info = me.get(market_id, "polymarket")
+                    # market_exchanges may use "limitless:<slug>" form; collapse to "limitless".
+                    if exchange_info.startswith("limitless"):
+                        mapping[token_id] = "limitless"
+                    else:
+                        mapping[token_id] = "polymarket"
+        self._token_to_exchange = mapping
+        logger.debug(
+            "Token→exchange map rebuilt",
+            token_count=len(mapping),
+            manifest_count=len(manifests),
+        )
 
     async def _limitless_polling_loop(
         self, token_ids: list[str], matched_token_ids: set[str] | None = None
@@ -664,6 +1065,13 @@ class Navigator:
             except (asyncio.CancelledError, Exception):
                 pass
 
+        if self._correlation_resolver_task is not None:
+            self._correlation_resolver_task.cancel()
+            try:
+                await self._correlation_resolver_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         if getattr(self, "_uvicorn_server", None) is not None:
             # Tell uvicorn to shut down gracefully instead of hard canceling
             self._uvicorn_server.should_exit = True
@@ -735,13 +1143,11 @@ class Navigator:
             raise RuntimeError("ConstraintStore not initialized")
         
         cluster_ids = await self._store.list_clusters()
-        
+
         if not cluster_ids:
-            logger.warning("No constraint manifests found. Run Map Maker first.")
-            from polyquant.api.server import monitor
-            await monitor.update_status(status="NO_CONSTRAINTS")
-            return
-        
+            logger.warning("No constraint manifests yet — entering WAITING mode. Hot-reload will pick them up.")
+            await monitor.update_status(status="WAITING_FOR_CONSTRAINTS")
+
         # Load all manifests and extract unique token IDs from constraint coefficients.
         # NOTE: market_ids in manifests are often empty for NegRisk markets.
         # The token IDs in constraint coefficients are the REAL identifiers we need.
@@ -758,15 +1164,13 @@ class Navigator:
                     if mid:
                         all_token_ids.add(mid)
                 market_exchanges.update(manifest.market_exchanges)
-                
-        # Initialize the set of loaded clusters
+
+        # Initialize the set of loaded clusters and seed mtime tracking so the
+        # hot-reload loop only fires on subsequent on-disk changes.
         self._loaded_cluster_ids = set(cluster_ids)
-        
+        self._loaded_manifest_mtimes = self._store.list_clusters_with_mtimes()
+
         token_id_list = list(all_token_ids)
-        if not token_id_list:
-            logger.warning("No token IDs found in constraint manifests")
-            return
-        
         logger.info(f"Monitoring {len(token_id_list)} unique tokens across {len(cluster_ids)} clusters")
         
         # Format clusters for the UI Dashboard
@@ -791,21 +1195,26 @@ class Navigator:
         
         # Start hot-reload task
         self._hot_reload_task = asyncio.create_task(self._hot_reload_loop())
+
+        # Start correlation outcome resolver (no-op if no signals ever land)
+        self._correlation_resolver_task = asyncio.create_task(
+            self._correlation_resolver_loop()
+        )
         
         # 1. Subscribe to WebSocket updates for ALL tokens
         # WS is the PRIMARY data source — subscribe all tokens from constraints.
         # Resolved tokens are silently ignored.
 
-        if self._polymarket:
+        if self._polymarket and token_id_list:
             logger.info(f"Subscribing to {len(token_id_list)} tokens via WebSocket")
             # Create WS client if not exists
             if not getattr(self._polymarket, "ws_client", None):
                  from polyquant.data.polymarket_client import PolymarketWSClient
                  self._polymarket.ws_client = PolymarketWSClient()
                  await self._polymarket.ws_client.connect()
-            
+
             await self._polymarket.ws_client.subscribe(
-                token_id_list, 
+                token_id_list,
                 self._ws_update_callback
             )
             
@@ -1038,10 +1447,21 @@ class Navigator:
             if mid and mid > 0:
                 current_mid_prices[token_id] = mid
 
-        # Group order books by cluster
+        # Snapshot manifests under lock so hot-reload can't change cluster
+        # attribution mid-tick. The lock is held only for the snapshot copy
+        # (no awaits inside) — hot-reload waits only microseconds.
+        async with self._guard._manifests_lock:
+            manifest_snapshot: dict[str, ConstraintManifest] = dict(self._guard._manifests)
+            outcome_to_cluster: dict[str, str] = {}
+            for cid, m in manifest_snapshot.items():
+                for constraint in m.constraints:
+                    for oid in constraint.coefficients:
+                        outcome_to_cluster[oid] = cid
+
+        # Group order books by cluster (using snapshot lookup)
         cluster_books: dict[str, dict[str, OrderBook]] = {}
         for token_id, book in order_books.items():
-            cluster_id = self._guard.get_cluster_for_outcome(token_id)
+            cluster_id = outcome_to_cluster.get(token_id)
             if cluster_id:
                 if cluster_id not in cluster_books:
                     cluster_books[cluster_id] = {}
@@ -1085,17 +1505,16 @@ class Navigator:
                         for adj in adjustments:
                             logger.debug(adj.reason)
 
-                # 3. Run Arbitrage Detector (using manifest)
-                if not self._guard:
-                    continue
-                manifest = self._guard._manifests.get(cluster_id)
+                # 3. Run Arbitrage Detector (using snapshot manifest)
+                manifest = manifest_snapshot.get(cluster_id)
                 if not manifest:
                     continue
 
                 try:
+                    validated = _manifest_to_validated(manifest)
                     arb_opportunity = await self._arbitrage_detector.detect(
-                        validated=manifest,
-                        order_books=cluster_books,
+                        validated=validated,
+                        order_books=books,
                         min_profit=config.fw_min_profit
                     )
                 except Exception as e:
@@ -1141,30 +1560,42 @@ class Navigator:
                     error=str(e),
                 )
 
-        # ── Correlation-based signals (cross-cluster, after constraint detection) ──
+        # ── Correlation-based signals (cross-cluster) ──
+        # Signals are always logged. Execution is gated behind
+        # config.correlation_execution_enabled inside _build_correlation_opportunity,
+        # so flipping the flag is a one-place change.
         correlation = self._correlation_engine
-        if (correlation is not None and
-            self._previous_prices and current_mid_prices):
+        prev_prices = self._previous_prices
+        prev_ts = self._previous_prices_ts
+        now_ts = time.monotonic()
+        if (correlation is not None and prev_prices and current_mid_prices
+                and prev_ts is not None
+                and (now_ts - prev_ts) <= self._correlation_max_gap_s):
             try:
                 corr_signals = correlation.check_for_signals(
                     current_prices=current_mid_prices,
-                    previous_prices=self._previous_prices,
+                    previous_prices=prev_prices,
                 )
                 for sig in corr_signals:
-                    opportunities.append({
-                        "cluster_id": f"corr_{sig.pair.leader_id[:8]}",
-                        "source": "correlation",
-                        "expected_profit": abs(sig.expected_laggard_move) * 100,
-                        "leader": sig.pair.leader_question[:60],
-                        "laggard": sig.pair.laggard_question[:60],
-                        "deviation_sigma": sig.deviation_sigma,
-                        "timestamp": datetime.utcnow().isoformat(),
-                    })
+                    logger.info(
+                        "Correlation signal observed",
+                        leader=sig.pair.leader_question[:60],
+                        laggard=sig.pair.laggard_question[:60],
+                        deviation_sigma=sig.deviation_sigma,
+                        expected_laggard_move=float(sig.expected_laggard_move),
+                        execution_enabled=config.correlation_execution_enabled,
+                    )
+                    corr_opp = await self._build_correlation_opportunity(
+                        sig, order_books
+                    )
+                    if corr_opp is not None:
+                        opportunities.append(corr_opp)
             except Exception as e:
                 logger.error("Correlation signal check failed", error=str(e))
 
         # Update previous prices for next tick's correlation delta
         self._previous_prices = current_mid_prices
+        self._previous_prices_ts = now_ts
 
         return opportunities
     
@@ -1207,6 +1638,67 @@ class Navigator:
 
         except Exception as e:
             logger.debug("Balance reconciliation skipped", error=str(e))
+
+    async def _has_live_depth(self, trades: list[Any], cluster_id: str = "") -> bool:
+        """
+        Min-viable live depth check.
+
+        For each trade leg, fetch the live order book and confirm there is at
+        least one resting order on the side we want to hit. Blocks obvious
+        zero-fill cases. Does NOT attempt to size against depth or enforce a
+        numeric threshold — that's intentionally left to a follow-up
+        (solver-native sizing).
+
+        This is the only place "current liquidity" gates execution. MapMaker
+        is structural-only; live conditions live here.
+        """
+        for trade in trades:
+            exchange = getattr(trade, "exchange", None)
+            token_id = trade.outcome_id
+            try:
+                if exchange == "polymarket" and self._polymarket:
+                    ob = await self._polymarket.get_order_book(token_id)
+                elif exchange == "limitless" and self._limitless:
+                    ob = await self._limitless.get_order_book(token_id)
+                else:
+                    logger.warning(
+                        "Depth check: unknown exchange or client unavailable, skipping trade",
+                        exchange=exchange,
+                        token_id=token_id,
+                        cluster_id=cluster_id,
+                    )
+                    return False
+            except Exception as e:
+                logger.warning(
+                    "Depth check failed; skipping trade",
+                    token_id=token_id,
+                    exchange=exchange,
+                    error=str(e),
+                )
+                return False
+
+            if ob is None:
+                logger.info(
+                    "Depth check: no order book, skipping trade",
+                    token_id=token_id,
+                    exchange=exchange,
+                    cluster_id=cluster_id,
+                )
+                return False
+
+            side_value = trade.side.value if hasattr(trade.side, "value") else trade.side
+            book_side = ob.asks if str(side_value).upper() == "BUY" else ob.bids
+            if not book_side or float(book_side[0].size) <= 0:
+                logger.info(
+                    "Depth check: zero depth on target side, skipping trade",
+                    token_id=token_id,
+                    side=side_value,
+                    exchange=exchange,
+                    cluster_id=cluster_id,
+                )
+                return False
+
+        return True
 
     async def _execute_opportunity(self, opportunity: Any, signal_timestamp_us: int = 0) -> None:
         """Execute a trading opportunity through the TradeExecutor.
@@ -1269,6 +1761,13 @@ class Navigator:
                     )
                     return
 
+        # ── Pre-flight: min-viable live depth check ──
+        # Block trades where any leg has zero depth on the side we want to hit.
+        # This is the only place "current liquidity" gates execution — MapMaker
+        # emits constraints regardless of snapshot conditions.
+        if not await self._has_live_depth(arb.trades, cluster_id=cluster_id):
+            return
+
         # ── Wrap in OptimizationResult (what TradeExecutor expects) ──
         opt_result = OptimizationResult(
             success=True,
@@ -1282,7 +1781,10 @@ class Navigator:
             logger.error("TradeExecutor not initialized — cannot execute")
             return
 
-        result = await self._trade_executor.execute_atomic(opt_result)
+        result = await self._trade_executor.execute_atomic(
+            opt_result,
+            signal_timestamp_us=signal_timestamp_us,
+        )
 
         if result.success:
             self._trades_executed += result.trade_count
@@ -1293,6 +1795,20 @@ class Navigator:
                 total_filled=float(result.total_filled),
                 expected_profit=float(arb.expected_profit),
             )
+
+            # Register correlation outcome-tracking metadata so the resolver
+            # loop can update pair.accuracy once the laggard has had time to react.
+            corr_meta = (
+                opportunity.get("_correlation_meta")
+                if isinstance(opportunity, dict)
+                else None
+            )
+            if corr_meta:
+                uid = f"{corr_meta['pair_leader_id']}:{time.monotonic_ns()}"
+                self._pending_corr_outcomes[uid] = {
+                    **corr_meta,
+                    "submit_ts_monotonic": time.monotonic(),
+                }
 
             # Feed PnL to KillSwitch for drawdown tracking
             if self._kill_switch:

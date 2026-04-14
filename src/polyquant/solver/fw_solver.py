@@ -708,25 +708,30 @@ class ArbitrageDetector:
             # Buy opportunity: Ask < Target
             if ob.best_ask and float(ob.best_ask) < target_p:
                 price_diff = target_p - float(ob.best_ask)
-                
+
                 # Calculate odds and depth for PositionSizer
                 # Buy side: Odds = (1/Ask) - 1
                 price = float(ob.best_ask)
                 odds = (1.0 / price) - 1.0 if price > 0 else 0.0
-                
+
                 depth = 0.0
                 if ob.asks and abs(float(ob.asks[0].price) - price) < 1e-6:
                     depth = float(ob.asks[0].size) * price # Liquidity in USD
-                if depth == 0:
-                    depth = 1000.0
+                if depth <= 0:
+                    logger.debug(
+                        "Kelly BUY skipped: no top-of-book depth at target price",
+                        outcome_id=outcome_id,
+                        target_price=price,
+                    )
+                    size_result = None
+                else:
+                    size_result = self.position_sizer.calculate_size(
+                        probability=target_p,
+                        odds=odds,
+                        order_book_depth=depth
+                    )
                 
-                size_result = self.position_sizer.calculate_size(
-                    probability=target_p,
-                    odds=odds,
-                    order_book_depth=depth
-                )
-                
-                if size_result.recommended_size > 0:
+                if size_result is not None and size_result.recommended_size > 0:
                     vwap = ob.get_vwap(OrderSide.BUY, Decimal(str(size_result.recommended_size)))
                     if vwap is not None and vwap < target_p:
                         price_diff = target_p - float(vwap)
@@ -757,30 +762,35 @@ class ArbitrageDetector:
             # Sell opportunity: Bid > Target
             if ob.best_bid and ob.best_bid > target_p:
                 price_diff = ob.best_bid - target_p
-                
+
                 # Calculate odds and depth for PositionSizer
                 # For SELL (shorting Yes / buying No):
                 # We pay (1-bid) to win 1. Profit = bid.
                 # Odds = bid / (1-bid)
                 price = ob.best_bid
                 if price >= 1.0 or price <= 0.0:
-                    odds = 0.0 
+                    odds = 0.0
                 else:
                     odds = price / (1.0 - price)
-                
+
                 depth = 0.0
                 if ob.bids and abs(ob.bids[0].price - price) < 1e-6:
                     depth = ob.bids[0].size * price # Liquidity in USD
-                if depth == 0:
-                    depth = 1000.0 # Default fallback
-                
-                size_result = self.position_sizer.calculate_size(
-                    probability=1.0 - target_p, # Probability of the event NOT happening
-                    odds=odds,
-                    order_book_depth=depth
-                )
-                
-                if size_result.recommended_size > 0:
+                if depth <= 0:
+                    logger.debug(
+                        "Kelly SELL skipped: no top-of-book depth at target price",
+                        outcome_id=outcome_id,
+                        target_price=float(price),
+                    )
+                    size_result = None
+                else:
+                    size_result = self.position_sizer.calculate_size(
+                        probability=1.0 - target_p, # Probability of the event NOT happening
+                        odds=odds,
+                        order_book_depth=depth
+                    )
+
+                if size_result is not None and size_result.recommended_size > 0:
                     vwap = ob.get_vwap(OrderSide.SELL, Decimal(str(size_result.recommended_size)))
                     if vwap is not None and vwap > target_p:
                         price_diff = float(vwap) - target_p

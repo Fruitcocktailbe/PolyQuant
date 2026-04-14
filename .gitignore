@@ -115,3 +115,11 @@ redis.zip
 
 # Node
 node_modules/
+
+# OMS sidecar artifacts
+oms-sidecar/target/
+oms-sidecar/check.err
+oms-sidecar/check.json
+oms-sidecar/check_out.txt
+oms-sidecar/error.txt
+oms_crash_journal.jsonl

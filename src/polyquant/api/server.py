@@ -47,6 +47,10 @@ class SystemState(BaseModel):
     trades_executed: List[Dict[str, Any]] = []  # Finalized fills
     pipeline_stage: str = "IDLE"  # "IDLE", "DISCOVERY", "LOGIC", "MATCHING", "COMPLETE"
     pipeline_events: List[Dict[str, Any]] = []  # Chronological MapMaker activity feed
+    llm_progress: Dict[str, Dict[str, Any]] = {
+        "LOGIC":    {"done": 0, "total": 0, "current": ""},
+        "MATCHING": {"done": 0, "total": 0, "current": ""},
+    }
     logs: List[str] = []
 
 class Monitor:
@@ -158,6 +162,32 @@ class Monitor:
             self.broadcast({"type": "state_update", "data": self.state.model_dump()})
         )
 
+    async def update_llm_progress(
+        self,
+        phase: str,
+        *,
+        done: int | None = None,
+        total: int | None = None,
+        current: str | None = None,
+    ):
+        """
+        Update one phase of llm_progress without clobbering the other.
+
+        Today matching and reasoning run sequentially in map_maker.build_map, but
+        the copy-then-write pattern keeps this helper safe to call from concurrent
+        coroutines if that ever changes.
+        """
+        current_progress = self.state.llm_progress
+        bucket = dict(current_progress.get(phase, {"done": 0, "total": 0, "current": ""}))
+        if done is not None:
+            bucket["done"] = done
+        if total is not None:
+            bucket["total"] = total
+        if current is not None:
+            bucket["current"] = current
+        new_progress = {**current_progress, phase: bucket}
+        await self.update_status(llm_progress=new_progress)
+
     def trigger_kill_switch(self):
         self.state.kill_switch_active = True
         logger.critical("KILL SWITCH TRIGGERED FROM UI")
@@ -216,6 +246,21 @@ def setup_web_logging():
     logging.getLogger("uvicorn.lifespan").addFilter(cancelled_filter)
     logging.getLogger("uvicorn").addFilter(cancelled_filter)
     logging.getLogger("asyncio").addFilter(cancelled_filter)
+
+
+async def start_api_server(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+):
+    """Boot the dashboard server. Returns (server, task) for graceful shutdown."""
+    import uvicorn
+    config_uv = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config_uv)
+    task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.5)  # give uvicorn time to bind
+    setup_web_logging()
+    logger.info(f"🌐 API server started on http://{host}:{port}")
+    return server, task
 
 # Global instance
 monitor = Monitor()
