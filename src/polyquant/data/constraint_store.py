@@ -29,11 +29,11 @@ USAGE:
 
 import asyncio  # Week 3: For parallel manifest loading
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from polyquant.utils import config, get_logger
 
@@ -45,6 +45,26 @@ logger = get_logger(__name__)
 # valid constraints and are auto-quarantined on load.
 CURRENT_MANIFEST_VERSION = "1.1"
 
+# Manifests older than this are deleted on startup. Stale manifests reference
+# markets that have likely resolved or moved, so keeping them around just
+# pollutes the solver's constraint set. Re-running `polyquant map` regenerates
+# whatever is still relevant.
+MANIFEST_TTL_DAYS = 30
+
+
+def _parse_version(version: str) -> tuple[int, ...]:
+    """
+    Parse a dotted version string into an integer tuple for semantic comparison.
+
+    String comparison is lexicographic: "1.10" < "1.2" is True, which would
+    incorrectly quarantine a newer manifest as legacy. Tuple comparison
+    ("1.10" → (1, 10)) gives the expected ordering.
+    """
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return (0,)
+
 
 class StoredConstraint(BaseModel):
     """A single constraint stored in the ConstraintStore."""
@@ -55,6 +75,18 @@ class StoredConstraint(BaseModel):
     confidence: float
     reasoning: str
     source_markets: list[str] = Field(default_factory=list)
+
+    @field_validator("coefficients")
+    @classmethod
+    def _validate_token_id_types(cls, v: dict) -> dict:
+        for tid in v.keys():
+            if not isinstance(tid, str):
+                raise TypeError(
+                    f"Token ID must be str, got {type(tid).__name__}: {tid!r}"
+                )
+            if not tid:
+                raise ValueError("Token ID cannot be empty")
+        return v
 
 
 class StoredDependency(BaseModel):
@@ -112,7 +144,7 @@ class ConstraintStore:
     def __init__(self, base_path: Path | None = None):
         """
         Initialize the ConstraintStore.
-        
+
         Args:
             base_path: Base directory for storage.
                        Defaults to .polyquant/constraints in project root.
@@ -122,11 +154,48 @@ class ConstraintStore:
             self.base_path = Path.cwd() / ".polyquant" / "constraints"
         else:
             self.base_path = Path(base_path)
-        
+
         # Ensure directory exists
         self.base_path.mkdir(parents=True, exist_ok=True)
-        
+
+        # Sweep manifests older than the TTL. Cluster IDs are content-addressed,
+        # so fresh runs always overwrite still-relevant clusters; anything not
+        # touched in MANIFEST_TTL_DAYS references markets that have almost
+        # certainly resolved and should not feed the solver.
+        removed = self._sweep_stale_manifests()
+        if removed:
+            logger.info("Swept stale manifests", removed=removed, ttl_days=MANIFEST_TTL_DAYS)
+
         logger.debug("ConstraintStore initialized", path=str(self.base_path))
+
+    def _sweep_stale_manifests(self) -> int:
+        """Delete manifest files older than MANIFEST_TTL_DAYS by mtime."""
+        cutoff = (datetime.utcnow() - timedelta(days=MANIFEST_TTL_DAYS)).timestamp()
+        removed_ids: list[str] = []
+        for path in self.base_path.glob("*.json"):
+            if path.name == "_index.json":
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed_ids.append(path.stem)
+            except OSError as e:
+                logger.warning("Failed to sweep manifest", file=path.name, error=str(e))
+        if removed_ids:
+            index_path = self.base_path / "_index.json"
+            if index_path.exists():
+                try:
+                    idx_data = json.loads(index_path.read_text())
+                    idx_data["clusters"] = [
+                        cid for cid in idx_data.get("clusters", []) if cid not in removed_ids
+                    ]
+                    idx_data["updated_at"] = datetime.utcnow().isoformat()
+                    temp_path = index_path.with_suffix(".tmp")
+                    temp_path.write_text(json.dumps(idx_data, indent=2))
+                    temp_path.replace(index_path)
+                except Exception as e:
+                    logger.warning("Failed to update index after sweep", error=str(e))
+        return len(removed_ids)
     
     async def save_manifest(self, manifest: ConstraintManifest) -> None:
         """
@@ -209,7 +278,7 @@ class ConstraintStore:
                 logger.warning("Could not inspect manifest for quarantine", file=path.name, error=str(e))
                 continue
             version = data.get("version", "1.0")
-            if version < CURRENT_MANIFEST_VERSION:
+            if _parse_version(version) < _parse_version(CURRENT_MANIFEST_VERSION):
                 legacy_dir.mkdir(exist_ok=True)
                 path.rename(legacy_dir / path.name)
                 moved.append(path.stem)
@@ -287,29 +356,6 @@ class ConstraintStore:
         logger.info("Loaded all manifests", count=len(manifests))
         return manifests
     
-    async def delete_manifest(self, cluster_id: str) -> bool:
-        """
-        Delete a constraint manifest.
-        
-        Args:
-            cluster_id: The cluster ID to delete.
-            
-        Returns:
-            True if deleted, False if not found.
-        """
-        file_path = self.base_path / f"{cluster_id}.json"
-        
-        if not file_path.exists():
-            return False
-        
-        file_path.unlink()
-        
-        # Update index
-        await self._remove_from_index(cluster_id)
-        
-        logger.info("Deleted constraint manifest", cluster_id=cluster_id)
-        return True
-    
     async def list_clusters(self) -> list[str]:
         """
         List all stored cluster IDs.
@@ -373,20 +419,3 @@ class ConstraintStore:
         temp_path.write_text(json.dumps(data, indent=2))
         temp_path.replace(index_path)
     
-    async def _remove_from_index(self, cluster_id: str) -> None:
-        """Remove a cluster ID from the index."""
-        index_path = self.base_path / "_index.json"
-        
-        if not index_path.exists():
-            return
-        
-        data = json.loads(index_path.read_text())
-        
-        clusters = data.get("clusters", [])
-        if cluster_id in clusters:
-            clusters.remove(cluster_id)
-            data["updated_at"] = datetime.utcnow().isoformat()
-            
-            temp_path = index_path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data, indent=2))
-            temp_path.replace(index_path)

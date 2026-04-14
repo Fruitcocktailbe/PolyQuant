@@ -46,10 +46,12 @@ from polyquant.data.constraint_store import (
     StoredDependency,
 )
 from polyquant.data.market_models import Market # Added based on instruction's implied source for Market
+from polyquant.data.limitless_client import limitless_yes_token, limitless_no_token
 from polyquant.agents.exchange_matcher import ExchangeMatcher
 from polyquant.utils import config, get_logger
 from polyquant.api.server import monitor
 from polyquant.utils.cache import cache
+from polyquant.utils.market_utils import get_yes_outcome, get_no_outcome
 
 logger = get_logger(__name__)
 
@@ -136,7 +138,7 @@ class MapMaker:
     
     async def build_map(
         self,
-        limit: int = 500,
+        limit: int = 0,
         min_liquidity: float = 1000,
         skip_processed: bool = True,
     ) -> dict[str, Any]:
@@ -609,13 +611,13 @@ class MapMaker:
                 raise RuntimeError("Validator not initialized")
             
             validated = await self._validator.validate(analysis)
-            
+
             if not validated.is_valid:
                 issue_reasons = [i.description for i in validated.issues[:3]]
                 reason_str = "; ".join(issue_reasons) if issue_reasons else "Unknown"
                 print(f"--- \u26a0\ufe0f  VALIDATOR REJECTED: '{cluster.topic}' | Reason: {reason_str} ---")
                 logger.warning(
-                    "Validation failed",
+                    "Validation failed - discarding cluster",
                     cluster_id=cluster.cluster_id,
                     issues=len(validated.issues),
                 )
@@ -624,7 +626,11 @@ class MapMaker:
                     f"Validation issues for '{cluster.topic}'",
                     detail=reason_str,
                 )
-                # Still save partial constraints that passed
+                # Rejected clusters must NOT be persisted. Navigator's
+                # _manifest_to_validated() unconditionally marks loaded manifests
+                # as is_valid=True, so any file on disk is treated as fully
+                # validated — a rejected-but-saved cluster would drive live trades.
+                return None
             
             # Convert to StoredConstraint format
             stored_constraints = [
@@ -661,24 +667,27 @@ class MapMaker:
                     # Correlation engine expects exactly that shape.
                     return await self._polymarket.get_history(mid)
                 
-                # We want to correlate the specific token prices, not abstract markets.
-                # Assuming the first outcome represents the 'Yes' side for binary markets.
+                # Correlate on the YES token specifically. Resolve YES by name
+                # so we never accidentally correlate NO prices — outcomes[0] is
+                # not guaranteed to be the YES side.
                 token_to_market = {}
                 token_markets = []
                 for m in cluster.markets:
-                    if m.outcomes and m.outcomes[0].token_id:
-                        token_id = m.outcomes[0].token_id
-                        token_to_market[token_id] = m
-                        # Create a dummy market with the token_id as its primary ID 
-                        # so the correlation engine tests the correct string
-                        token_market = Market(
-                            market_id=token_id, 
-                            question=m.question, 
-                            outcomes=m.outcomes,
-                            liquidity=m.liquidity,
-                            volume=m.volume,
-                        )
-                        token_markets.append(token_market)
+                    yes_out = get_yes_outcome(m)
+                    if not yes_out or not yes_out.token_id:
+                        continue
+                    token_id = yes_out.token_id
+                    token_to_market[token_id] = m
+                    # Create a dummy market with the YES token_id as its primary
+                    # ID so the correlation engine tests the correct string
+                    token_market = Market(
+                        market_id=token_id,
+                        question=m.question,
+                        outcomes=m.outcomes,
+                        liquidity=m.liquidity,
+                        volume=m.volume,
+                    )
+                    token_markets.append(token_market)
                 
                 # CorrelationAgent might need to be async or we fetch here
                 # Let's assume we can pass the provider and it handles it
@@ -717,23 +726,32 @@ class MapMaker:
                             
                         market_titles[l_id] = f"{m.question} (Limitless)"
                             
-                        # Find YES and NO token ids for Polymarket
-                        pm_yes = None
-                        pm_no = None
-                        for out in m.outcomes:
-                            if "yes" in out.name.lower():
-                                pm_yes = out.token_id or out.outcome_id
-                            elif "no" in out.name.lower():
-                                pm_no = out.token_id or out.outcome_id
-                        
-                        l_yes = f"{l_id}_0"
-                        l_no = f"{l_id}_1"
-                        
+                        # Resolve Polymarket YES/NO by outcome name — never by
+                        # index. Falls back to skipping the cross-exchange
+                        # mapping if either side is unresolvable, rather than
+                        # silently writing the wrong token_id into coefficients.
+                        pm_yes_out = get_yes_outcome(m)
+                        pm_no_out = get_no_outcome(m)
+                        if pm_yes_out is None or pm_no_out is None:
+                            logger.warning(
+                                "Skipping Limitless equivalence: polarity unresolved",
+                                market_id=m.market_id,
+                                question=m.question,
+                            )
+                            continue
+                        pm_yes = pm_yes_out.token_id or pm_yes_out.outcome_id
+                        pm_no = pm_no_out.token_id or pm_no_out.outcome_id
+
+                        # Build Limitless token_ids via the canonical helper so
+                        # the suffix convention stays in one place.
+                        l_yes = limitless_yes_token(l_id)
+                        l_no = limitless_no_token(l_id)
+
                         # Append to coefficients for all constraints so solver treats them as perfect substitutes
                         for c in stored_constraints:
-                            if pm_yes and pm_yes in c.coefficients:
+                            if pm_yes in c.coefficients:
                                 c.coefficients[l_yes] = c.coefficients[pm_yes]
-                            if pm_no and pm_no in c.coefficients:
+                            if pm_no in c.coefficients:
                                 c.coefficients[l_no] = c.coefficients[pm_no]
             # Validate coefficient keys to ensure they are properly mapped
             for c in stored_constraints:

@@ -165,18 +165,18 @@ class PolyQuantConfig(BaseSettings):
     # =========================================================================
     
     polymarket_taker_fee_pct: float = Field(
-        default=0.00,
-        description="Polymarket Taker Fee as a percentage (e.g. 0.001 is 10bps)"
+        default=0.02,
+        description="Polymarket Taker Fee as a percentage (2% on the resting side per Polymarket docs)"
     )
 
     limitless_taker_fee_pct: float = Field(
-        default=0.00,
-        description="Limitless Taker Fee as a percentage"
+        default=0.03,
+        description="Limitless Taker Fee — conservative max. Real fees ramp 0.03%→3% as events approach resolution; default to the max to avoid approving rings that become unprofitable near expiry."
     )
 
     polygon_gas_per_tx: float = Field(
-        default=0.01,
-        description="Estimated Polygon gas cost per execution in USD/USDC"
+        default=0.05,
+        description="Estimated Polygon gas cost per execution in USD/USDC (tune during congestion)"
     )
 
     base_gas_per_tx: float = Field(
@@ -255,6 +255,12 @@ class PolyQuantConfig(BaseSettings):
         default=200,
         ge=10,
         description="Dead Man's Switch: max age of websocket messages before halting"
+    )
+
+    soft_staleness_start_ms: int = Field(
+        default=50,
+        ge=1,
+        description="Staleness penalty begins at this quote age (ms). Linear decay from 1.0 at this threshold to 0.0 at ws_max_age_ms. Set above typical WS tick interval (~30-80 ms) to avoid penalizing normal jitter."
     )
 
     order_expiration_seconds: int = Field(

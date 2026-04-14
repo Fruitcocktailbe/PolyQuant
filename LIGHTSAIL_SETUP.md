@@ -22,6 +22,11 @@ source $HOME/.cargo/env
 # Install SCIP Optimization Suite (Pre-compiled for Ubuntu recommended)
 sudo apt install -y scip
 
+# Enable Redis as a system service so it survives reboots
+# (Map Maker fails hard at cache.connect() if Redis isn't running)
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+
 # Create a Swap File (Recommended for 2GB RAM instances)
 # This helps prevent out-of-memory errors during memory-intensive operations like Map Maker.
 sudo fallocate -l 2G /swapfile
@@ -34,7 +39,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ## 3. Project Setup
 
 ```bash
-git clone https://github.com/yourusername/PolyQuant.git
+git clone https://github.com/Fruitcocktailbe/PolyQuant.git
 cd PolyQuant
 
 # Python Environment
@@ -45,16 +50,28 @@ pip install -e .
 
 # Create .env
 cp .env.example .env
-nano .env  # Add your API keys (Polymarket, Limitless, OpenRouter, etc.)
-# Note: If trading in 'paper' mode without a POLYGON_PRIVATE_KEY, your 
+nano .env
+# Required for `map` mode: GEMINI_API_KEY (this is actually your OpenRouter key,
+#                          sk-or-v1-..., despite the legacy name).
+# Strongly recommended:    LIMITLESS_API_KEY (lmts_...) for cross-exchange matching.
+# Required only for `trade` mode: POLYGON_PRIVATE_KEY, BASE_PRIVATE_KEY,
+#                                 ALCHEMY_API_KEY, LIMITLESS_API_KEY.
+# Note: If trading in 'paper' mode without a POLYGON_PRIVATE_KEY, your
 # starting paper-trading UI balance will default to $10,000.00.
 
 # Generate Market Map (REQUIRED before trading)
 # This scans for arbitrage clusters, local constraints, and cross-exchange mappings.
-python -m polyquant.map_maker
+# `polyquant.main map` is the canonical entry point — starts the uvicorn dashboard
+# sidecar on :8000, supports --limit/--min-liquidity/--force, and exits non-zero
+# on failure. `polyquant.map_maker` still works as a minimal headless fallback.
+python -m polyquant.main map
 
+# Tip: on first run, do a small smoke test before a full scan:
+# python -m polyquant.main map --limit 50
 
 # LOW-RAM TIP: If Map Maker hangs, add: ENABLE_SEMANTIC_MATCHING=false
+# (with the chunked-encoding fix in exchange_matcher.py this is rarely needed,
+#  but it disables the SentenceTransformer stage entirely if RAM is the blocker)
 
 ```
 
@@ -71,10 +88,11 @@ cd ~/PolyQuant
 source venv/bin/activate
 ```
 
-### Window 0: Redis + Map Maker
+### Window 0: Map Maker
+Redis is already running as a system service from Section 2, so you don't need to start it here. Just confirm it's up and run (or re-run) the Map Maker whenever you want to refresh the constraint map.
 ```bash
-redis-server --daemonize yes
-python -m polyquant.map_maker   # Run once to generate constraints
+redis-cli ping                  # Should print PONG
+python -m polyquant.main map    # Run to generate / refresh constraints
 ```
 
 ### Window 1: The Execution Engine (Rust)

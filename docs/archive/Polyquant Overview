@@ -1,3 +1,9 @@
+> ⚠️ **HISTORICAL — v0.2/v0.3, superseded.**
+> This document describes state from before the OMS sidecar + Rust client integration.
+> Claims about `_submit_order()` returning None and `RUST_AVAILABLE = False` are **no longer accurate**.
+> The current execution path runs through `executor.py:376` → `RustClient.dispatch_trades()` → ZeroMQ → Rust sidecar.
+> See `docs/DUTCHING_ENHANCEMENTS_v0.4.0.md` for the current authoritative spec.
+
 # PolyQuant 2.0 — Comprehensive Application Overview
 
 ## What Is PolyQuant?

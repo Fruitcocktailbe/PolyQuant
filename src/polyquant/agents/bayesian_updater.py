@@ -78,14 +78,22 @@ class BayesianUpdater:
     # An adjustment > 20% of original price is likely a model error.
     MAX_ADJUSTMENT_PCT = 0.20
 
+    # Partition sum tolerance. Partitions are expected to sum to ~1.0; if the
+    # Bayesian adjustments drift the sum outside this band, renormalize.
+    PARTITION_SUM_TOLERANCE = 0.05
+
     def __init__(self):
         # Dependency graph: outcome_id -> list of (linked_outcome_id, relationship, strength)
         self._dep_graph: dict[str, list[tuple[str, str, float]]] = {}
+        # Partition groups: list of outcome_id sets that must sum to ~1.
+        # Built via union-find over dependencies with relationship="partition".
+        self._partition_groups: list[set[str]] = []
         # Previous tick's prices for delta calculation
         self._previous_prices: dict[str, float] = {}
         # Track adjustment count for monitoring
         self._adjustment_count: int = 0
         self._phantom_prevented_count: int = 0
+        self._renormalize_count: int = 0
 
     def load_dependencies(self, manifests: list[ConstraintManifest]) -> None:
         """
@@ -95,6 +103,24 @@ class BayesianUpdater:
             manifests: List of validated ConstraintManifests from the store.
         """
         self._dep_graph.clear()
+        self._partition_groups.clear()
+
+        # Union-find over partition edges so we can recover the full set of
+        # outcomes that must sum to ~1 from the pairwise dependencies.
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            parent.setdefault(a, a)
+            parent.setdefault(b, b)
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
 
         for manifest in manifests:
             for dep in manifest.dependencies:
@@ -119,11 +145,22 @@ class BayesianUpdater:
                     (source_key, reverse_rel, confidence)
                 )
 
+                if dep.relationship == "partition":
+                    union(source_key, target_key)
+
+        # Collapse the union-find into explicit partition groups.
+        groups: dict[str, set[str]] = {}
+        for node in parent:
+            root = find(node)
+            groups.setdefault(root, set()).add(node)
+        self._partition_groups = [g for g in groups.values() if len(g) >= 2]
+
         total_links = sum(len(v) for v in self._dep_graph.values())
         logger.info(
             "Bayesian dependency graph loaded",
             outcomes_tracked=len(self._dep_graph),
             total_links=total_links,
+            partitions=len(self._partition_groups),
             manifests=len(manifests),
         )
 
@@ -186,6 +223,39 @@ class BayesianUpdater:
                     adjustments.append(adj)
                     self._adjustment_count += 1
 
+        # Partition renormalization. MAX_ADJUSTMENT_PCT is enforced per leg,
+        # so a 3-outcome partition can individually adjust each member by up
+        # to 20%, which collectively breaks the sum ≈ 1 invariant. Walk each
+        # partition group, check its adjusted sum, and if it drifted outside
+        # PARTITION_SUM_TOLERANCE, rescale members proportionally.
+        for group in self._partition_groups:
+            present = [oid for oid in group if oid in adjusted]
+            if len(present) < 2:
+                continue
+            total = sum(adjusted[oid] for oid in present)
+            if total <= 0:
+                continue
+            if abs(total - 1.0) <= self.PARTITION_SUM_TOLERANCE:
+                continue
+            scale = 1.0 / total
+            for oid in present:
+                old = adjusted[oid]
+                new = max(0.01, min(0.99, old * scale))
+                if abs(new - old) >= 0.005:
+                    adjusted[oid] = new
+                    adjustments.append(
+                        PriceAdjustment(
+                            outcome_id=oid,
+                            raw_price=old,
+                            adjusted_price=new,
+                            reason=(
+                                f"Partition renormalize (sum={total:.3f} -> 1.0): "
+                                f"{old:.3f} → {new:.3f}"
+                            ),
+                        )
+                    )
+            self._renormalize_count += 1
+
         # Update previous prices for next tick
         self._previous_prices = dict(current_prices)
 
@@ -196,6 +266,7 @@ class BayesianUpdater:
                 adjustments=len(adjustments),
                 total_adjustments=self._adjustment_count,
                 phantoms_prevented=self._phantom_prevented_count,
+                renormalizations=self._renormalize_count,
             )
 
         return adjusted, adjustments
@@ -310,6 +381,8 @@ class BayesianUpdater:
         return {
             "outcomes_tracked": len(self._dep_graph),
             "total_links": sum(len(v) for v in self._dep_graph.values()),
+            "partition_groups": len(self._partition_groups),
             "adjustments_made": self._adjustment_count,
             "phantoms_prevented": self._phantom_prevented_count,
+            "renormalizations": self._renormalize_count,
         }

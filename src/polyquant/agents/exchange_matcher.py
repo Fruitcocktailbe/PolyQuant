@@ -14,6 +14,7 @@ Accepted pairs are reused across runs and never re-verified. Rejected pairs
 are skipped before they reach the LLM (delete the entry to force re-check).
 """
 
+import gc
 import os
 import json
 import asyncio
@@ -24,10 +25,9 @@ from pathlib import Path
 
 import numpy as np
 try:
-    from sentence_transformers import SentenceTransformer, util
+    from sentence_transformers import SentenceTransformer
 except ImportError:
     SentenceTransformer = None
-    util = None
 
 from polyquant.data.polymarket_client import PolymarketClient
 from polyquant.data.limitless_client import LimitlessClient
@@ -52,6 +52,7 @@ SIMILARITY_FLOOR = 0.50      # absolute floor — below this we don't even consi
 SIMILARITY_VERIFY = 0.65     # threshold for sending to LLM
 LLM_RPS_SEMAPHORE = 2
 LLM_PACING_SECONDS = 1.0
+ENCODE_CHUNK_SIZE = 500      # bounds peak RAM on the 2 GB Lightsail VM
 
 LLM_VERIFY_PROMPT = """
 You are an arbitrage trading engine.
@@ -365,12 +366,44 @@ class ExchangeMatcher:
         p_docs = [m.question for m in poly_markets]
         l_docs = [m.get("title", "") for m in limit_markets]
 
-        logger.info(f"Encoding {len(p_docs)} Polymarket + {len(l_docs)} Limitless questions...")
-        p_emb = model.encode(p_docs, convert_to_tensor=True)
-        l_emb = model.encode(l_docs, convert_to_tensor=True)
+        logger.info(
+            f"Encoding {len(p_docs)} Polymarket + {len(l_docs)} Limitless questions "
+            f"(chunk={ENCODE_CHUNK_SIZE})..."
+        )
 
-        sim_matrix = util.cos_sim(p_emb, l_emb).cpu().numpy()
+        def _encode_chunked(docs: list[str]) -> np.ndarray:
+            if not docs:
+                return np.zeros(
+                    (0, model.get_sentence_embedding_dimension()), dtype=np.float32
+                )
+            chunks: list[np.ndarray] = []
+            for start in range(0, len(docs), ENCODE_CHUNK_SIZE):
+                chunks.append(
+                    model.encode(
+                        docs[start:start + ENCODE_CHUNK_SIZE],
+                        convert_to_numpy=True,
+                        show_progress_bar=False,
+                    )
+                )
+            return np.vstack(chunks)
+
+        p_emb = _encode_chunked(p_docs)
+        l_emb = _encode_chunked(l_docs)
+
+        # Pure-numpy cosine so we can release torch tensors before the slow Layer 3.
+        p_norms = np.linalg.norm(p_emb, axis=1, keepdims=True)
+        l_norms = np.linalg.norm(l_emb, axis=1, keepdims=True)
+        p_normed = p_emb / np.where(p_norms == 0, 1.0, p_norms)
+        l_normed = l_emb / np.where(l_norms == 0, 1.0, l_norms)
+        sim_matrix = p_normed @ l_normed.T
         logger.info("Similarity matrix computed.")
+
+        # Drop the ~300 MB SentenceTransformer + all intermediates before Layer 3's
+        # LLM calls — sim_matrix is tiny (len(p)*len(l)*4 bytes) and is all we need.
+        # _encode_chunked closes over `model`, so it must be deleted too.
+        del model, p_emb, l_emb, p_normed, l_normed, p_norms, l_norms, _encode_chunked
+        self._model = None
+        gc.collect()
 
         # ---------- Layer 2 cont.: bidirectional top-K union ----------
         K = min(EMBEDDING_TOP_K, len(limit_markets))
