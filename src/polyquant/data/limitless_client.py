@@ -21,6 +21,53 @@ logger = get_logger(__name__)
 CHAIN_ID_BASE = 8453
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
+# Internal encoding convention for Limitless token_ids.
+#
+# Limitless's /markets/{slug}/orderbook endpoint returns a single YES-denominated
+# book. We synthesize the NO side by inverting prices (1 - p). To keep a single
+# token_id namespace across the rest of PolyQuant, we suffix the slug with a
+# LOGICAL side marker: LIMITLESS_YES_SUFFIX for the raw book, LIMITLESS_NO_SUFFIX
+# for the inverted synthetic NO book.
+#
+# This is OUR convention, not an API-imposed ordering. All code that constructs
+# Limitless token_ids must use limitless_yes_token() / limitless_no_token() —
+# never raw "_0"/"_1" string literals, which are easy to typo into a silent
+# sign flip.
+LIMITLESS_YES_SUFFIX = "_yes"
+LIMITLESS_NO_SUFFIX = "_no"
+
+
+def limitless_yes_token(slug: str) -> str:
+    return f"{slug}{LIMITLESS_YES_SUFFIX}"
+
+
+def limitless_no_token(slug: str) -> str:
+    return f"{slug}{LIMITLESS_NO_SUFFIX}"
+
+
+def parse_limitless_token(token_id: str) -> tuple[str, bool] | None:
+    """
+    Parse a Limitless token_id into (slug, is_yes).
+
+    Returns None if the token_id does not use the PolyQuant Limitless encoding.
+    Accepts both the current "_yes"/"_no" logical suffixes and the legacy
+    "_0"/"_1" numeric suffixes for manifests written before the convention
+    migration.
+    """
+    if token_id.endswith(LIMITLESS_YES_SUFFIX):
+        return token_id[: -len(LIMITLESS_YES_SUFFIX)], True
+    if token_id.endswith(LIMITLESS_NO_SUFFIX):
+        return token_id[: -len(LIMITLESS_NO_SUFFIX)], False
+    # Legacy numeric form.
+    try:
+        slug, side_str = token_id.rsplit("_", 1)
+        side = int(side_str)
+        if side in (0, 1):
+            return slug, side == 0
+    except ValueError:
+        pass
+    return None
+
 class LimitlessClient:
     """Async client for Limitless Exchange APIs on Base."""
     
@@ -148,56 +195,64 @@ class LimitlessClient:
     async def get_order_book(self, token_id: str) -> Optional[Any]:
         """
         Fetch the order book for a given Limitless market outcome.
-        
+
         Args:
-            token_id: Expected format is "{market_slug}_{side}" where side is 0 (YES) or 1 (NO)
+            token_id: Must be built via limitless_yes_token(slug) or
+                limitless_no_token(slug). Legacy "{slug}_0"/"{slug}_1" token
+                ids are still accepted for backward compatibility with older
+                constraint manifests but produce a warning.
+
+        The Limitless /orderbook endpoint returns YES-denominated bids/asks.
+        For the NO side we synthesize the book by inverting prices (p -> 1-p)
+        and swapping bid<->ask, under the partition invariant p_yes + p_no = 1.
         """
         from polyquant.data.market_models import OrderBook, OrderLevel
-        
-        try:
-            slug, side_str = token_id.rsplit("_", 1)
-            side = int(side_str)
-        except ValueError:
+
+        parsed = parse_limitless_token(token_id)
+        if parsed is None:
             logger.error(f"Invalid Limitless token_id format: {token_id}")
             return None
-            
+        slug, is_yes = parsed
+        if token_id.endswith(("_0", "_1")) and not token_id.endswith((LIMITLESS_YES_SUFFIX, LIMITLESS_NO_SUFFIX)):
+            logger.warning(
+                "Legacy numeric Limitless token_id — regenerate manifests to migrate",
+                token_id=token_id,
+            )
+
         try:
             res = await self._retry_request("GET", f"/markets/{slug}/orderbook")
             data = res.json()
         except Exception as e:
             logger.error(f"Failed to fetch orderbook for {slug}: {e}")
             return None
-        
+
         book = OrderBook(outcome_id=token_id)
-        
-        # Limitless returns prices for the YES (0) token.
+
         raw_bids = data.get("bids", [])
         raw_asks = data.get("asks", [])
-        
-        if side == 0:
-            # YES Outcome - use as is
+
+        if is_yes:
             for b in raw_bids:
                 book.bids.append(OrderLevel(price=Decimal(str(b["price"])), size=Decimal(str(b["size"]))))
             for a in raw_asks:
                 book.asks.append(OrderLevel(price=Decimal(str(a["price"])), size=Decimal(str(a["size"]))))
         else:
-            # NO Outcome - invert
-            # YES Ask -> NO Bid
+            # Synthetic NO book: YES Ask at price p becomes NO Bid at 1-p
+            # (paying 1-p for NO is the complement of being willing to sell
+            # YES at p), and vice versa. Only keep levels that stay inside
+            # the (0, 1) probability range after inversion.
             for a in raw_asks:
                 inv_price = Decimal("1.0") - Decimal(str(a["price"]))
                 if inv_price > 0:
                     book.bids.append(OrderLevel(price=inv_price, size=Decimal(str(a["size"]))))
-            
-            # YES Bid -> NO Ask
             for b in raw_bids:
                 inv_price = Decimal("1.0") - Decimal(str(b["price"]))
                 if inv_price < 1:
                     book.asks.append(OrderLevel(price=inv_price, size=Decimal(str(b["size"]))))
-        
-        # Sort properly: Bids descending, Asks ascending
+
         book.bids.sort(key=lambda x: x.price, reverse=True)
         book.asks.sort(key=lambda x: x.price)
-        
+
         return book
         
     async def get_usdc_balance(self) -> Decimal:

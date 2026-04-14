@@ -187,14 +187,28 @@ class KillSwitch:
         )
         
     async def load_state(self) -> None:
-        """Load state from Redis."""
+        """
+        Load kill switch state from Redis.
+
+        Raises if the cache layer is not connected — the caller (Navigator
+        startup) requires an authoritative answer about whether a prior halt
+        is still active. Silently proceeding with default in-memory state
+        would let a crash-restart bypass a triggered kill switch.
+        """
+        if not cache._is_connected or cache._client is None:
+            raise RuntimeError(
+                "Kill switch state load requires a connected Redis cache. "
+                "Call cache.connect() before load_state(). A disconnected "
+                "cache cannot distinguish 'first run' from 'Redis down'."
+            )
+
         state = await cache.load_kill_switch_state()
         if state:
             self._is_triggered = state.get("is_triggered", False)
             self.high_water_mark = state.get("high_water_mark", self.initial_capital)
             self.current_capital = state.get("current_capital", self.initial_capital)
             self._trigger_count = state.get("trigger_count", 0)
-            
+
             # Restore trigger event if present
             if state.get("trigger_event"):
                 evt = state["trigger_event"]
@@ -205,11 +219,16 @@ class KillSwitch:
                     metric_value=evt["metric_value"],
                     threshold=evt["threshold"],
                 )
-            
+
             logger.info(
                 "KillSwitch state loaded from Redis",
                 high_water_mark=self.high_water_mark,
                 is_triggered=self._is_triggered
+            )
+        else:
+            logger.info(
+                "KillSwitch state: no prior state in Redis (first run)",
+                redis_url=cache._redis_url,
             )
 
     async def save_state(self) -> None:

@@ -34,36 +34,57 @@ USAGE:
 """
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from polyquant.utils.llm_client import call_llm_json
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from polyquant.data import Market, PolymarketClient
 from polyquant.utils import config, get_logger
 from polyquant.utils.cache import cache
+from polyquant.utils.market_utils import get_yes_outcome, has_binary_polarity
 
 logger = get_logger(__name__)
+
+
+def _hash_cluster_id(market_ids: list[str]) -> str:
+    """Stable content-addressed cluster id from sorted member market_ids."""
+    joined = ",".join(sorted(market_ids))
+    return hashlib.sha1(joined.encode()).hexdigest()[:16]
 
 
 class MarketCluster(BaseModel):
     """
     A cluster of related markets that may have logical dependencies.
-    
+
     Attributes:
-        cluster_id: Unique identifier for this cluster
+        cluster_id: Content-addressed hash of sorted member market_ids.
+            Rerunning map over the same cluster overwrites the same manifest
+            instead of leaking a new file per run.
         topic: Human-readable topic description
         markets: List of Market objects in this cluster
         potential_dependencies: Initial guesses at dependencies (for Logic Architect)
         created_at: When this cluster was created
     """
-    cluster_id: str = Field(default_factory=lambda: str(datetime.utcnow().timestamp()))
+    cluster_id: str = ""
     topic: str
     markets: list[Market] = Field(default_factory=list)
     potential_dependencies: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @model_validator(mode="after")
+    def _assign_cluster_id(self) -> "MarketCluster":
+        # Preserve explicitly set ids (e.g. "negrisk_{event_id}"). Only fill in
+        # a hash when the caller left cluster_id blank AND we have markets to
+        # hash. Empty-market fallback clusters keep an empty id, which signals
+        # downstream code to skip persistence.
+        if not self.cluster_id and self.markets:
+            self.cluster_id = _hash_cluster_id([m.market_id for m in self.markets])
+        return self
 
 
 class DiscoveryAgent:
@@ -298,6 +319,26 @@ The YES Price is the current market probability (0.00 to 1.00).
             
             # Filter zombie markets (extreme prices)
             valid_markets = [m for m in markets if not self._is_zombie_market(m)]
+            # Drop markets without resolvable YES/NO polarity. The solver, the
+            # Limitless bridge, and all constraint-building code identify the
+            # YES leg by outcome name; markets whose outcomes can't be mapped
+            # (e.g. "Trump wins" / "Trump loses") cannot be safely traded and
+            # were previously silently misinterpreted as YES = outcomes[0].
+            dropped_ambiguous = 0
+            polar_markets: list[Market] = []
+            for m in valid_markets:
+                if has_binary_polarity(m):
+                    polar_markets.append(m)
+                else:
+                    dropped_ambiguous += 1
+            if dropped_ambiguous:
+                logger.warning(
+                    "Dropped markets without resolvable YES/NO polarity",
+                    event_title=event_title,
+                    dropped=dropped_ambiguous,
+                    kept=len(polar_markets),
+                )
+            valid_markets = polar_markets
             if not valid_markets:
                 continue
             
@@ -309,9 +350,17 @@ The YES Price is the current market probability (0.00 to 1.00).
                 # Dead/zero-volume outcomes often have phantom mid-prices that inflate
                 # the sum far beyond 1.0 (e.g., 14.43 or 4.50), producing false positives.
                 MIN_OUTCOME_VOLUME = 100  # $100 minimum volume to be considered "real"
+                # Also require each market to expose a nameable YES outcome —
+                # the price sum compares YES probabilities, so a market whose
+                # YES side cannot be resolved by name contributes noise.
                 priced_markets = [
                     m for m in valid_markets
-                    if m.outcomes and m.volume and m.volume > MIN_OUTCOME_VOLUME
+                    if (
+                        m.outcomes
+                        and m.volume
+                        and m.volume > MIN_OUTCOME_VOLUME
+                        and get_yes_outcome(m) is not None
+                    )
                 ]
                 filtered_count = len(valid_markets) - len(priced_markets)
 
@@ -334,9 +383,12 @@ The YES Price is the current market probability (0.00 to 1.00).
                         threshold=MIN_OUTCOME_VOLUME,
                     )
 
-                # Calculate actual price sum using only outcomes with real volume
+                # Calculate actual price sum using only outcomes with real volume.
+                # Resolve YES by name, not by position — outcomes[0] is not
+                # guaranteed to be the YES side for any given market.
                 total_price = sum(
-                    m.outcomes[0].price for m in priced_markets
+                    (get_yes_outcome(m).price for m in priced_markets),
+                    start=Decimal("0"),
                 )
 
                 # Detect deviation from theoretical sum of 1.0 (ensure types match)
@@ -592,8 +644,9 @@ The YES Price is the current market probability (0.00 to 1.00).
         # Format markets for the prompt - include prices and liquidity
         market_lines = []
         for m in markets:
-            # Get YES price from first outcome, or 0 if unavailable
-            yes_price = m.outcomes[0].price if m.outcomes else 0.0
+            # Resolve YES by name, not by index — polarity is not guaranteed.
+            yes_outcome = get_yes_outcome(m)
+            yes_price = yes_outcome.price if yes_outcome else 0.0
             market_lines.append(
                 f"ID: {m.market_id} | Question: {m.question} | YES Price: {yes_price:.2f} | Liquidity: ${m.liquidity:,.0f}"
             )

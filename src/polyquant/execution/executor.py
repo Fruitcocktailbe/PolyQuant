@@ -80,18 +80,29 @@ class TradeExecutor:
     3. If any leg fails, unwind all previous fills
     4. Use IOC to prevent hanging orders
     """
-    def __init__(self, rust_client: Any, trade_store: Any = None, paper_mode: bool = False):
+    def __init__(
+        self,
+        rust_client: Any,
+        trade_store: Any = None,
+        paper_mode: bool = False,
+        price_cache: Any = None,
+    ):
         """
         Initialize executor.
-        
+
         Args:
             rust_client: RustClient for ZMQ ultra-low latency execution sidecar
             trade_store: TradeStore for persistent storage
             paper_mode: If True, simulate fills locally without dispatching to Rust
+            price_cache: Optional PriceCache for post-VWAP profit rechecks. When
+                provided, execute_atomic() recomputes net profit using the
+                current order books (not the solver's earlier snapshot) and
+                aborts if the trade is no longer profitable after fees+gas.
         """
         self._rust_client = rust_client
         self._trade_store = trade_store
         self._paper_mode = paper_mode
+        self._price_cache = price_cache
 
         # Dual Balance Tracking
         self.poly_balance: Decimal = Decimal("0")
@@ -108,6 +119,60 @@ class TradeExecutor:
             paper_mode=self._paper_mode,
         )
     
+    def _verify_net_profit_after_vwap(self, result: OptimizationResult) -> str | None:
+        """
+        Recompute net profit against the latest cached order books and abort
+        if the trade is no longer profitable. Returns None when the trade is
+        still good, otherwise a human-readable rejection reason.
+
+        The solver's expected_profit already has fees+gas deducted, so the
+        executor only needs to apply the additional slippage from order-book
+        drift between the solver snapshot and right now. Any leg where the
+        current VWAP is worse than the solver's limit_price (higher for BUY,
+        lower for SELL) contributes positive slippage.
+        """
+        if not result.trades:
+            return None
+
+        expected = result.expected_profit or Decimal("0")
+        cumulative_slippage = Decimal("0")
+
+        for trade in result.trades:
+            book = self._price_cache.get(trade.outcome_id)
+            if book is None:
+                # No fresh book — the per-exchange staleness check in the
+                # navigator pre-flight is the primary guard for dead feeds;
+                # here we skip the leg and trust the earlier decision.
+                logger.debug(
+                    "Post-VWAP recheck: no cached book, skipping leg",
+                    outcome_id=trade.outcome_id,
+                )
+                continue
+
+            side = trade.side
+            vwap = book.get_vwap(side, trade.size)
+            if vwap is None:
+                return (
+                    f"Post-VWAP recheck: insufficient depth on {trade.outcome_id} "
+                    f"for size {trade.size}"
+                )
+
+            if side == OrderSide.BUY:
+                leg_slip = (vwap - trade.limit_price) * trade.size
+            else:
+                leg_slip = (trade.limit_price - vwap) * trade.size
+            if leg_slip > 0:
+                cumulative_slippage += leg_slip
+
+        adjusted_net = expected - cumulative_slippage
+        if adjusted_net <= 0:
+            return (
+                f"Post-VWAP net profit <= 0 "
+                f"(expected={expected:.4f}, slippage={cumulative_slippage:.4f}, "
+                f"adjusted={adjusted_net:.4f})"
+            )
+        return None
+
     async def execute_atomic(
         self,
         result: OptimizationResult,
@@ -171,6 +236,25 @@ class TradeExecutor:
                                 success=False,
                                 reason=f"VWAP slippage {t.vwap_slippage} exceeds limit {slippage_limit} on {t.outcome_id}",
                             )
+
+            # Post-VWAP profitability recheck. The solver's profit calculation
+            # is taken from a snapshot that may be hundreds of ms stale; the
+            # order book can move enough to wipe out the edge before we
+            # dispatch. Recompute net profit using the current cached books
+            # and abort if <= 0. The hard slippage cap above catches extreme
+            # moves; this check catches small moves that quietly flip a
+            # trade from profitable to unprofitable.
+            if self._price_cache is not None:
+                recheck_reason = self._verify_net_profit_after_vwap(result)
+                if recheck_reason is not None:
+                    logger.warning(
+                        "Trade rejected: post-VWAP profit check failed",
+                        reason=recheck_reason,
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        reason=recheck_reason,
+                    )
 
         # Sort by priority (lower = first = illiquid)
         sorted_trades = sorted(result.trades, key=lambda t: t.priority)

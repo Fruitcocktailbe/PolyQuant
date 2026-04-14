@@ -56,6 +56,7 @@ USAGE:
 """
 
 import json
+from decimal import Decimal
 from datetime import datetime
 from typing import Any
 
@@ -65,6 +66,7 @@ from pydantic import BaseModel, Field
 from polyquant.agents.discovery import MarketCluster
 from polyquant.data import Market, MarketDependency
 from polyquant.utils import config, get_logger
+from polyquant.utils.market_utils import get_yes_outcome
 
 logger = get_logger(__name__)
 
@@ -519,13 +521,17 @@ CRITICAL RULES:
                 negrisk_by_group.setdefault(m.group_id, []).append(m)
 
         for group_id, group_markets in negrisk_by_group.items():
+            # Sum YES probabilities resolved by name. Markets without a
+            # named YES outcome are skipped rather than silently contributing
+            # outcomes[0].price (which may be the NO side).
+            yes_outs = [get_yes_outcome(m) for m in group_markets]
             total = sum(
-                m.outcomes[0].price for m in group_markets
-                if m.outcomes
+                (o.price for o in yes_outs if o is not None),
+                start=Decimal("0"),
             )
             hints["negrisk_groups"][group_id] = {
                 "market_count": len(group_markets),
-                "price_sum": round(total, 4),
+                "price_sum": round(float(total), 4),
             }
 
         return hints
@@ -820,10 +826,15 @@ CRITICAL RULES:
 
         # Build price lookup. Outcome.price is Decimal upstream, but validation math
         # (actual_sum += price, abs(rhs - sum)) mixes in floats, so coerce once here.
+        # Key the map by the same identifier that _sanitize_token_ids writes into
+        # constraint coefficients (`token_id or outcome_id`). Keying on
+        # outcome_id alone silently fails the price-consistency check for any
+        # CLOB market where token_id != outcome_id, letting nonsense rhs values
+        # slip through the sanity filter.
         price_map: dict[str, float] = {}
         for market in cluster.markets:
             for outcome in market.outcomes:
-                price_map[outcome.outcome_id] = float(outcome.price)
+                price_map[outcome.token_id or outcome.outcome_id] = float(outcome.price)
 
         # Filter dependencies based on price consistency
         valid_dependencies = []

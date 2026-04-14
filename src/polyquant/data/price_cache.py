@@ -67,6 +67,13 @@ class PriceCache:
         self._lock = asyncio.Lock()
         self._update_event = asyncio.Event()  # For event-driven architecture
 
+        # Per-exchange staleness tracking. A trade spanning multiple venues
+        # must verify that EACH venue's feed is fresh — aggregating at the
+        # token level lets a dead Limitless feed masquerade as healthy while
+        # Polymarket keeps ticking.
+        self._token_exchange: dict[str, str] = {}  # token_id -> exchange label
+        self._last_update_by_exchange: dict[str, float] = {}
+
         logger.info("PriceCache initialized", stale_threshold=stale_threshold_seconds)
     
     def subscribe(self, callback: UpdateCallback) -> None:
@@ -79,7 +86,12 @@ class PriceCache:
         self._subscribers.append(callback)
         logger.debug("Subscriber added", total_subscribers=len(self._subscribers))
     
-    async def update(self, token_id: str, book: OrderBook) -> None:
+    async def update(
+        self,
+        token_id: str,
+        book: OrderBook,
+        exchange: str | None = None,
+    ) -> None:
         """
         Update the cache with a new order book snapshot.
 
@@ -88,13 +100,20 @@ class PriceCache:
         Args:
             token_id: The token ID (outcome) being updated.
             book: The new order book snapshot.
+            exchange: Optional exchange label (e.g. "polymarket", "limitless").
+                When provided, the per-exchange "last update" timestamp is
+                advanced so exchange_stale() can distinguish which feed died.
         """
         if not isinstance(token_id, str) or not token_id:
             logger.error("Invalid token_id in PriceCache.update", token_id=repr(token_id))
             return
+        now = time.monotonic()
         async with self._lock:
             self._books[token_id] = book
-            self._last_update[token_id] = time.monotonic()  # Fast monotonic time
+            self._last_update[token_id] = now  # Fast monotonic time
+            if exchange:
+                self._token_exchange[token_id] = exchange
+                self._last_update_by_exchange[exchange] = now
 
         # Signal event-driven systems (e.g., Navigator)
         self._update_event.set()
@@ -157,6 +176,25 @@ class PriceCache:
         if last is None:
             return True
         return time.monotonic() - last > self._stale_threshold
+
+    def exchange_stale(self, exchange: str, threshold_seconds: float | None = None) -> bool:
+        """
+        Check whether a specific exchange has produced a recent update.
+
+        Unlike is_stale(token_id), this checks the exchange FEED as a whole.
+        A cross-exchange trade must verify that every involved venue is
+        freshly ticking — otherwise a dead Limitless feed can slip through
+        while Polymarket keeps updating unrelated tokens.
+        """
+        threshold = threshold_seconds if threshold_seconds is not None else self._stale_threshold
+        last = self._last_update_by_exchange.get(exchange)
+        if last is None:
+            return True
+        return time.monotonic() - last > threshold
+
+    def get_exchange_for_token(self, token_id: str) -> str | None:
+        """Return the exchange label the token was last updated under, or None."""
+        return self._token_exchange.get(token_id)
 
     def age_ms(self, token_id: str) -> float | None:
         """Return the age of this token's last WS update in milliseconds.

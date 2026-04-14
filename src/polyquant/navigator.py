@@ -537,12 +537,57 @@ class Navigator:
         from polyquant.agents.correlation import CorrelationEngine
         self._correlation_engine = CorrelationEngine()
         
-        # Initialize risk management
+        # Initialize risk management. Kill switch state MUST be restored from
+        # Redis before trading starts — otherwise a crash-restart could resume
+        # with an in-memory is_triggered=False and bypass a prior halt.
+        #
+        # Redis connection is explicitly established here (not lazily) so a
+        # connection failure fails fast with a clear error instead of silently
+        # degrading to "no persisted state" mode.
+        from polyquant.utils.cache import cache as _cache
+        try:
+            cache_connected = await _cache.connect()
+        except Exception as e:
+            logger.critical(
+                "REDIS CONNECT FAILED - REFUSING TO START",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                redis_url=config.redis_url,
+                exc_info=True,
+            )
+            raise SystemExit(
+                f"Redis connect raised {type(e).__name__}: {e}. "
+                f"URL: {config.redis_url}. Refusing to start trading."
+            ) from e
+        if not cache_connected:
+            logger.critical(
+                "REDIS CONNECT RETURNED FALSE - REFUSING TO START",
+                redis_url=config.redis_url,
+            )
+            raise SystemExit(
+                f"Redis connect returned False. URL: {config.redis_url}. "
+                f"Check Redis service and REDIS_URL. Refusing to start trading."
+            )
+
         self._kill_switch = KillSwitch(
             initial_capital=10000,
             on_trigger=self._on_kill_switch_trigger,
         )
-        await self._kill_switch.load_state()
+        try:
+            await self._kill_switch.load_state()
+        except Exception as e:
+            logger.critical(
+                "KILL SWITCH STATE LOAD FAILED - REFUSING TO START",
+                error_type=type(e).__name__,
+                error_message=str(e),
+                redis_url=config.redis_url,
+                exc_info=True,
+            )
+            raise SystemExit(
+                f"Kill switch state load failed ({type(e).__name__}: {e}). "
+                f"Redis at {config.redis_url} reachable but state load errored. "
+                f"Refusing to start trading."
+            ) from e
         self._position_sizer = PositionSizer(capital=10000)
         
         self._is_running = True
@@ -550,6 +595,13 @@ class Navigator:
         
         # Initialize price cache for low-latency access
         self._price_cache = PriceCache(stale_threshold_seconds=2.0)
+
+        # Wire the cache into the executor so it can recompute net profit
+        # against fresh VWAP right before dispatch. Constructed late because
+        # TradeExecutor is built earlier in __aenter__ and PriceCache only
+        # exists once the WS subscription stack is ready.
+        if self._trade_executor is not None:
+            self._trade_executor._price_cache = self._price_cache
         
         # Subscribe cache to WebSocket updates
         # NOTE: This connects the WS client (in PolymarketClient) to our local cache
@@ -557,7 +609,10 @@ class Navigator:
         # The WS client expects a callback(book: OrderBook)
         async def on_ws_update(book: OrderBook):
             if self._price_cache:
-                await self._price_cache.update(book.outcome_id, book)
+                # All updates arriving via this callback come from the
+                # Polymarket WS subscription. Limitless updates are pushed
+                # through the polling loop below and tagged separately.
+                await self._price_cache.update(book.outcome_id, book, exchange="polymarket")
         
         # This will be registered when we subscribe to specific tokens
         self._ws_update_callback = on_ws_update
@@ -1011,7 +1066,7 @@ class Navigator:
                         break
                     ob = await self._limitless.get_order_book(token_id)
                     if ob:
-                        await self._price_cache.update(token_id, ob)
+                        await self._price_cache.update(token_id, ob, exchange="limitless")
 
                 # Slow tier: poll unmatched tokens every 4th cycle (~1s)
                 fast_counter += 1
@@ -1022,7 +1077,7 @@ class Navigator:
                             break
                         ob = await self._limitless.get_order_book(token_id)
                         if ob:
-                            await self._price_cache.update(token_id, ob)
+                            await self._price_cache.update(token_id, ob, exchange="limitless")
 
                 # 250ms between fast cycles
                 await asyncio.sleep(0.25)
@@ -1758,6 +1813,24 @@ class Navigator:
                         reason=reason,
                         outcome_id=trade.outcome_id,
                         cluster_id=cluster_id,
+                    )
+                    return
+
+        # ── Pre-flight: per-exchange staleness dead-man switch ──
+        # Every exchange involved in this trade must have produced an update
+        # within the cache staleness window. Checking per-token is not enough:
+        # if Polymarket is ticking but the Limitless polling loop is stuck,
+        # a Limitless leg's stale book would be padded by the Polymarket
+        # update's global event signal.
+        if self._price_cache:
+            exchanges_in_trade = {t.exchange for t in arb.trades if t.exchange}
+            for exch in exchanges_in_trade:
+                if self._price_cache.exchange_stale(exch):
+                    logger.warning(
+                        "Trade rejected: exchange feed stale",
+                        exchange=exch,
+                        cluster_id=cluster_id,
+                        stale_threshold_s=self._price_cache._stale_threshold,
                     )
                     return
 
