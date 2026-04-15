@@ -195,8 +195,15 @@ class ExchangeMatcher:
         if isinstance(data, dict) and ("accepted" in data or "rejected" in data):
             for pid, entry in (data.get("accepted") or {}).items():
                 try:
+                    lid = entry["limitless_id"]
+                    # Drop legacy entries that stored Limitless's numeric `id`
+                    # instead of the URL `slug`. The orderbook endpoint expects
+                    # a slug, so any all-digit value here is a stale entry from
+                    # before the slug fix and would 404 downstream.
+                    if not isinstance(lid, str) or lid.isdigit():
+                        continue
                     self._accepted[pid] = _AcceptedEntry(
-                        limitless_id=entry["limitless_id"],
+                        limitless_id=lid,
                         similarity=float(entry.get("similarity", 0.0)),
                         reasoning=entry.get("reasoning", ""),
                         verified_at=entry.get("verified_at", ""),
@@ -441,8 +448,8 @@ class ExchangeMatcher:
         ):
             p_market = poly_markets[p_idx]
             l_market = limit_markets[l_idx]
-            l_id = l_market.get("id") or l_market.get("marketId")
-            if not l_id:
+            l_id = l_market.get("slug")
+            if not isinstance(l_id, str) or not l_id:
                 continue
             # Already accepted? (Polymarket id already mapped)
             if p_market.market_id in self._accepted:
@@ -540,8 +547,8 @@ class ExchangeMatcher:
         for p_idx, l_idx, sim, resp in results:
             p_market = poly_markets[p_idx]
             l_market = limit_markets[l_idx]
-            l_id = l_market.get("id") or l_market.get("marketId")
-            if not l_id:
+            l_id = l_market.get("slug")
+            if not isinstance(l_id, str) or not l_id:
                 continue
 
             if p_market.market_id in self._accepted:

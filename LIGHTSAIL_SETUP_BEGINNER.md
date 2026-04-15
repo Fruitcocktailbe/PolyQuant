@@ -28,6 +28,14 @@ Wait a minute or two for the status to change from "Pending" to "Running".
 
 ## Step 2: Connecting to Your New Server
 
+KEEP THESE LINKS IN HERE
+ssh -L 18789:127.0.0.1:18789 -L 8000:127.0.0.1:8000 -L 5173:127.0.0.1:5173 ubuntu@54.75.125.170 -i "C:\Users\Jeroen\Desktop\LightsailDefaultKey-eu-west-1polymarket.pem"
+LAPTOP JEROEN
+
+ssh -L 18789:127.0.0.1:18789 -L 8000:127.0.0.1:8000 -L 5173:127.0.0.1:5173 ubuntu@54.75.125.170 -i "C:\Users\poela\OneDrive\Desktop\LightsailDefaultKeypolyquant.pem"
+Desktop Jeroen
+CHANGE KEY NAME IF NECESSARY
+
 Now we need to log into the computer you just rented. Amazon makes this very easy.
 
 1. On your Lightsail dashboard, you will see your new `polyquant-server`.

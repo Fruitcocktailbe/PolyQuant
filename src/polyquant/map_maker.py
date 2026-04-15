@@ -3,28 +3,19 @@ Map Maker - Offline analysis and constraint generation.
 
 The Map Maker is the "slow brain" of PolyQuant. It runs periodically to:
 1. Discover markets from Polymarket.
-2. Analyze logical dependencies using DeepSeek.
-3. Validate constraints using Gemini.
+2. Analyze logical dependencies using Gemini (LogicArchitect).
+3. Validate constraints using Gemini (ValidatorAgent).
 4. Persist the validated "Constraint Map" to disk.
 
 The Navigator then loads this map for real-time trading.
 
 USAGE:
 ------
-    # Run as a script
-    python -m polyquant.map_maker
-    
-    # Or programmatically
-    from polyquant.map_maker import MapMaker
-    
-    async def run():
-        map_maker = MapMaker()
-        await map_maker.build_map()
+    python -m polyquant.main map [--limit N] [--min-liquidity M] [--force]
 """
 
-import asyncio
 import hashlib
-import json
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -35,7 +26,6 @@ from polyquant.agents import (
     DiscoveryAgent,
     LogicArchitect,
     ValidatorAgent,
-    CorrelationEngine,
     MarketCluster,
 )
 from polyquant.data import PolymarketClient
@@ -45,7 +35,6 @@ from polyquant.data.constraint_store import (
     StoredConstraint,
     StoredDependency,
 )
-from polyquant.data.market_models import Market # Added based on instruction's implied source for Market
 from polyquant.data.limitless_client import limitless_yes_token, limitless_no_token
 from polyquant.agents.exchange_matcher import ExchangeMatcher
 from polyquant.utils import config, get_logger
@@ -54,6 +43,13 @@ from polyquant.utils.cache import cache
 from polyquant.utils.market_utils import get_yes_outcome, get_no_outcome
 
 logger = get_logger(__name__)
+
+
+# Recognized token_id shapes. Polymarket token_ids are long decimal strings;
+# Limitless token_ids end in `_yes`/`_no` (or legacy `_0`/`_1` from manifests
+# written before the suffix migration).
+_POLY_TOKEN_RE = re.compile(r"^\d{50,80}$")
+_LIMITLESS_TOKEN_RE = re.compile(r".+_(yes|no|0|1)$")
 
 
 class MapMaker:
@@ -79,21 +75,18 @@ class MapMaker:
         self._discovery: DiscoveryAgent | None = None
         self._logic_architect: LogicArchitect | None = None
         self._validator: ValidatorAgent | None = None
-        self._correlation_agent: CorrelationEngine | None = None
         self._polymarket: PolymarketClient | None = None
         self._store: ConstraintStore | None = None
         self._exchange_matcher: ExchangeMatcher | None = None
-        
+
         logger.info("MapMaker initialized")
-    
+
     async def __aenter__(self) -> "MapMaker":
         """Initialize all components."""
         logger.info("Starting Map Maker...")
 
-        # Connect to cache
         await cache.connect()
 
-        # Initialize agents
         self._discovery = DiscoveryAgent()
         await self._discovery.__aenter__()
 
@@ -103,37 +96,29 @@ class MapMaker:
         self._validator = ValidatorAgent()
         await self._validator.__aenter__()
 
-        self._correlation_agent = CorrelationEngine()
-
-        # Initialize Polymarket client (for market data)
         self._polymarket = PolymarketClient()
         await self._polymarket.__aenter__()
 
-        # Initialize Cross-Exchange Matcher
         self._exchange_matcher = ExchangeMatcher()
-
-        # Initialize constraint store
         self._store = ConstraintStore()
 
         logger.info("Map Maker started")
         return self
-    
+
     async def __aexit__(self, *args: Any) -> None:
-        """Cleanup all components."""
+        """Cleanup context-managed components. ExchangeMatcher and
+        ConstraintStore are not context managers and need no teardown."""
         logger.info("Shutting down Map Maker...")
-        
+
         if self._discovery:
             await self._discovery.__aexit__(*args)
         if self._logic_architect:
             await self._logic_architect.__aexit__(*args)
         if self._validator:
             await self._validator.__aexit__(*args)
-        if self._correlation_agent:
-            # Cleanup if needed
-            pass
         if self._polymarket:
             await self._polymarket.__aexit__(*args)
-        
+
         logger.info("Map Maker shutdown complete")
     
     async def build_map(
@@ -238,9 +223,11 @@ class MapMaker:
                 return results
             
             # ================================================================
-            # PHASE 2, 3 & 4: CONCURRENT REASONING AND CROSS-EXCHANGE MAPPING
+            # PHASE 2: CROSS-EXCHANGE MATCHING (must run first so the reasoning
+            #          loop sees the up-to-date Limitless equivalencies)
+            # PHASE 3: REASONING (LLM constraint analysis)
             # ================================================================
-            logger.info("Starting concurrent Reasoning Phase (Intra-market) and Matching Phase (Cross-exchange)...")
+            logger.info("Phase 2: Cross-exchange matching, then Phase 3: Reasoning")
             
             async def run_reasoning_pipeline() -> dict[str, Any]:
                 await monitor.update_status(pipeline_stage="LOGIC")
@@ -285,12 +272,11 @@ class MapMaker:
                     )
 
                     t_cluster = time.time()
-                    manifest = await self._analyze_cluster(cluster)
+                    result = await self._analyze_cluster(cluster)
                     cluster_elapsed = time.time() - t_cluster
 
-                    if manifest:
-                        # Check if this was a cache hit
-                        is_cached = hasattr(manifest, '_from_cache') and manifest._from_cache
+                    if result is not None:
+                        manifest, is_cached = result
                         if is_cached:
                             cache_hits += 1
                             print(f"--- \u26a1 CACHE HIT: '{cluster.topic}' ({manifest.constraint_count} constraints) ---")
@@ -371,8 +357,25 @@ class MapMaker:
                     return matching_stats
                 return {"skipped": True}
 
-            # Run cross exchange matching first so reasoning pipeline can use the newly discovered Limitless pairs
-            matching_stats = await run_cross_exchange_pipeline()
+            # Run cross-exchange matching first so the reasoning loop can see
+            # newly-discovered Limitless pairs. A matching failure must NOT
+            # take down the whole build — reasoning can still produce
+            # Polymarket-only manifests with an empty mapped_pairs.
+            try:
+                matching_stats = await run_cross_exchange_pipeline()
+            except Exception as match_err:
+                logger.error(
+                    "Cross-exchange matching failed; continuing without Limitless equivalencies",
+                    error=str(match_err),
+                    exc_info=True,
+                )
+                await monitor.emit_pipeline_event(
+                    "MATCHING", "error",
+                    f"Matching pipeline failed: {type(match_err).__name__}",
+                    detail=str(match_err),
+                )
+                matching_stats = {"error": str(match_err), "skipped": True}
+
             analysis_data = await run_reasoning_pipeline()
             
             results["analysis"] = analysis_data
@@ -547,21 +550,27 @@ class MapMaker:
         cluster_repr = f"{cluster.topic}|{'|'.join(market_data)}"
         return hashlib.sha256(cluster_repr.encode()).hexdigest()
 
+    @staticmethod
+    def _cache_ttl_seconds() -> int:
+        """LLM cache lives until ~10% before the next scheduled MapMaker run,
+        so a fresh build never re-hits stale entries from the previous run."""
+        return max(60, int(config.map_interval_seconds * 0.9))
+
     async def _analyze_cluster(
         self,
         cluster: MarketCluster,
-    ) -> ConstraintManifest | None:
+    ) -> tuple[ConstraintManifest, bool] | None:
         """
         Analyze a single cluster and create a ConstraintManifest.
 
-        This runs the Logic Architect and Validator on the cluster.
-        Uses caching to avoid redundant LLM calls for identical clusters.
-
-        Args:
-            cluster: The market cluster to analyze.
+        Cache layout: only the LLM-derived portion (constraints + dependencies)
+        is cached. Cross-exchange equivalencies are re-injected on every run,
+        whether the LLM output came from cache or fresh analysis — otherwise
+        newly-discovered Limitless pairs would not land on cached clusters
+        until the LLM cache expired.
 
         Returns:
-            ConstraintManifest if analysis succeeds, None otherwise.
+            (manifest, from_cache) on success, None on failure / empty.
         """
         logger.info(
             "Analyzing cluster",
@@ -570,263 +579,246 @@ class MapMaker:
             markets=len(cluster.markets),
         )
 
-        # Compute cluster hash for caching
         cluster_hash = self._compute_cluster_hash(cluster)
 
-        # Check cache first
-        cached_result = await cache.get_llm_result(cluster_hash)
-        if cached_result:
-            logger.info(
-                "Cache hit - reusing previous analysis",
-                cluster_id=cluster.cluster_id,
-                cluster_hash=cluster_hash[:8],
-            )
+        stored_constraints: list[StoredConstraint] | None = None
+        stored_dependencies: list[StoredDependency] | None = None
+        from_cache = False
 
-            # Reconstruct manifest from cached data
+        cached_payload = await cache.get_llm_result(cluster_hash)
+        if cached_payload:
             try:
-                manifest = ConstraintManifest(**cached_result)
-                # Mark as from cache for statistics
-                manifest._from_cache = True  # type: ignore
-                return manifest
+                stored_constraints = [
+                    StoredConstraint(**c) for c in cached_payload.get("constraints", [])
+                ]
+                stored_dependencies = [
+                    StoredDependency(**d) for d in cached_payload.get("dependencies", [])
+                ]
+                from_cache = True
+                logger.info(
+                    "Cache hit - reusing previous LLM analysis",
+                    cluster_id=cluster.cluster_id,
+                    cluster_hash=cluster_hash[:8],
+                )
             except Exception as e:
                 logger.warning(
-                    "Failed to reconstruct manifest from cache",
+                    "Failed to reconstruct cached constraints; re-analyzing",
+                    cluster_id=cluster.cluster_id,
                     error=str(e),
                 )
-                # Fall through to re-analyze
+                stored_constraints = None
+                stored_dependencies = None
+                from_cache = False
 
-        try:
-            # Run Logic Architect
-            if not self._logic_architect:
-                raise RuntimeError("Logic Architect not initialized")
-            
-            analysis = await self._logic_architect.analyze_cluster(cluster)
-            
-            if not analysis.constraints and not analysis.dependencies:
-                logger.info("No dependencies found", cluster_id=cluster.cluster_id)
-                return None
-            
-            # Run Validator
-            if not self._validator:
-                raise RuntimeError("Validator not initialized")
-            
-            validated = await self._validator.validate(analysis)
+        if stored_constraints is None or stored_dependencies is None:
+            try:
+                if not self._logic_architect:
+                    raise RuntimeError("Logic Architect not initialized")
+                if not self._validator:
+                    raise RuntimeError("Validator not initialized")
 
-            if not validated.is_valid:
-                issue_reasons = [i.description for i in validated.issues[:3]]
-                reason_str = "; ".join(issue_reasons) if issue_reasons else "Unknown"
-                print(f"--- \u26a0\ufe0f  VALIDATOR REJECTED: '{cluster.topic}' | Reason: {reason_str} ---")
-                logger.warning(
-                    "Validation failed - discarding cluster",
-                    cluster_id=cluster.cluster_id,
-                    issues=len(validated.issues),
-                )
-                await monitor.emit_pipeline_event(
-                    "LOGIC", "validation_fail",
-                    f"Validation issues for '{cluster.topic}'",
-                    detail=reason_str,
-                )
-                # Rejected clusters must NOT be persisted. Navigator's
-                # _manifest_to_validated() unconditionally marks loaded manifests
-                # as is_valid=True, so any file on disk is treated as fully
-                # validated — a rejected-but-saved cluster would drive live trades.
-                return None
-            
-            # Convert to StoredConstraint format
-            stored_constraints = [
-                StoredConstraint(
-                    constraint_id=c.constraint_id,
-                    description=c.description,
-                    coefficients=c.coefficients,
-                    rhs=c.rhs,
-                    confidence=c.confidence,
-                    reasoning=c.reasoning,
-                    source_markets=c.source_markets,
-                )
-                for c in validated.validated_constraints
-            ]
-            
-            # Convert to StoredDependency format
-            stored_dependencies = [
-                StoredDependency(
-                    source_market_id=d.source_market_id,
-                    source_outcome=d.source_outcome,
-                    target_market_id=d.target_market_id,
-                    target_outcome=d.target_outcome,
-                    relationship=d.relationship,
-                    confidence=d.confidence,
-                )
-                for d in validated.validated_dependencies
-            ]
-            
-            # Run Correlation Agent
-            correlations = []
-            if self._correlation_agent and self._polymarket:
-                async def history_provider(mid: str):
-                    # get_history returns a list of {"t": timestamp, "p": price} dicts
-                    # Correlation engine expects exactly that shape.
-                    return await self._polymarket.get_history(mid)
-                
-                # Correlate on the YES token specifically. Resolve YES by name
-                # so we never accidentally correlate NO prices — outcomes[0] is
-                # not guaranteed to be the YES side.
-                token_to_market = {}
-                token_markets = []
-                for m in cluster.markets:
-                    yes_out = get_yes_outcome(m)
-                    if not yes_out or not yes_out.token_id:
-                        continue
-                    token_id = yes_out.token_id
-                    token_to_market[token_id] = m
-                    # Create a dummy market with the YES token_id as its primary
-                    # ID so the correlation engine tests the correct string
-                    token_market = Market(
-                        market_id=token_id,
-                        question=m.question,
-                        outcomes=m.outcomes,
-                        liquidity=m.liquidity,
-                        volume=m.volume,
+                analysis = await self._logic_architect.analyze_cluster(cluster)
+
+                if not analysis.constraints and not analysis.dependencies:
+                    logger.info("No dependencies found", cluster_id=cluster.cluster_id)
+                    return None
+
+                validated = await self._validator.validate(analysis)
+
+                # Validator-bypass guard: if the LLM was unavailable, the
+                # validator returns is_valid=True with no real review. The
+                # Navigator stamps loaded manifests as is_valid=True, so
+                # persisting unreviewed output would drive live trades from
+                # raw LLM constraints. Refuse to persist instead.
+                if validated.validation_notes.startswith("No-LLM mode"):
+                    logger.error(
+                        "Refusing to persist cluster: validator ran in No-LLM mode "
+                        "(LLM unavailable). Check GEMINI_API_KEY / OpenRouter config.",
+                        cluster_id=cluster.cluster_id,
                     )
-                    token_markets.append(token_market)
-                
-                # CorrelationAgent might need to be async or we fetch here
-                # Let's assume we can pass the provider and it handles it
-                # Logic: scan_for_pairs(token_markets, history_provider)
-                signals = await self._correlation_agent.scan_for_pairs(
-                    token_markets, 
-                    history_provider
+                    await monitor.emit_pipeline_event(
+                        "LOGIC", "validation_skipped",
+                        f"Validator was unavailable for '{cluster.topic}' — refusing to persist",
+                    )
+                    return None
+
+                rejected_count = (
+                    len(analysis.constraints) - len(validated.validated_constraints)
                 )
-                correlations = [s.model_dump(mode="json") for s in signals]
+                if rejected_count > 0:
+                    rejected_ids: list[str] = []
+                    for issue in validated.issues:
+                        if issue.severity == "error":
+                            rejected_ids.extend(issue.affected_constraints)
+                    logger.warning(
+                        "Validator filtered constraints",
+                        cluster_id=cluster.cluster_id,
+                        rejected=rejected_count,
+                        kept=len(validated.validated_constraints),
+                        rejected_ids=rejected_ids[:10],
+                    )
 
-            # Create limitless equivalencies
-            market_ids = [m.market_id for m in cluster.markets]
-            market_exchanges = {m.market_id: "polymarket" for m in cluster.markets}
-            market_titles = {m.market_id: m.question for m in cluster.markets}
-            
-            if self._exchange_matcher:
-                mapped = self._exchange_matcher.mapped_pairs
-                for m in cluster.markets:
-                    l_val = mapped.get(m.market_id)
-                    if l_val:
-                        # Value might be "l_id|slug" or just "l_id"
-                        if "|" in l_val:
-                            l_id, l_slug = l_val.split("|", 1)
-                        else:
-                            l_id = l_val
-                            l_slug = ""
-                            
-                        if l_id not in market_ids:
-                            market_ids.append(l_id)
-                        
-                        # Add slug to market exchanges for downstream
-                        if l_slug:
-                            market_exchanges[l_id] = f"limitless:{l_slug}"
-                        else:
-                            market_exchanges[l_id] = "limitless"
-                            
-                        market_titles[l_id] = f"{m.question} (Limitless)"
-                            
-                        # Resolve Polymarket YES/NO by outcome name — never by
-                        # index. Falls back to skipping the cross-exchange
-                        # mapping if either side is unresolvable, rather than
-                        # silently writing the wrong token_id into coefficients.
-                        pm_yes_out = get_yes_outcome(m)
-                        pm_no_out = get_no_outcome(m)
-                        if pm_yes_out is None or pm_no_out is None:
-                            logger.warning(
-                                "Skipping Limitless equivalence: polarity unresolved",
-                                market_id=m.market_id,
-                                question=m.question,
-                            )
-                            continue
-                        pm_yes = pm_yes_out.token_id or pm_yes_out.outcome_id
-                        pm_no = pm_no_out.token_id or pm_no_out.outcome_id
+                if not validated.is_valid:
+                    logger.info(
+                        "All constraints rejected by validator — nothing to persist",
+                        cluster_id=cluster.cluster_id,
+                    )
+                    return None
 
-                        # Build Limitless token_ids via the canonical helper so
-                        # the suffix convention stays in one place.
-                        l_yes = limitless_yes_token(l_id)
-                        l_no = limitless_no_token(l_id)
+                stored_constraints = [
+                    StoredConstraint(
+                        constraint_id=c.constraint_id,
+                        description=c.description,
+                        coefficients=c.coefficients,
+                        rhs=c.rhs,
+                        confidence=c.confidence,
+                        reasoning=c.reasoning,
+                        source_markets=c.source_markets,
+                    )
+                    for c in validated.validated_constraints
+                ]
+                stored_dependencies = [
+                    StoredDependency(
+                        source_market_id=d.source_market_id,
+                        source_outcome=d.source_outcome,
+                        target_market_id=d.target_market_id,
+                        target_outcome=d.target_outcome,
+                        relationship=d.relationship,
+                        confidence=d.confidence,
+                    )
+                    for d in validated.validated_dependencies
+                ]
 
-                        # Append to coefficients for all constraints so solver treats them as perfect substitutes
-                        for c in stored_constraints:
-                            if pm_yes in c.coefficients:
-                                c.coefficients[l_yes] = c.coefficients[pm_yes]
-                            if pm_no in c.coefficients:
-                                c.coefficients[l_no] = c.coefficients[pm_no]
-            # Validate coefficient keys to ensure they are properly mapped
+                cache_payload = {
+                    "constraints": [c.model_dump(mode="json") for c in stored_constraints],
+                    "dependencies": [d.model_dump(mode="json") for d in stored_dependencies],
+                }
+                await cache.set_llm_result(
+                    cluster_hash, cache_payload, ttl_seconds=self._cache_ttl_seconds()
+                )
+
+            except Exception as e:
+                logger.error(
+                    "Cluster analysis failed",
+                    cluster_id=cluster.cluster_id,
+                    error=str(e),
+                    exc_info=True,
+                )
+                return None
+
+        # Cross-exchange injection runs on BOTH the cache-hit and fresh paths
+        # so newly-discovered Limitless matches always land on the manifest.
+        market_ids, market_exchanges, market_titles = self._build_market_metadata(cluster)
+        self._inject_limitless_equivalencies(
+            cluster, stored_constraints, market_ids, market_exchanges, market_titles
+        )
+        self._validate_token_id_shapes(stored_constraints)
+
+        manifest = ConstraintManifest(
+            cluster_id=cluster.cluster_id,
+            topic=cluster.topic,
+            market_ids=market_ids,
+            market_exchanges=market_exchanges,
+            market_titles=market_titles,
+            constraints=stored_constraints,
+            dependencies=stored_dependencies,
+        )
+
+        logger.info(
+            "Cluster analysis complete",
+            cluster_id=cluster.cluster_id,
+            constraints=len(stored_constraints),
+            dependencies=len(stored_dependencies),
+            from_cache=from_cache,
+        )
+
+        return manifest, from_cache
+
+    @staticmethod
+    def _build_market_metadata(
+        cluster: MarketCluster,
+    ) -> tuple[list[str], dict[str, str], dict[str, str]]:
+        market_ids = [m.market_id for m in cluster.markets]
+        market_exchanges = {m.market_id: "polymarket" for m in cluster.markets}
+        market_titles = {m.market_id: m.question for m in cluster.markets}
+        return market_ids, market_exchanges, market_titles
+
+    def _inject_limitless_equivalencies(
+        self,
+        cluster: MarketCluster,
+        stored_constraints: list[StoredConstraint],
+        market_ids: list[str],
+        market_exchanges: dict[str, str],
+        market_titles: dict[str, str],
+    ) -> None:
+        """Add Limitless YES/NO token coefficients alongside their Polymarket
+        counterparts so the solver treats matched pairs as the same security.
+
+        Polarity is resolved by exact outcome name (never by index). Each
+        injection is logged so an operator can audit which Polymarket↔Limitless
+        pairs the solver was treating as equivalent on a given run."""
+        if not self._exchange_matcher:
+            return
+
+        mapped = self._exchange_matcher.mapped_pairs
+        for m in cluster.markets:
+            l_id = mapped.get(m.market_id)
+            if not l_id:
+                continue
+
+            if l_id not in market_ids:
+                market_ids.append(l_id)
+            market_exchanges[l_id] = "limitless"
+            market_titles[l_id] = f"{m.question} (Limitless)"
+
+            pm_yes_out = get_yes_outcome(m)
+            pm_no_out = get_no_outcome(m)
+            if pm_yes_out is None or pm_no_out is None:
+                logger.warning(
+                    "Skipping Limitless equivalence: polarity unresolved",
+                    market_id=m.market_id,
+                    question=m.question,
+                )
+                continue
+            pm_yes = pm_yes_out.token_id or pm_yes_out.outcome_id
+            pm_no = pm_no_out.token_id or pm_no_out.outcome_id
+
+            l_yes = limitless_yes_token(l_id)
+            l_no = limitless_no_token(l_id)
+
             for c in stored_constraints:
-                invalid_keys = []
-                for k in c.coefficients.keys():
-                    if not (k.startswith("0x") or "_" in k or len(k) > 20):
-                        invalid_keys.append(k)
-                if invalid_keys:
-                    logger.warning("Constraint has potentially unmapped/invalid token IDs", constraint_id=c.constraint_id, invalid_keys=invalid_keys)
-
-            # Create manifest
-
-            manifest = ConstraintManifest(
-                cluster_id=cluster.cluster_id,
-                topic=cluster.topic,
-                market_ids=market_ids,
-                market_exchanges=market_exchanges,
-                market_titles=market_titles,
-                constraints=stored_constraints,
-                dependencies=stored_dependencies,
-                correlations=correlations,
-            )
-
-            # Cache the result for future runs (5 minute TTL)
-            cache_data = manifest.model_dump(mode="json")
-            await cache.set_llm_result(cluster_hash, cache_data, ttl_seconds=300)
+                if pm_yes in c.coefficients:
+                    c.coefficients[l_yes] = c.coefficients[pm_yes]
+                if pm_no in c.coefficients:
+                    c.coefficients[l_no] = c.coefficients[pm_no]
 
             logger.info(
-                "Cluster analysis complete",
+                "Cross-exchange equivalence injected",
                 cluster_id=cluster.cluster_id,
-                constraints=len(stored_constraints),
-                dependencies=len(stored_dependencies),
-                cached=True,
+                polymarket_market_id=m.market_id,
+                limitless_id=l_id,
+                pm_yes=pm_yes,
+                pm_no=pm_no,
+                l_yes=l_yes,
+                l_no=l_no,
             )
 
-            return manifest
-            
-        except Exception as e:
-            logger.error(
-                "Cluster analysis failed",
-                cluster_id=cluster.cluster_id,
-                error=str(e),
-            )
-            return None
+    @staticmethod
+    def _validate_token_id_shapes(stored_constraints: list[StoredConstraint]) -> None:
+        """Warn when a coefficient key doesn't match a recognized token_id
+        shape (Polymarket decimal or Limitless suffixed). Anything that slips
+        past these patterns is almost certainly an unmapped placeholder that
+        the solver will silently ignore."""
+        for c in stored_constraints:
+            invalid_keys = [
+                k for k in c.coefficients
+                if not (_POLY_TOKEN_RE.match(k) or _LIMITLESS_TOKEN_RE.match(k))
+            ]
+            if invalid_keys:
+                logger.warning(
+                    "Constraint has unrecognized token_id format",
+                    constraint_id=c.constraint_id,
+                    invalid_keys=invalid_keys,
+                )
 
 
-async def main() -> None:
-    """Main entry point for the Map Maker."""
-    from polyquant.api.server import monitor, start_api_server
-
-    print("""
-    ===============================================================
-                      PolyQuant Map Maker
-              Offline Constraint Analysis Engine
-    ===============================================================
-    """)
-
-    server, server_task = await start_api_server()
-    await monitor.update_status(status="MAPPING")
-
-    try:
-        async with MapMaker() as map_maker:
-            result = await map_maker.build_map(
-                limit=500,
-                min_liquidity=1000,
-            )
-
-            report_path = result.get("report_path", "N/A")
-            print(f"\n  Report saved to: {report_path}")
-            await monitor.update_status(status="MAPPING_COMPLETE")
-            await asyncio.sleep(5)  # let final WS frames flush to dashboard
-    finally:
-        server.should_exit = True
-        await server_task
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

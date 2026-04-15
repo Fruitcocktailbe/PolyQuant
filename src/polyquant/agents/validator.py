@@ -161,6 +161,14 @@ time. Your job is structural validation: is the constraint mathematically and
 logically correct? A constraint with currently-thin liquidity is still a valid
 constraint — it may become tradeable when prices move.
 
+PARTIAL FILTERING IS REQUIRED. When you find a problem, do NOT mark the entire
+analysis invalid. Instead, flag the specific bad constraints by their
+constraint_id in the issue's `affected_constraints` array, and the downstream
+pipeline will filter them out individually. Good constraints in the same
+cluster must still survive. Only flag a constraint with severity="error" when
+it is mathematically inconsistent or logically broken — use severity="warning"
+for items that are merely suboptimal or worth a human glance.
+
 COMMON EDGE CASES TO CHECK:
 - "Win by X points" vs "Win outright" - different resolutions
 - Date/time boundaries and timezone issues
@@ -202,7 +210,10 @@ Be thorough and conservative. Flag anything that could cause issues."""
         from polyquant.utils.llm_client import get_llm_client
         self._llm_available = get_llm_client() is not None
         if not self._llm_available:
-            logger.warning("LLM not available - running in No-LLM mode")
+            logger.error(
+                "LLM not available — Validator is running in No-LLM mode. "
+                "MapMaker will refuse to persist any cluster while in this state."
+            )
         return self
     
     async def __aexit__(self, *args) -> None:
@@ -377,26 +388,23 @@ Be thorough and conservative. Flag anything that could cause issues."""
                 )
             )
         
-        # Determine validity based on issues
-        is_valid = response.get("is_valid", True)
-        if any(i.severity == "error" for i in issues):
-            is_valid = False
-        
-        # Filter validated items (exclude those with errors)
-        error_constraint_ids = set()
+        # Filter constraints with severity="error" individually. A cluster
+        # is valid as long as at least one constraint survives — partial
+        # filtering replaces the old all-or-nothing verdict.
+        error_constraint_ids: set[str] = set()
         for issue in issues:
             if issue.severity == "error":
                 error_constraint_ids.update(issue.affected_constraints)
-        
-        validated_dependencies = [
-            dep for dep in original.dependencies
-        ]
-        
+
         validated_constraints = [
             cons for cons in original.constraints
             if cons.constraint_id not in error_constraint_ids
         ]
-        
+
+        validated_dependencies = list(original.dependencies)
+
+        is_valid = len(validated_constraints) > 0
+
         return ValidatedResult(
             original=original,
             is_valid=is_valid,

@@ -31,7 +31,6 @@ import asyncio  # Week 3: For parallel manifest loading
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -41,9 +40,11 @@ logger = get_logger(__name__)
 
 
 # Bumped from "1.0" → "1.1" when MapMaker stopped filtering constraints by
-# snapshot-time liquidity/spread. v1.0 manifests are missing structurally
-# valid constraints and are auto-quarantined on load.
-CURRENT_MANIFEST_VERSION = "1.1"
+# snapshot-time liquidity/spread. Bumped from "1.1" → "1.2" when the dead
+# `correlations` field was dropped from the manifest schema (Navigator runs
+# its own CorrelationEngine live and never read the persisted field). Older
+# manifests are auto-quarantined on load.
+CURRENT_MANIFEST_VERSION = "1.2"
 
 # Manifests older than this are deleted on startup. Stale manifests reference
 # markets that have likely resolved or moved, so keeping them around just
@@ -112,9 +113,10 @@ class ConstraintManifest(BaseModel):
     market_titles: dict[str, str] = Field(default_factory=dict)  # market_id -> human-readable title
     constraints: list[StoredConstraint] = Field(default_factory=list)
     dependencies: list[StoredDependency] = Field(default_factory=list)
-    correlations: list[Any] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     version: str = CURRENT_MANIFEST_VERSION
+
+    model_config = {"extra": "ignore"}  # tolerate dropped fields like `correlations` in legacy v1.1 files mid-quarantine
     
     @property
     def constraint_count(self) -> int:

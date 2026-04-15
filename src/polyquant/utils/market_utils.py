@@ -32,32 +32,35 @@ def extract_market_id(outcome_id: str) -> str:
 
 def get_yes_outcome(market: "Market") -> "Outcome | None":
     """
-    Resolve a market's YES outcome by name.
+    Resolve a market's YES outcome by exact name match.
 
-    Returns the first outcome whose name contains "yes" (case-insensitive).
-    Returns None if no such outcome exists — callers MUST handle the None
-    case explicitly (log + skip) rather than falling back to index 0.
+    Returns the outcome whose name is exactly "yes" (case-insensitive,
+    whitespace-stripped). Returns None if no such outcome exists — callers
+    MUST handle the None case explicitly (log + skip) rather than falling
+    back to index 0.
 
-    Indexing outcomes positionally is unsafe: Polymarket and Limitless both
-    return outcomes in non-deterministic order, so `market.outcomes[0]` is
-    not guaranteed to be YES.
+    Substring matching ("yes" in name) is unsafe — it would match outcomes
+    like "Yesterday". Indexing positionally is also unsafe — Polymarket and
+    Limitless return outcomes in non-deterministic order. Exact-match is
+    the only safe option for binary YES/NO markets.
     """
     for outcome in market.outcomes:
-        if "yes" in outcome.name.lower():
+        if outcome.name.strip().lower() == "yes":
             return outcome
     return None
 
 
 def get_no_outcome(market: "Market") -> "Outcome | None":
     """
-    Resolve a market's NO outcome by name.
+    Resolve a market's NO outcome by exact name match.
 
-    Returns the first outcome whose name contains "no" (case-insensitive).
-    Returns None if no such outcome exists — callers MUST handle the None
-    case explicitly rather than falling back to index 1.
+    Returns the outcome whose name is exactly "no" (case-insensitive,
+    whitespace-stripped). Substring matching is unsafe: "no" is a substring
+    of "Unknown", "Noah", "November", "snow", which would silently flip
+    polarity. Exact-match only.
     """
     for outcome in market.outcomes:
-        if "no" in outcome.name.lower():
+        if outcome.name.strip().lower() == "no":
             return outcome
     return None
 
