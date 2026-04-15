@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, memo, useRef } from '
 import {
     LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer
 } from 'recharts';
-import { Cpu, Layers, Activity, Wifi, DollarSign } from 'lucide-react';
+import { Cpu, Layers, Activity, Wifi, DollarSign, ExternalLink } from 'lucide-react';
 import { api, SystemState } from '../services/api';
 import { PipelineMonitor } from './PipelineMonitor';
 import { TradeLog } from './TradeLog';
@@ -138,6 +138,42 @@ const ClusterCard = memo<{ cluster: any; onClick?: (id: string) => void }>(({ cl
     </div>
 ));
 
+// Classify a stored constraint into a human-readable type label + one-line
+// explainer. Pattern-matches on `description` (e.g. "FAIR_IMPLIED_PARTITION
+// for market X") which the map_maker populates from the extractor that
+// produced the constraint.
+function classifyConstraint(c: { description?: string; operator?: string; rhs?: number }): { label: string; blurb: string } {
+    const d = (c.description || "").toUpperCase();
+    if (d.includes("PARTITION")) {
+        return {
+            label: "Mutual Exclusivity (Sum-to-1)",
+            blurb: "NegRisk outcomes partition the event — prices must sum to 1.0. Deviations are arbitrage: short-all if over, buy-all if under.",
+        };
+    }
+    if (d.includes("IMPLIES") || d.includes("IMPLICATION")) {
+        return {
+            label: "Implication",
+            blurb: "Outcome A resolving YES forces outcome B to resolve YES.",
+        };
+    }
+    if (d.includes("EXCLUDES") || d.includes("EXCLUSION")) {
+        return {
+            label: "Exclusion",
+            blurb: "Outcome A resolving YES forces outcome B to resolve NO.",
+        };
+    }
+    if (d.includes("DUTCH")) {
+        return {
+            label: "Dutch Book",
+            blurb: "Combined outcomes across markets create a risk-free book.",
+        };
+    }
+    return {
+        label: "Linear Constraint",
+        blurb: `Aᵀ · z ${c.operator || "≤"} ${c.rhs?.toFixed(2) ?? "?"}`,
+    };
+}
+
 // Cluster Details Modal Component
 const ClusterDetailsModal = memo<{ clusterId: string | null; onClose: () => void }>(({ clusterId, onClose }) => {
     const [details, setDetails] = useState<any>(null);
@@ -185,87 +221,147 @@ const ClusterDetailsModal = memo<{ clusterId: string | null; onClose: () => void
                             Loading internal structure...
                         </div>
                     ) : details ? (
-                        <div className="p-5 space-y-6">
-                            {/* Stats */}
-                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                                <div className="border border-white/5 bg-black/20 p-3">
-                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraints</div>
-                                    <div className="text-lg font-mono text-neon-green">{details.constraints?.length || 0}</div>
+                        (() => {
+                            const tokenLabels: Record<string, { market_id: string; market_title: string; outcome_name: string; exchange: string }> = details.token_labels || {};
+                            const marketUrls: Record<string, string> = details.market_urls || {};
+                            const exchanges: Record<string, string> = details.market_exchanges || {};
+                            const marketCount = Object.keys(exchanges).filter(k => k).length;
+                            const dominantType = details.constraints && details.constraints.length > 0
+                                ? classifyConstraint(details.constraints[0]).label
+                                : "—";
+                            return (
+                            <div className="p-5 space-y-6">
+                                {/* Stats */}
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                    <div className="border border-white/5 bg-black/20 p-3">
+                                        <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraints</div>
+                                        <div className="text-lg font-mono text-neon-green">{details.constraints?.length || 0}</div>
+                                    </div>
+                                    <div className="border border-white/5 bg-black/20 p-3">
+                                        <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Linked Markets</div>
+                                        <div className="text-lg font-mono text-neon-purple">{marketCount}</div>
+                                    </div>
+                                    <div className="border border-white/5 bg-black/20 p-3">
+                                        <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraint Type</div>
+                                        <div className="text-[11px] font-mono text-white leading-tight mt-1" title={dominantType}>{dominantType}</div>
+                                    </div>
+                                    <div className="border border-white/5 bg-black/20 p-3">
+                                        <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Validation Status</div>
+                                        <div className="text-lg font-mono text-neon-cyan text-sm mt-1">{details.is_valid === false ? 'INVALID' : 'VALID'}</div>
+                                    </div>
                                 </div>
-                                <div className="border border-white/5 bg-black/20 p-3">
-                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Linked Markets</div>
-                                    <div className="text-lg font-mono text-neon-purple">{details.market_ids?.length || 0}</div>
-                                </div>
-                                <div className="border border-white/5 bg-black/20 p-3">
-                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Constraint Ext.</div>
-                                    <div className="text-lg font-mono text-white">{details.extractor?.slice(0, 10) || 'None'}</div>
-                                </div>
-                                <div className="border border-white/5 bg-black/20 p-3">
-                                    <div className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Validation Status</div>
-                                    <div className="text-lg font-mono text-neon-cyan text-sm mt-1">{details.is_valid ? 'VALID' : 'INVALID'}</div>
-                                </div>
-                            </div>
 
-                            {/* Constraints Detail */}
-                            <div>
-                                <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
-                                    <Activity className="w-3 h-3 text-neon-green" /> Constraint Equations
-                                </h3>
-                                <div className="space-y-2">
-                                    {details.constraints?.map((constraint: any, idx: number) => (
-                                        <div key={idx} className="bg-black/40 border border-white/5 p-3 hover:border-white/10 transition-colors">
-                                            <div className="flex justify-between items-start mb-2">
-                                                <span className="text-[10px] text-gray-500 uppercase">{constraint.type || 'Prio 0'}</span>
-                                                <div className="text-[10px] font-mono whitespace-nowrap overflow-x-auto custom-scrollbar pb-1 text-right max-w-[70%]">
-                                                    {Object.entries(constraint.coefficients || {}).map(([token, coeff]: [string, any], i, arr) => (
-                                                        <span key={token} className="inline-block">
-                                                            <span className={coeff > 0 ? "text-neon-cyan" : "text-neon-red"}>{coeff > 0 ? '+' : ''}{Number(coeff).toFixed(2)}</span>
-                                                            <span className="text-gray-400">×</span>
-                                                            <span className="text-white" title={token}>{token.slice(0, 5)}...</span>
-                                                            {i < arr.length - 1 ? "  " : ""}
+                                {/* Constraints Detail */}
+                                <div>
+                                    <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
+                                        <Activity className="w-3 h-3 text-neon-green" /> Constraint Equations
+                                    </h3>
+                                    <div className="space-y-3">
+                                        {details.constraints?.map((constraint: any, idx: number) => {
+                                            const classification = classifyConstraint(constraint);
+                                            const confidencePct = typeof constraint.confidence === "number"
+                                                ? Math.round(constraint.confidence * 100)
+                                                : null;
+                                            const operator = constraint.operator || "≤";
+                                            const rhs = typeof constraint.rhs === "number" ? constraint.rhs.toFixed(2) : "0.00";
+                                            return (
+                                                <div key={idx} className="bg-black/40 border border-white/5 p-4 hover:border-white/10 transition-colors">
+                                                    <div className="flex justify-between items-start mb-3 gap-3">
+                                                        <div className="flex flex-col gap-1 min-w-0">
+                                                            <span className="text-[11px] font-bold text-neon-green uppercase tracking-wider">{classification.label}</span>
+                                                            {constraint.description && (
+                                                                <span className="text-[9px] text-gray-500 font-mono truncate" title={constraint.description}>
+                                                                    {constraint.description}
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {confidencePct !== null && (
+                                                            <span className="text-[9px] px-2 py-1 border border-neon-cyan/40 bg-neon-cyan/10 text-neon-cyan font-mono uppercase tracking-tighter shrink-0">
+                                                                {confidencePct}% conf
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div className="bg-black/40 border border-white/5 p-3">
+                                                        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[11px] font-mono">
+                                                            {Object.entries(constraint.coefficients || {}).map(([token, coeffRaw]: [string, any]) => {
+                                                                const coeff = Number(coeffRaw);
+                                                                const tokenInfo = tokenLabels[token];
+                                                                const display = tokenInfo
+                                                                    ? `${tokenInfo.outcome_name}${tokenInfo.market_title ? ` · ${tokenInfo.market_title}` : ""}`
+                                                                    : `${token.slice(0, 8)}…`;
+                                                                return (
+                                                                    <span key={token} className="inline-flex items-baseline gap-1" title={token}>
+                                                                        <span className={coeff > 0 ? "text-neon-cyan" : "text-neon-red"}>
+                                                                            {coeff > 0 ? "+" : ""}{coeff.toFixed(2)}
+                                                                        </span>
+                                                                        <span className="text-gray-500">×</span>
+                                                                        <span className="text-white px-1.5 py-0.5 bg-white/5 border border-white/10 rounded-sm max-w-[320px] truncate">
+                                                                            {display}
+                                                                        </span>
+                                                                    </span>
+                                                                );
+                                                            })}
+                                                            <span className="text-gray-500 mx-1">{operator}</span>
+                                                            <span className="text-neon-green">{rhs}</span>
+                                                        </div>
+                                                    </div>
+                                                    {constraint.reasoning && (
+                                                        <div className="text-[10px] text-gray-500 italic mt-2 leading-relaxed">
+                                                            {constraint.reasoning}
+                                                        </div>
+                                                    )}
+                                                    <div className="text-[9px] text-gray-600 mt-2 leading-relaxed">
+                                                        {classification.blurb}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                        {(!details.constraints || details.constraints.length === 0) && (
+                                            <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No constraints extracted.</div>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Markets Map */}
+                                <div>
+                                    <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
+                                        <Cpu className="w-3 h-3 text-neon-purple" /> Markets Discovered
+                                    </h3>
+                                    <div className="space-y-2">
+                                        {Object.entries(exchanges).filter(([marketId]) => !!marketId).map(([marketId, exchange]: [string, any]) => {
+                                            const title = details.market_titles?.[marketId] || "Unknown Market";
+                                            const url = marketUrls[marketId];
+                                            const isLimitless = String(exchange).toLowerCase().includes('limitless');
+                                            const row = (
+                                                <div className="bg-black/40 border border-white/5 p-3 transition-colors flex justify-between items-center group hover:border-neon-cyan/40 hover:bg-neon-cyan/5">
+                                                    <div className="flex flex-col gap-1 w-[70%]">
+                                                        <span className="text-xs text-white truncate group-hover:text-neon-cyan transition-colors" title={title}>{title}</span>
+                                                        <span className="text-[9px] text-gray-500 font-mono select-all truncate" title={marketId}>ID: {marketId}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                        {url && <ExternalLink className="w-3 h-3 text-gray-500 group-hover:text-neon-cyan transition-colors" />}
+                                                        <span className={`text-[8px] px-2 py-1 border font-bold uppercase tracking-tighter ${isLimitless ? 'bg-neon-purple/20 text-neon-purple border-neon-purple/40' : 'bg-neon-cyan/20 text-neon-cyan border-neon-cyan/40'}`}>
+                                                            {exchange as string}
                                                         </span>
-                                                    ))}
-                                                    <span className="text-gray-500 mx-2">{constraint.operator || '<='}</span>
-                                                    <span className="text-neon-green">{constraint.rhs?.toFixed(2) || '0.00'}</span>
+                                                    </div>
                                                 </div>
-                                            </div>
-                                        </div>
-                                    ))}
-                                    {(!details.constraints || details.constraints.length === 0) && (
-                                        <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No constraints extracted.</div>
-                                    )}
+                                            );
+                                            return url ? (
+                                                <a key={marketId} href={url} target="_blank" rel="noopener noreferrer" className="block">
+                                                    {row}
+                                                </a>
+                                            ) : (
+                                                <div key={marketId}>{row}</div>
+                                            );
+                                        })}
+                                        {marketCount === 0 && (
+                                            <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No markets linked yet.</div>
+                                        )}
+                                    </div>
                                 </div>
                             </div>
-
-                            {/* Markets Map */}
-                            <div>
-                                <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-[0.2em] mb-3 flex items-center gap-2 border-b border-white/10 pb-2">
-                                    <Cpu className="w-3 h-3 text-neon-purple" /> Markets Discovered
-                                </h3>
-                                <div className="space-y-2">
-                                    {Object.entries(details.market_exchanges || {}).map(([marketId, exchange]: [string, any]) => {
-                                        const title = details.market_titles?.[marketId] || "Unknown Market";
-                                        const isLimitless = String(exchange).toLowerCase().includes('limitless');
-                                        return (
-                                            <div key={marketId} className="bg-black/40 border border-white/5 p-3 hover:border-white/10 transition-colors flex justify-between items-center">
-                                                <div className="flex flex-col gap-1 w-[70%]">
-                                                    <span className="text-xs text-white truncate" title={title}>{title}</span>
-                                                    <span className="text-[9px] text-gray-500 font-mono select-all">ID: {marketId}</span>
-                                                </div>
-                                                <div className="flex items-center">
-                                                    <span className={`text-[8px] px-2 py-1 border font-bold uppercase tracking-tighter ${isLimitless ? 'bg-neon-purple/20 text-neon-purple border-neon-purple/40' : 'bg-neon-cyan/20 text-neon-cyan border-neon-cyan/40'}`}>
-                                                        {exchange as string}
-                                                    </span>
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                    {Object.keys(details.market_exchanges || {}).length === 0 && (
-                                        <div className="text-[10px] text-gray-600 font-mono text-center py-4 italic">No markets linked yet.</div>
-                                    )}
-                                </div>
-                            </div>
-                        </div>
+                            );
+                        })()
                     ) : (
                         <div className="flex flex-col items-center justify-center h-full text-red-400 font-mono text-xs gap-2 p-10 text-center">
                             Failed to load cluster details.

@@ -45,7 +45,6 @@ logger = get_logger(__name__)
 CACHE_DIR = Path(".polyquant/constraints")
 CACHE_FILE = CACHE_DIR / "market_pairs.json"
 
-MIN_LIQUIDITY = 2500.0
 LIMITLESS_PAGE_SIZE = 20
 EMBEDDING_TOP_K = 5
 SIMILARITY_FLOOR = 0.50      # absolute floor — below this we don't even consider
@@ -250,13 +249,18 @@ class ExchangeMatcher:
     # ----------------------------------------------------------- fetch markets
 
     async def _fetch_polymarket(self) -> tuple[list[Any], int]:
+        floor = config.min_liquidity_matcher_polymarket
+        logger.info(
+            f"Polymarket: fetching markets at liquidity floor ${floor:,.0f} "
+            f"(server-side filter)"
+        )
         markets: list[Any] = []
         async with PolymarketClient() as p_client:
             offset = 0
             page_size = 500
             while True:
                 batch, raw_count = await p_client.get_active_markets(
-                    limit=page_size, offset=offset, min_liquidity=MIN_LIQUIDITY
+                    limit=page_size, offset=offset, min_liquidity=floor
                 )
                 markets.extend(batch)
                 offset += page_size
@@ -307,21 +311,29 @@ class ExchangeMatcher:
         poly_markets, poly_fetched_total = await self._fetch_polymarket()
         limit_markets_raw = await self._fetch_limitless()
 
+        limitless_floor = config.min_liquidity_matcher_limitless
+        logger.info(
+            f"Limitless: filtering {len(limit_markets_raw)} raw markets at "
+            f"liquidity floor ${limitless_floor:,.0f} (client-side filter)"
+        )
         limit_markets: list[dict] = []
         for m in limit_markets_raw:
             vol, liq = _limitless_dollars(m)
-            if max(vol, liq) >= MIN_LIQUIDITY:
+            if max(vol, liq) >= limitless_floor:
                 limit_markets.append(m)
 
         logger.info(
-            f"Layer 0 complete: {len(poly_markets)} Polymarket | {len(limit_markets)} Limitless after filter."
+            f"Layer 0 complete: {len(poly_markets)} Polymarket "
+            f"(floor ${config.min_liquidity_matcher_polymarket:,.0f}) | "
+            f"{len(limit_markets)} Limitless (floor ${limitless_floor:,.0f}) "
+            f"after filter."
         )
 
         pipeline_stats: Dict[str, Any] = {
             "polymarket_fetched": poly_fetched_total,
-            "polymarket_after_filter": len(poly_markets),
-            "limitless_fetched": len(limit_markets_raw),
-            "limitless_after_filter": len(limit_markets),
+            "polymarket_fetched_at_floor": len(poly_markets),
+            "limitless_fetched_raw": len(limit_markets_raw),
+            "limitless_kept_at_floor": len(limit_markets),
             "limitless_discarded": len(limit_markets_raw) - len(limit_markets),
             "already_accepted": len(self._accepted),
             "already_rejected": len(self._rejected),

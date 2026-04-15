@@ -413,6 +413,131 @@ async def test_roi_and_capital_efficiency():
         config.sizing_strategy = old_strategy
 
 
+@pytest.mark.asyncio
+async def test_trusted_multi_market_partition_accepted():
+    """
+    Verifies that a multi-market partition with a trusted `negrisk_*` constraint_id
+    is accepted by the Dutching detector and produces a multi-leg opportunity.
+    Regression guard for the cross-market arb skip in fw_solver.py.
+    """
+    old_strategy = config.sizing_strategy
+    config.sizing_strategy = "dutching"
+
+    try:
+        limits = PositionLimits(
+            max_single_trade_pct=0.1,
+            max_total_exposure_pct=0.5,
+            max_orderbook_depth_pct=1.0,
+            kelly_fraction=1.0,
+        )
+        sizer = PositionSizer(capital=1000.0, limits=limits)
+
+        # Tokens whose extract_market_id() returns three distinct market ids.
+        A_ID = "mktA_yes"
+        B_ID = "mktB_yes"
+        C_ID = "mktC_yes"
+
+        constraint = LogicalConstraint(
+            constraint_id="negrisk_evt123",
+            description="NegRisk event partition across three binary markets",
+            coefficients={A_ID: 1.0, B_ID: 1.0, C_ID: 1.0},
+            rhs=1.0,
+            source_markets=["mktA", "mktB", "mktC"],
+        )
+
+        original_analysis = AnalysisResult(
+            cluster_id="negrisk_evt123",
+            dependencies=[],
+            constraints=[constraint],
+        )
+
+        validated = ValidatedResult(
+            original=original_analysis,
+            is_valid=True,
+            validated_constraints=[constraint],
+            market_exchanges={
+                "mktA": "polymarket",
+                "mktB": "polymarket",
+                "mktC": "polymarket",
+            },
+        )
+
+        # Prices sum to 0.90 (11.1% margin).
+        order_books = {
+            A_ID: OrderBook(outcome_id=A_ID, asks=[OrderLevel(price=Decimal("0.30"), size=Decimal("1000"))]),
+            B_ID: OrderBook(outcome_id=B_ID, asks=[OrderLevel(price=Decimal("0.30"), size=Decimal("1000"))]),
+            C_ID: OrderBook(outcome_id=C_ID, asks=[OrderLevel(price=Decimal("0.30"), size=Decimal("1000"))]),
+        }
+
+        detector = ArbitrageDetector(position_sizer=sizer)
+        opportunity = await detector.detect(validated, order_books)
+
+        assert opportunity is not None, "Trusted negrisk_* partition must be accepted"
+        assert len(opportunity.trades) == 3
+        trade_markets = {t.market_id for t in opportunity.trades}
+        assert trade_markets == {"mktA", "mktB", "mktC"}
+        assert opportunity.expected_profit > 0
+
+    finally:
+        config.sizing_strategy = old_strategy
+
+
+@pytest.mark.asyncio
+async def test_untrusted_multi_market_partition_rejected():
+    """
+    Verifies that a multi-market partition with an untrusted constraint_id prefix
+    is still rejected by the P3.2 provenance check (original safety invariant).
+    """
+    old_strategy = config.sizing_strategy
+    config.sizing_strategy = "dutching"
+
+    try:
+        limits = PositionLimits(
+            max_single_trade_pct=0.1,
+            max_total_exposure_pct=0.5,
+            max_orderbook_depth_pct=1.0,
+            kelly_fraction=1.0,
+        )
+        sizer = PositionSizer(capital=1000.0, limits=limits)
+
+        A_ID = "mktA_yes"
+        B_ID = "mktB_yes"
+
+        constraint = LogicalConstraint(
+            constraint_id="adhoc_xyz",
+            description="Unverified multi-market partition",
+            coefficients={A_ID: 1.0, B_ID: 1.0},
+            rhs=1.0,
+            source_markets=["mktA", "mktB"],
+        )
+
+        original_analysis = AnalysisResult(
+            cluster_id="adhoc",
+            dependencies=[],
+            constraints=[constraint],
+        )
+
+        validated = ValidatedResult(
+            original=original_analysis,
+            is_valid=True,
+            validated_constraints=[constraint],
+            market_exchanges={"mktA": "polymarket", "mktB": "polymarket"},
+        )
+
+        order_books = {
+            A_ID: OrderBook(outcome_id=A_ID, asks=[OrderLevel(price=Decimal("0.40"), size=Decimal("1000"))]),
+            B_ID: OrderBook(outcome_id=B_ID, asks=[OrderLevel(price=Decimal("0.50"), size=Decimal("1000"))]),
+        }
+
+        detector = ArbitrageDetector(position_sizer=sizer)
+        opportunity = await detector.detect(validated, order_books)
+
+        assert opportunity is None, "Untrusted multi-market partition must be skipped"
+
+    finally:
+        config.sizing_strategy = old_strategy
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(test_dutching_integration_smoke())
@@ -420,6 +545,8 @@ if __name__ == "__main__":
         asyncio.run(test_dynamic_confidence_scoring())
         asyncio.run(test_partition_size_limit())
         asyncio.run(test_roi_and_capital_efficiency())
+        asyncio.run(test_trusted_multi_market_partition_accepted())
+        asyncio.run(test_untrusted_multi_market_partition_rejected())
     except Exception as e:
         import traceback
         traceback.print_exc()

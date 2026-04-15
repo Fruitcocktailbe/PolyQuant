@@ -397,11 +397,14 @@ class PolymarketClient:
                     # Parse markets within the event
                     raw_markets = event_data.get("markets", [])
                     parsed_markets = [self._parse_market(m) for m in raw_markets]
-                    
+                    event_slug = event_data.get("slug", "") or ""
+                    for pm in parsed_markets:
+                        pm.event_slug = event_slug
+
                     all_events.append({
                         "event_id": event_data.get("id", ""),
                         "title": event_data.get("title", ""),
-                        "slug": event_data.get("slug", ""),
+                        "slug": event_slug,
                         "liquidity": event_liq,
                         "volume": float(event_data.get("volume", 0) or 0),
                         "markets": parsed_markets,
@@ -896,6 +899,7 @@ class PolymarketClient:
             liquidity=float(data.get("liquidity", 0)),
             end_date=end_date,
             resolved=data.get("closed", False),
+            slug=data.get("slug", "") or "",
             
             # Phase 5: Enhanced Metadata Extraction
             negrisk=data.get("neg_risk", False) or data.get("negrisk", False),

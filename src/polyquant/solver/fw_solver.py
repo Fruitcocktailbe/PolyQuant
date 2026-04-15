@@ -54,6 +54,9 @@ from polyquant.risk.position_sizing import PositionSizer
 
 logger = get_logger(__name__)
 
+TRUSTED_MULTI_MARKET_PREFIXES = ("negrisk_", "cross_")
+
+
 class FWSolver:
     """
     Implements the Barrier Frank-Wolfe algorithm for LMSR market making.
@@ -895,20 +898,27 @@ class ArbitrageDetector:
                 logger.debug("Skipping: RHS is not 1.0", rhs=constraint.rhs)
                 continue
 
-            # P3.2 — partition integrity: every token must belong to the same market.
-            # Without this check, the Logic Architect could emit a "partition" made of
-            # outcomes from several independent markets whose prices happen to sum to
-            # < 1.0. Sizing it as risk-free would produce uncorrelated directional bets
-            # that could all lose simultaneously.
+            # P3.2 — partition integrity. Single-market partitions are always safe.
+            # Multi-market partitions are only accepted when they come from a trusted
+            # mechanical source (negrisk_* or cross_*), which the Map Maker builds and
+            # validates explicitly. Any other multi-market constraint is treated as
+            # unverified provenance and skipped.
             token_market_ids = {extract_market_id(tid) for tid in constraint.coefficients.keys()}
-            if len(token_market_ids) != 1:
-                logger.warning(
-                    "Skipping multi-market 'partition' — outcomes span multiple markets, not a real risk-free arb",
+            if len(token_market_ids) > 1:
+                if not constraint.constraint_id.startswith(TRUSTED_MULTI_MARKET_PREFIXES):
+                    logger.warning(
+                        "Skipping multi-market 'partition' — untrusted provenance",
+                        constraint_id=constraint.constraint_id,
+                        market_ids=list(token_market_ids),
+                        token_count=len(constraint.coefficients),
+                    )
+                    continue
+                logger.info(
+                    "Accepting trusted multi-market partition",
                     constraint_id=constraint.constraint_id,
-                    market_ids=list(token_market_ids),
-                    token_count=len(constraint.coefficients),
+                    market_count=len(token_market_ids),
+                    source=constraint.constraint_id.split("_", 1)[0],
                 )
-                continue
 
             # We found a potential Dutching ring!
             outcome_ids = list(constraint.coefficients.keys())

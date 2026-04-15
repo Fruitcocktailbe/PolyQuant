@@ -205,12 +205,12 @@ def layer1_template_cluster(
     }
     matched -= singletons
 
-    logger.debug(
-        "Layer 1 template clustering complete",
+    logger.info(
+        "Partition Layer 1 (template)",
         input_markets=len(markets),
         clusters=len(clusters),
         matched_markets=len(matched),
-        unmatched_samples=unmatched_samples,
+        unmatched_sample=unmatched_samples,
     )
     return clusters, matched
 
@@ -304,8 +304,8 @@ def layer2_embedding_cluster(markets: list[Market]) -> list[list[Market]]:
         pass
     gc.collect()
 
-    logger.debug(
-        "Layer 2 embedding clustering complete",
+    logger.info(
+        "Partition Layer 2 (embeddings)",
         input_markets=len(markets),
         clusters=len(all_clusters),
         threshold=threshold,
@@ -326,6 +326,12 @@ def layer3_triage(
     no price checks — that's the Navigator's job, not the Map Maker's.
     """
     survivors: list[list[Market]] = []
+    rejection_reasons: dict[str, int] = {
+        "size_bounds": 0,
+        "duplicate_token": 0,
+        "post_filter_below_min": 0,
+        "fresh_manifest": 0,
+    }
     now = datetime.utcnow()
     ttl_hours = config.partition_manifest_ttl_hours
     min_size = config.partition_min_cluster_size
@@ -334,6 +340,7 @@ def layer3_triage(
     for candidate in candidates:
         # Size bounds
         if not (min_size <= len(candidate) <= max_size):
+            rejection_reasons["size_bounds"] += 1
             continue
 
         # Freshness + polarity checks
@@ -358,9 +365,10 @@ def layer3_triage(
             usable.append(m)
 
         if duplicate_token:
-            logger.debug("Layer 3: dropped candidate with duplicate YES token_id")
+            rejection_reasons["duplicate_token"] += 1
             continue
         if len(usable) < min_size:
+            rejection_reasons["post_filter_below_min"] += 1
             continue
 
         # Dedup against recently-persisted constraint manifests (if store is wired)
@@ -370,18 +378,16 @@ def layer3_triage(
             ).hexdigest()[:16]
             candidate_constraint_id = f"cross_{token_hash}"
             if store.is_constraint_fresh(candidate_constraint_id, ttl_hours):
-                logger.debug(
-                    "Layer 3: skipped candidate, fresh manifest exists",
-                    constraint_id=candidate_constraint_id,
-                )
+                rejection_reasons["fresh_manifest"] += 1
                 continue
 
         survivors.append(usable)
 
-    logger.debug(
-        "Layer 3 triage complete",
+    logger.info(
+        "Partition Layer 3 (triage)",
         input_candidates=len(candidates),
         survivors=len(survivors),
+        rejection_reasons=rejection_reasons,
     )
     return survivors
 
@@ -613,11 +619,20 @@ async def detect_cross_market_partitions(
     from polyquant.agents.discovery import MarketCluster
 
     if not markets:
+        logger.info(
+            "Cross-market detection skipped: no residual polar markets "
+            "(all consumed by NegRisk/native_partition)"
+        )
         return []
 
     # Binary path only — cross-market partitions assume per-market YES/NO legs.
     polar_markets = [m for m in markets if has_binary_polarity(m)]
     if len(polar_markets) < config.partition_min_cluster_size:
+        logger.info(
+            "Cross-market detection skipped: fewer than min_cluster_size polar markets",
+            polar=len(polar_markets),
+            min_size=config.partition_min_cluster_size,
+        )
         return []
 
     # Layer 1
@@ -631,24 +646,23 @@ async def detect_cross_market_partitions(
     candidates = l1_clusters + l2_clusters
     survivors = layer3_triage(candidates, store)
 
-    logger.info(
-        "Partition detector candidates",
-        layer1=len(l1_clusters),
-        layer2=len(l2_clusters),
-        post_triage=len(survivors),
-    )
-
     # Layer 4 verify each survivor
     result_clusters: list[MarketCluster] = []
     conf_threshold = config.partition_confidence_threshold
+    layer4_sent = 0
+    layer4_accepted = 0
+    layer4_rejected = 0
 
     for idx, candidate in enumerate(survivors):
+        layer4_sent += 1
         verification = await layer4_verify(candidate)
         if verification is None:
+            layer4_rejected += 1
             logger.debug("Layer 4: no verification", idx=idx, size=len(candidate))
             continue
 
         if not verification.is_partition or not verification.is_mutually_exclusive:
+            layer4_rejected += 1
             logger.info(
                 "Layer 4: rejected — not a mutually exclusive partition",
                 event=verification.underlying_event[:80],
@@ -657,6 +671,7 @@ async def detect_cross_market_partitions(
             continue
 
         if verification.confidence < conf_threshold:
+            layer4_rejected += 1
             logger.info(
                 "Layer 4: rejected — confidence below threshold",
                 confidence=verification.confidence,
@@ -666,6 +681,7 @@ async def detect_cross_market_partitions(
             continue
 
         if not verification.is_exhaustive:
+            layer4_rejected += 1
             logger.info(
                 "Layer 4: dropped non-exhaustive partition (v1 scope)",
                 event=verification.underlying_event[:80],
@@ -676,12 +692,15 @@ async def detect_cross_market_partitions(
         verified_ids = set(verification.verified_market_ids)
         verified_markets = [m for m in candidate if m.market_id in verified_ids]
         if len(verified_markets) < config.partition_min_cluster_size:
+            layer4_rejected += 1
             logger.info(
                 "Layer 4: rejected — verified set below min size",
                 verified=len(verified_markets),
                 min_size=config.partition_min_cluster_size,
             )
             continue
+
+        layer4_accepted += 1
 
         # Cluster ID matches the mechanical constraint_id prefix used later by
         # build_partition_constraint, so Layer 3 dedup lines up on re-runs.
@@ -709,6 +728,12 @@ async def detect_cross_market_partitions(
         )
         result_clusters.append(cluster)
 
+    logger.info(
+        "Partition Layer 4 (LLM verify)",
+        candidates_sent=layer4_sent,
+        accepted=layer4_accepted,
+        rejected=layer4_rejected,
+    )
     logger.info(
         "Cross-market partition detection complete",
         input_markets=len(markets),

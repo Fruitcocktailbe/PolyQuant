@@ -403,6 +403,20 @@ class PolyQuantConfig(BaseSettings):
         description="Enable heavy AI-based semantic matching for cross-exchange arbitrage. Disable on low-RAM systems."
     )
 
+    min_liquidity_matcher_polymarket: float = Field(
+        default=2500.0,
+        ge=0.0,
+        description="ExchangeMatcher: minimum Polymarket market liquidity to consider for cross-exchange matching."
+    )
+
+    min_liquidity_matcher_limitless: float = Field(
+        default=500.0,
+        ge=0.0,
+        description="ExchangeMatcher: minimum Limitless market liquidity to consider for cross-exchange matching. "
+                    "Lower than Polymarket because the Limitless universe is ~20x smaller; a $2500 floor "
+                    "left only 129/976 markets visible to the matcher."
+    )
+
     # =========================================================================
     # LLM Configuration
     # =========================================================================

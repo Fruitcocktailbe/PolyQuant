@@ -34,7 +34,9 @@ from polyquant.data.constraint_store import (
     ConstraintManifest,
     StoredConstraint,
     StoredDependency,
+    TokenLabel,
 )
+from polyquant.data.market_models import Market
 from polyquant.data.limitless_client import limitless_yes_token, limitless_no_token
 from polyquant.agents.exchange_matcher import ExchangeMatcher
 from polyquant.utils import config, get_logger
@@ -78,6 +80,12 @@ class MapMaker:
         self._polymarket: PolymarketClient | None = None
         self._store: ConstraintStore | None = None
         self._exchange_matcher: ExchangeMatcher | None = None
+
+        # Per-run counters for Limitless equivalence injection diagnostics.
+        # Reset at the start of each build_map() call so the run report
+        # reflects this run only.
+        self._limitless_skip_native_partition: int = 0
+        self._limitless_skip_polarity_mismatch: int = 0
 
         logger.info("MapMaker initialized")
 
@@ -142,6 +150,10 @@ class MapMaker:
             Summary of the map building process.
         """
         start_time = datetime.now(timezone.utc)
+
+        # Reset per-run Limitless equivalence counters
+        self._limitless_skip_native_partition = 0
+        self._limitless_skip_polarity_mismatch = 0
 
         # Get and increment version for this build
         current_version = await cache.get_manifest_version()
@@ -324,6 +336,8 @@ class MapMaker:
                     "total_dependencies": total_dependencies,
                     "cache_hits": cache_hits,
                     "cache_hit_rate": f"{(cache_hits / total_clusters * 100):.1f}%" if total_clusters > 0 else "0%",
+                    "limitless_skip_native_partition": self._limitless_skip_native_partition,
+                    "limitless_skip_polarity_mismatch": self._limitless_skip_polarity_mismatch,
                 }
 
             async def run_cross_exchange_pipeline() -> dict[str, Any]:
@@ -452,10 +466,11 @@ class MapMaker:
             lines.append("-" * 70)
             lines.append("  PHASE 2: CROSS-EXCHANGE MATCHING (Polymarket ↔ Limitless)")
             lines.append("-" * 70)
-            lines.append(f"  Polymarket markets fetched  : {match.get('polymarket_fetched', 'N/A')}")
-            lines.append(f"  Polymarket after $2500 filt : {match.get('polymarket_after_filter', 'N/A')}")
-            lines.append(f"  Limitless markets fetched   : {match.get('limitless_fetched', 'N/A')}")
-            lines.append(f"  Limitless after $2500 filt  : {match.get('limitless_after_filter', 'N/A')}")
+            poly_floor = config.min_liquidity_matcher_polymarket
+            limitless_floor = config.min_liquidity_matcher_limitless
+            lines.append(f"  Polymarket fetched (≥${poly_floor:,.0f}): {match.get('polymarket_fetched_at_floor', match.get('polymarket_fetched', 'N/A'))}")
+            lines.append(f"  Limitless raw fetched      : {match.get('limitless_fetched_raw', match.get('limitless_fetched', 'N/A'))}")
+            lines.append(f"  Limitless kept (≥${limitless_floor:,.0f}) : {match.get('limitless_kept_at_floor', match.get('limitless_after_filter', 'N/A'))}")
             lines.append(f"  Limitless discarded (low $) : {match.get('limitless_discarded', 'N/A')}")
             lines.append(f"  Already accepted (cache)    : {match.get('already_accepted', 0)}")
             lines.append(f"  Already rejected (cache)    : {match.get('already_rejected', 0)}")
@@ -495,6 +510,8 @@ class MapMaker:
         lines.append(f"  Total dependencies     : {analysis.get('total_dependencies', 0)}")
         lines.append(f"  Cache hits             : {analysis.get('cache_hits', 0)}")
         lines.append(f"  Cache hit rate         : {analysis.get('cache_hit_rate', 'N/A')}")
+        lines.append(f"  Limitless skip (native)   : {analysis.get('limitless_skip_native_partition', 0)} (expected)")
+        lines.append(f"  Limitless skip (polarity) : {analysis.get('limitless_skip_polarity_mismatch', 0)} (diagnostic)")
         lines.append("")
         
         # Error
@@ -596,9 +613,21 @@ class MapMaker:
         ]
         stored_dependencies: list[StoredDependency] = []
 
-        market_ids, market_exchanges, market_titles = self._build_market_metadata(cluster)
+        (
+            market_ids,
+            market_exchanges,
+            market_titles,
+            market_urls,
+            token_labels,
+        ) = self._build_market_metadata(cluster)
         self._inject_limitless_equivalencies(
-            cluster, stored_constraints, market_ids, market_exchanges, market_titles
+            cluster,
+            stored_constraints,
+            market_ids,
+            market_exchanges,
+            market_titles,
+            market_urls,
+            token_labels,
         )
         self._validate_token_id_shapes(stored_constraints)
 
@@ -608,6 +637,8 @@ class MapMaker:
             market_ids=market_ids,
             market_exchanges=market_exchanges,
             market_titles=market_titles,
+            market_urls=market_urls,
+            token_labels=token_labels,
             constraints=stored_constraints,
             dependencies=stored_dependencies,
         )
@@ -784,9 +815,21 @@ class MapMaker:
 
         # Cross-exchange injection runs on BOTH the cache-hit and fresh paths
         # so newly-discovered Limitless matches always land on the manifest.
-        market_ids, market_exchanges, market_titles = self._build_market_metadata(cluster)
+        (
+            market_ids,
+            market_exchanges,
+            market_titles,
+            market_urls,
+            token_labels,
+        ) = self._build_market_metadata(cluster)
         self._inject_limitless_equivalencies(
-            cluster, stored_constraints, market_ids, market_exchanges, market_titles
+            cluster,
+            stored_constraints,
+            market_ids,
+            market_exchanges,
+            market_titles,
+            market_urls,
+            token_labels,
         )
         self._validate_token_id_shapes(stored_constraints)
 
@@ -796,6 +839,8 @@ class MapMaker:
             market_ids=market_ids,
             market_exchanges=market_exchanges,
             market_titles=market_titles,
+            market_urls=market_urls,
+            token_labels=token_labels,
             constraints=stored_constraints,
             dependencies=stored_dependencies,
         )
@@ -811,13 +856,48 @@ class MapMaker:
         return manifest, from_cache
 
     @staticmethod
+    def _polymarket_url(market: Market) -> str:
+        """Best-effort deep link to the Polymarket page for a market.
+
+        Prefers the event slug (ideal for NegRisk clusters where the whole
+        event renders on one page), then the market slug, then a search URL
+        as a never-dead fallback."""
+        from urllib.parse import quote
+        if market.event_slug:
+            return f"https://polymarket.com/event/{market.event_slug}"
+        if market.slug:
+            return f"https://polymarket.com/market/{market.slug}"
+        return f"https://polymarket.com/markets?_s={quote(market.question or '')}"
+
+    @staticmethod
     def _build_market_metadata(
         cluster: MarketCluster,
-    ) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    ) -> tuple[
+        list[str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, TokenLabel],
+    ]:
         market_ids = [m.market_id for m in cluster.markets]
         market_exchanges = {m.market_id: "polymarket" for m in cluster.markets}
         market_titles = {m.market_id: m.question for m in cluster.markets}
-        return market_ids, market_exchanges, market_titles
+        market_urls: dict[str, str] = {
+            m.market_id: MapMaker._polymarket_url(m) for m in cluster.markets
+        }
+        token_labels: dict[str, TokenLabel] = {}
+        for m in cluster.markets:
+            for o in m.outcomes:
+                tid = o.token_id or o.outcome_id
+                if not tid:
+                    continue
+                token_labels[tid] = TokenLabel(
+                    market_id=m.market_id,
+                    market_title=m.question,
+                    outcome_name=o.name,
+                    exchange="polymarket",
+                )
+        return market_ids, market_exchanges, market_titles, market_urls, token_labels
 
     def _inject_limitless_equivalencies(
         self,
@@ -826,6 +906,8 @@ class MapMaker:
         market_ids: list[str],
         market_exchanges: dict[str, str],
         market_titles: dict[str, str],
+        market_urls: dict[str, str],
+        token_labels: dict[str, TokenLabel],
     ) -> None:
         """Add Limitless YES/NO token coefficients alongside their Polymarket
         counterparts so the solver treats matched pairs as the same security.
@@ -834,6 +916,17 @@ class MapMaker:
         injection is logged so an operator can audit which Polymarket↔Limitless
         pairs the solver was treating as equivalent on a given run."""
         if not self._exchange_matcher:
+            return
+
+        # Native-partition clusters never have YES/NO outcomes by definition
+        # (their outcomes are candidate names, team names, etc.). Cross-exchange
+        # matching doesn't apply — short-circuit quietly.
+        if cluster.constraint_source == "native_partition":
+            self._limitless_skip_native_partition += 1
+            logger.debug(
+                "Limitless equivalence N/A for native_partition cluster",
+                cluster_id=cluster.cluster_id,
+            )
             return
 
         mapped = self._exchange_matcher.mapped_pairs
@@ -846,14 +939,18 @@ class MapMaker:
                 market_ids.append(l_id)
             market_exchanges[l_id] = "limitless"
             market_titles[l_id] = f"{m.question} (Limitless)"
+            market_urls[l_id] = f"https://limitless.exchange/markets/{l_id}"
 
             pm_yes_out = get_yes_outcome(m)
             pm_no_out = get_no_outcome(m)
             if pm_yes_out is None or pm_no_out is None:
-                logger.warning(
-                    "Skipping Limitless equivalence: polarity unresolved",
+                self._limitless_skip_polarity_mismatch += 1
+                logger.info(
+                    "Skipping Limitless equivalence: outcomes don't match yes/no",
+                    cluster_source=cluster.constraint_source,
+                    cluster_id=cluster.cluster_id,
                     market_id=m.market_id,
-                    question=m.question,
+                    outcome_names=[o.name for o in m.outcomes],
                 )
                 continue
             pm_yes = pm_yes_out.token_id or pm_yes_out.outcome_id
@@ -861,6 +958,19 @@ class MapMaker:
 
             l_yes = limitless_yes_token(l_id)
             l_no = limitless_no_token(l_id)
+
+            token_labels[l_yes] = TokenLabel(
+                market_id=l_id,
+                market_title=f"{m.question} (Limitless)",
+                outcome_name="Yes",
+                exchange="limitless",
+            )
+            token_labels[l_no] = TokenLabel(
+                market_id=l_id,
+                market_title=f"{m.question} (Limitless)",
+                outcome_name="No",
+                exchange="limitless",
+            )
 
             for c in stored_constraints:
                 if pm_yes in c.coefficients:

@@ -37,7 +37,6 @@ import asyncio
 import hashlib
 import json
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, TYPE_CHECKING
 
 from polyquant.utils.llm_client import call_llm_json
@@ -366,6 +365,8 @@ The YES Price is the current market probability (0.00 to 1.00).
         clusters: list[MarketCluster] = []
         events_for_llm: list[dict] = []
         auto_clustered_market_ids: set[str] = set()
+        skipped_by_memory = 0
+        skipped_by_cache = 0
 
         for event in events:
             event_id = event["event_id"]
@@ -375,11 +376,13 @@ The YES Price is the current market probability (0.00 to 1.00).
 
             # Skip already-processed events
             if skip_processed and event_id in self._processed_markets:
+                skipped_by_memory += 1
                 continue
 
             # Skip if Redis says processed
             if skip_processed and await cache.is_market_processed(f"event_{event_id}"):
                 self._processed_markets.add(event_id)
+                skipped_by_cache += 1
                 continue
 
             # Filter zombie markets (extreme prices)
@@ -413,13 +416,13 @@ The YES Price is the current market probability (0.00 to 1.00).
             # ENHANCED (Week 5): Explicit deviation detection for arbitrage opportunities
             # ENHANCED (Week 6): Filter zero-volume outcomes to prevent phantom signals
             if neg_risk_id and len(valid_markets) > 1:
-                # Filter out outcomes with negligible volume before calculating price sum.
-                # Dead/zero-volume outcomes often have phantom mid-prices that inflate
-                # the sum far beyond 1.0 (e.g., 14.43 or 4.50), producing false positives.
+                # Filter out dead outcomes before emitting the partition constraint.
+                # Low-volume outcomes often have phantom quotes that would pollute
+                # the coefficient set; require each sub-market to have real volume
+                # AND a resolvable YES leg (token the solver can reference).
+                # NOTE: this is structural cleanup, not price-based arbitrage
+                # detection. The Navigator handles all price/arb logic at trade time.
                 MIN_OUTCOME_VOLUME = 100  # $100 minimum volume to be considered "real"
-                # Also require each market to expose a nameable YES outcome —
-                # the price sum compares YES probabilities, so a market whose
-                # YES side cannot be resolved by name contributes noise.
                 priced_markets = [
                     m for m in valid_markets
                     if (
@@ -443,76 +446,34 @@ The YES Price is the current market probability (0.00 to 1.00).
 
                 if filtered_count > 0:
                     logger.debug(
-                        "NegRisk: filtered low-volume outcomes from price sum",
+                        "NegRisk: filtered low-volume outcomes",
                         event_title=event_title,
                         kept=len(priced_markets),
                         filtered=filtered_count,
                         threshold=MIN_OUTCOME_VOLUME,
                     )
 
-                # Calculate actual price sum using only outcomes with real volume.
-                # Resolve YES by name, not by position — outcomes[0] is not
-                # guaranteed to be the YES side for any given market.
-                total_price = sum(
-                    (get_yes_outcome(m).price for m in priced_markets),
-                    start=Decimal("0"),
-                )
-
-                # Detect deviation from theoretical sum of 1.0 (ensure types match)
-                deviation = abs(float(total_price) - 1.0)
-                deviation_pct = deviation * 100
-
-                # Classify market state based on deviation
-                if float(total_price) < 0.98:
-                    market_state = "UNDERPRICED"
-                    arbitrage_type = "Buy Arbitrage (prices sum < 1.0)"
-                elif float(total_price) > 1.02:
-                    market_state = "OVERPRICED"
-                    arbitrage_type = "Sell Arbitrage (prices sum > 1.0)"
-                else:
-                    market_state = "FAIR"
-                    arbitrage_type = "No deviation"
-
-                # Create dependency description with deviation info
-                dependency_desc = (
-                    f"[PARTITION] NegRisk group must sum to 1.0. "
-                    f"Actual: {total_price:.4f} ({market_state}). "
-                    f"Deviation: {deviation_pct:.2f}%. "
-                    f"Opportunity: {arbitrage_type}"
-                )
-
                 clusters.append(
                     MarketCluster(
                         cluster_id=f"negrisk_{event_id}",
-                        topic=f"[AUTO] {event_title} (NegRisk, Sum={total_price:.4f}, {market_state})",
-                        markets=valid_markets,
-                        potential_dependencies=[dependency_desc],
+                        topic=f"[NEGRISK] {event_title} ({len(priced_markets)} outcomes)",
+                        markets=priced_markets,
+                        potential_dependencies=[
+                            "[PARTITION] NegRisk event: outcomes are mutually "
+                            "exclusive and exhaustive; YES prices must sum to 1.0."
+                        ],
                         constraint_source="negrisk",
                         is_exhaustive=True,
                     )
                 )
-                for _m in valid_markets:
+                for _m in priced_markets:
                     auto_clustered_market_ids.add(_m.market_id)
 
-                # Log arbitrage signals for monitoring
-                if deviation > 0.02:  # >2% deviation
-                    logger.warning(
-                        "ARBITRAGE SIGNAL: Price deviation detected in NegRisk event",
-                        event_title=event_title,
-                        markets=len(valid_markets),
-                        price_sum=f"{total_price:.4f}",
-                        deviation_pct=f"{deviation_pct:.2f}%",
-                        state=market_state,
-                        opportunity=arbitrage_type,
-                    )
-                else:
-                    logger.info(
-                        "Auto-clustered NegRisk event (fair price)",
-                        event_title=event_title,
-                        markets=len(valid_markets),
-                        price_sum=f"{total_price:.4f}",
-                        state=market_state,
-                    )
+                logger.info(
+                    "Auto-clustered NegRisk event",
+                    event_title=event_title,
+                    outcomes=len(priced_markets),
+                )
             elif len(valid_markets) > 1:
                 # Multi-market event → needs LLM to determine constraint types
                 events_for_llm.append({
@@ -534,6 +495,32 @@ The YES Price is the current market probability (0.00 to 1.00).
                 })
         
         auto_cluster_count = len(clusters)
+        events_processed = len(events) - skipped_by_memory - skipped_by_cache
+        logger.info(
+            "Phase 2 cache-skip summary",
+            events_fetched=len(events),
+            skipped_by_memory=skipped_by_memory,
+            skipped_by_cache=skipped_by_cache,
+            events_processed=events_processed,
+            hint=(
+                "Use --force to bypass the 24h event-processed cache"
+                if skipped_by_cache > 0
+                else None
+            ),
+        )
+
+        # Loud alert: if we silently dropped most of the event universe to the
+        # cache, surface it so the user knows why a run looks sparse.
+        if len(events) > 0 and skipped_by_cache / len(events) > 0.5:
+            logger.warning(
+                "More than half of fetched events were silently skipped by the "
+                "Redis event-processed cache (24h TTL). Re-run with --force to "
+                "bypass the cache and re-process events.",
+                skipped_by_cache=skipped_by_cache,
+                events_fetched=len(events),
+                skip_ratio=f"{skipped_by_cache / len(events):.1%}",
+            )
+
         logger.info(
             "Phase 2 complete: pre-filtering done",
             auto_clusters=auto_cluster_count,

@@ -42,9 +42,11 @@ logger = get_logger(__name__)
 # Bumped from "1.0" → "1.1" when MapMaker stopped filtering constraints by
 # snapshot-time liquidity/spread. Bumped from "1.1" → "1.2" when the dead
 # `correlations` field was dropped from the manifest schema (Navigator runs
-# its own CorrelationEngine live and never read the persisted field). Older
-# manifests are auto-quarantined on load.
-CURRENT_MANIFEST_VERSION = "1.2"
+# its own CorrelationEngine live and never read the persisted field). Bumped
+# from "1.2" → "1.3" when token_labels/market_urls lookups were added for the
+# dashboard's human-readable constraint view. Older manifests are
+# auto-quarantined on load.
+CURRENT_MANIFEST_VERSION = "1.3"
 
 # Manifests older than this are deleted on startup. Stale manifests reference
 # markets that have likely resolved or moved, so keeping them around just
@@ -100,6 +102,19 @@ class StoredDependency(BaseModel):
     confidence: float
 
 
+class TokenLabel(BaseModel):
+    """Human-readable label for a CLOB token id used in a constraint.
+
+    Populated by map_maker from cluster.markets so the dashboard can render
+    each coefficient term as e.g. "Turkey · Will the next diplomatic US-Iran
+    meeting be in Turkey?" instead of a 77-digit numeric id.
+    """
+    market_id: str
+    market_title: str
+    outcome_name: str
+    exchange: str  # "polymarket" | "limitless"
+
+
 class ConstraintManifest(BaseModel):
     """
     The full constraint manifest for a market cluster.
@@ -117,6 +132,8 @@ class ConstraintManifest(BaseModel):
     market_ids: list[str] = Field(default_factory=list)
     market_exchanges: dict[str, str] = Field(default_factory=dict)  # market_id -> exchange
     market_titles: dict[str, str] = Field(default_factory=dict)  # market_id -> human-readable title
+    market_urls: dict[str, str] = Field(default_factory=dict)  # market_id -> exchange deep-link
+    token_labels: dict[str, TokenLabel] = Field(default_factory=dict)  # token_id -> friendly label
     constraints: list[StoredConstraint] = Field(default_factory=list)
     dependencies: list[StoredDependency] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -243,6 +260,20 @@ class ConstraintStore:
         for constraint in manifest.constraints:
             sub_market_ids = constraint.source_markets or manifest.market_ids
             sub_market_ids_set = set(sub_market_ids)
+            # Keep only the token labels referenced by this constraint's
+            # coefficients. Anything else is noise for the split file.
+            sub_token_labels = {
+                tid: label
+                for tid, label in manifest.token_labels.items()
+                if tid in constraint.coefficients
+            }
+            # Fold in market_ids for any label that survives, so the markets
+            # section can render titles/URLs for tokens whose parent market
+            # wasn't listed in `source_markets`.
+            effective_market_ids = set(sub_market_ids_set)
+            for label in sub_token_labels.values():
+                if label.market_id:
+                    effective_market_ids.add(label.market_id)
             sub = ConstraintManifest(
                 cluster_id=constraint.constraint_id,
                 source_cluster_id=manifest.cluster_id,
@@ -251,13 +282,19 @@ class ConstraintStore:
                 market_exchanges={
                     mid: exch
                     for mid, exch in manifest.market_exchanges.items()
-                    if mid in sub_market_ids_set
+                    if mid in effective_market_ids
                 },
                 market_titles={
                     mid: title
                     for mid, title in manifest.market_titles.items()
-                    if mid in sub_market_ids_set
+                    if mid in effective_market_ids
                 },
+                market_urls={
+                    mid: url
+                    for mid, url in manifest.market_urls.items()
+                    if mid in effective_market_ids
+                },
+                token_labels=sub_token_labels,
                 constraints=[constraint],
                 dependencies=[],  # cluster-level metadata lives in the sidecar
                 created_at=manifest.created_at,

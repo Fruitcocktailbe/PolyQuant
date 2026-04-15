@@ -111,7 +111,10 @@ class Market(BaseModel):
     liquidity: float = 0.0
     end_date: datetime | None = None
     resolved: bool = False
-    
+
+    slug: str = ""
+    event_slug: str = ""
+
     # Phase 5: Enhanced Metadata
     negrisk: bool = False
     group_id: str | None = None
