@@ -18,6 +18,7 @@ USAGE:
 
 import html
 import json
+import threading
 import time
 from functools import lru_cache
 from typing import Any
@@ -30,6 +31,106 @@ logger = get_logger(__name__)
 
 # Google AI Studio OpenAI-compatible endpoint
 GOOGLE_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Google AI Studio free-tier request-per-minute limits. Source:
+# https://ai.google.dev/gemini-api/docs/rate-limits
+# We pace calls at (60 / RPM) * safety_margin to stay below the ceiling.
+_MODEL_RPM: dict[str, int] = {
+    "gemini-2.5-pro": 5,
+    "gemini-2.5-flash": 10,
+    "gemini-2.5-flash-lite": 15,
+}
+_DEFAULT_RPM = 5  # Conservative fallback for unknown models
+_RPM_SAFETY_MARGIN = 1.15  # Pad the interval by 15% to account for clock skew / request overhead
+_DEFAULT_RETRY_AFTER_S = 60.0  # If 429 lacks Retry-After, wait one full minute
+_MAX_BLOCK_SKIP_S = 120.0  # Skip a model in the fallback chain if it's blocked this long or more
+
+
+class _RateLimiter:
+    """
+    Thread-safe per-model token bucket.
+
+    Enforces a minimum interval between successive calls to each model based on
+    its free-tier RPM, and records 429 back-off windows so concurrent callers
+    share the same block. `wait_if_needed` sleeps before the call (proactive
+    pacing); `record_429` sets a hard block consumed by subsequent callers.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_call: dict[str, float] = {}
+        self._blocked_until: dict[str, float] = {}
+
+    def _min_interval(self, model: str) -> float:
+        rpm = _MODEL_RPM.get(model, _DEFAULT_RPM)
+        return (60.0 / rpm) * _RPM_SAFETY_MARGIN
+
+    def wait_if_needed(self, model: str) -> None:
+        """Block until the next call to `model` is allowed under RPM + 429 state."""
+        while True:
+            with self._lock:
+                now = time.time()
+                blocked = self._blocked_until.get(model, 0.0)
+                last = self._last_call.get(model, 0.0)
+                next_allowed = max(blocked, last + self._min_interval(model))
+                wait = next_allowed - now
+                if wait <= 0:
+                    # Reserve this slot immediately so concurrent waiters space out.
+                    self._last_call[model] = now
+                    return
+            # Sleep outside the lock so other threads can compute their own waits.
+            logger.debug(f"Rate limiter: waiting {wait:.1f}s for {model}")
+            time.sleep(wait)
+
+    def record_429(self, model: str, retry_after_s: float) -> None:
+        with self._lock:
+            self._blocked_until[model] = max(
+                self._blocked_until.get(model, 0.0),
+                time.time() + retry_after_s,
+            )
+
+    def blocked_for(self, model: str) -> float:
+        """Seconds until `model` becomes available again (0 if free)."""
+        with self._lock:
+            blocked = self._blocked_until.get(model, 0.0)
+            return max(0.0, blocked - time.time())
+
+
+_rate_limiter = _RateLimiter()
+
+
+def _parse_retry_after(exc: Exception) -> float:
+    """
+    Extract a retry-after duration from a Google AI Studio / OpenAI 429 error.
+
+    Checks in order: the `Retry-After` header on the response, Google's
+    `retryDelay` field inside the error body details, and finally a sensible
+    default.
+    """
+    try:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            headers = getattr(response, "headers", None)
+            if headers:
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                if retry_after:
+                    return float(retry_after)
+    except Exception:
+        pass
+
+    try:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            details = body.get("error", {}).get("details", []) or []
+            for detail in details:
+                if isinstance(detail, dict) and "retryDelay" in detail:
+                    # Format is e.g. "30s"
+                    delay_str = str(detail["retryDelay"]).rstrip("s")
+                    return float(delay_str)
+    except Exception:
+        pass
+
+    return _DEFAULT_RETRY_AFTER_S
 
 
 @lru_cache(maxsize=1)
@@ -136,6 +237,9 @@ def _try_once(
         "json_mode_unsupported" — model rejected response_format; caller should retry without it
         "error"        — any other exception
     """
+    # Proactive per-model pacing: sleep until we're inside the RPM budget.
+    _rate_limiter.wait_if_needed(model)
+
     try:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -150,6 +254,13 @@ def _try_once(
     except Exception as e:
         error_str = str(e)
         if "429" in error_str:
+            retry_after = _parse_retry_after(e)
+            _rate_limiter.record_429(model, retry_after)
+            logger.warning(
+                "LLM 429 received — model blocked",
+                model=model,
+                retry_after_s=retry_after,
+            )
             return None, "rate_limit"
         # Some free models reject response_format — detect and signal retry.
         # Match only on the parameter name itself to avoid false positives on
@@ -288,15 +399,32 @@ def call_llm_json(
     messages = [{"role": "user", "content": full_prompt}]
     prompt_chars = len(full_prompt)
 
-    max_retries = 3
-    base_wait = 10.0  # First 429 wait
+    max_retries = 2  # Per-model retries for rate-limit / json-mode quirks
+    last_failure_was_rate_limit = False
 
     for model_idx, candidate_model in enumerate(model_chain):
         is_fallback = model_idx > 0
+
+        # Skip any model that's 429-blocked for longer than we're willing to wait
+        # on a sibling. Sibling models share the same account quota, so there's
+        # rarely any point in cross-falling-back when the block is short.
+        block_s = _rate_limiter.blocked_for(candidate_model)
+        if is_fallback and block_s > _MAX_BLOCK_SKIP_S:
+            print(
+                f"--- ⏭️  LLM SKIP: {candidate_model} | blocked for {block_s:.0f}s ---"
+            )
+            logger.info(
+                "Skipping fallback model — still rate-limited",
+                model=candidate_model,
+                block_s=block_s,
+            )
+            continue
+
         prefix = "🤖 LLM FALLBACK" if is_fallback else "🤖 LLM START"
         print(f"\n--- {prefix}: {candidate_model} | Prompt: {prompt_chars:,} chars ---")
         t0 = time.time()
         use_json_mode = True
+        last_failure_was_rate_limit = False
 
         for attempt in range(max_retries):
             parsed, status = _try_once(
@@ -313,22 +441,23 @@ def call_llm_json(
                 return parsed
 
             if status == "rate_limit":
-                if attempt < max_retries - 1:
-                    wait_time = base_wait * (2 ** attempt)
+                last_failure_was_rate_limit = True
+                block_s = _rate_limiter.blocked_for(candidate_model)
+                # Only retry the same model if the block will clear quickly.
+                # Otherwise drop through: siblings are likely blocked too, but
+                # we still give them one shot further down the chain.
+                if attempt < max_retries - 1 and 0 < block_s <= _MAX_BLOCK_SKIP_S:
                     print(
-                        f"--- ⚠️ LLM RATE LIMITED (429) | Waiting {wait_time}s "
-                        f"before retry ({attempt+1}/{max_retries}) ---\n"
+                        f"--- ⚠️  LLM RATE LIMITED (429) | {candidate_model} | "
+                        f"waiting {block_s:.0f}s (retry {attempt + 1}/{max_retries}) ---\n"
                     )
-                    logger.warning(
-                        f"LLM 429 Rate Limit. Backing off for {wait_time}s",
-                        attempt=attempt + 1,
-                        model=candidate_model,
-                    )
-                    time.sleep(wait_time)
+                    time.sleep(block_s)
                     continue
-                # Exhausted retries for this model — move on to the next one
                 elapsed = time.time() - t0
-                print(f"--- ❌ LLM RATE LIMIT EXHAUSTED [{elapsed:.1f}s] | {candidate_model} ---\n")
+                print(
+                    f"--- ❌ LLM RATE LIMITED [{elapsed:.1f}s] | {candidate_model} | "
+                    f"block={block_s:.0f}s ---\n"
+                )
                 break
 
             if status == "json_mode_unsupported":
@@ -346,5 +475,6 @@ def call_llm_json(
     logger.error(
         "All LLM models exhausted",
         models_tried=model_chain,
+        last_failure_was_rate_limit=last_failure_was_rate_limit,
     )
     return None

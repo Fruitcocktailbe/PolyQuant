@@ -190,6 +190,7 @@ class MapMaker:
                 limit=limit,
                 min_liquidity=min_liquidity,
                 skip_processed=skip_processed,
+                constraint_store=self._store,
             )
             
             # Record in monitor for UI
@@ -556,6 +557,69 @@ class MapMaker:
         so a fresh build never re-hits stale entries from the previous run."""
         return max(60, int(config.map_interval_seconds * 0.9))
 
+    async def _analyze_mechanical_cluster(
+        self,
+        cluster: MarketCluster,
+    ) -> tuple[ConstraintManifest, bool] | None:
+        """
+        Build a ConstraintManifest for a mechanical cluster without any LLM call.
+
+        Handles NegRisk, native_partition, and cross_market_partition clusters.
+        The constraint shape is fully determined by the cluster's market set —
+        no semantic reasoning is needed.
+
+        Cross-exchange equivalencies are still injected on top, so Limitless
+        matches land on these clusters too.
+        """
+        from polyquant.agents.logic_architect import build_partition_constraint
+
+        logic_constraint = build_partition_constraint(cluster)
+        if logic_constraint is None:
+            logger.warning(
+                "Mechanical cluster produced no constraint — skipping",
+                cluster_id=cluster.cluster_id,
+                constraint_source=cluster.constraint_source,
+                market_count=len(cluster.markets),
+            )
+            return None
+
+        stored_constraints: list[StoredConstraint] = [
+            StoredConstraint(
+                constraint_id=logic_constraint.constraint_id,
+                description=logic_constraint.description,
+                coefficients=logic_constraint.coefficients,
+                rhs=logic_constraint.rhs,
+                confidence=logic_constraint.confidence,
+                reasoning=logic_constraint.reasoning,
+                source_markets=logic_constraint.source_markets,
+            )
+        ]
+        stored_dependencies: list[StoredDependency] = []
+
+        market_ids, market_exchanges, market_titles = self._build_market_metadata(cluster)
+        self._inject_limitless_equivalencies(
+            cluster, stored_constraints, market_ids, market_exchanges, market_titles
+        )
+        self._validate_token_id_shapes(stored_constraints)
+
+        manifest = ConstraintManifest(
+            cluster_id=cluster.cluster_id,
+            topic=cluster.topic,
+            market_ids=market_ids,
+            market_exchanges=market_exchanges,
+            market_titles=market_titles,
+            constraints=stored_constraints,
+            dependencies=stored_dependencies,
+        )
+
+        logger.info(
+            "Mechanical cluster analysis complete",
+            cluster_id=cluster.cluster_id,
+            constraint_source=cluster.constraint_source,
+            constraints=len(stored_constraints),
+        )
+        return manifest, False
+
     async def _analyze_cluster(
         self,
         cluster: MarketCluster,
@@ -577,7 +641,19 @@ class MapMaker:
             cluster_id=cluster.cluster_id,
             topic=cluster.topic,
             markets=len(cluster.markets),
+            constraint_source=cluster.constraint_source,
         )
+
+        # Mechanical cluster bypass: NegRisk / native / cross-market partitions
+        # all emit a single LogicalConstraint with known structure. Skip
+        # LogicArchitect and Validator entirely — they'd just re-derive what
+        # we already know, at real Pro-tier quota cost.
+        if cluster.constraint_source in (
+            "negrisk",
+            "native_partition",
+            "cross_market_partition",
+        ):
+            return await self._analyze_mechanical_cluster(cluster)
 
         cluster_hash = self._compute_cluster_hash(cluster)
 

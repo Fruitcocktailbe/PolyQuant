@@ -103,10 +103,16 @@ class StoredDependency(BaseModel):
 class ConstraintManifest(BaseModel):
     """
     The full constraint manifest for a market cluster.
-    
+
     This is what gets persisted to disk and loaded by the Navigator.
+
+    After the per-constraint split (v1.3+): `cluster_id` is used as the file key.
+    When `save_manifest` splits a multi-constraint input, each output file's
+    `cluster_id` field is reset to the constraint's stable `constraint_id`, and
+    `source_cluster_id` retains the original cluster for traceability.
     """
     cluster_id: str
+    source_cluster_id: str = ""  # original cluster before per-constraint split
     topic: str = ""
     market_ids: list[str] = Field(default_factory=list)
     market_exchanges: dict[str, str] = Field(default_factory=dict)  # market_id -> exchange
@@ -177,6 +183,14 @@ class ConstraintStore:
         for path in self.base_path.glob("*.json"):
             if path.name == "_index.json":
                 continue
+            if path.name.startswith("_cluster_"):
+                # Cluster metadata sidecars follow the same TTL but aren't tracked in the index.
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError as e:
+                    logger.warning("Failed to sweep sidecar", file=path.name, error=str(e))
+                continue
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
@@ -199,32 +213,122 @@ class ConstraintStore:
                     logger.warning("Failed to update index after sweep", error=str(e))
         return len(removed_ids)
     
-    async def save_manifest(self, manifest: ConstraintManifest) -> None:
+    async def save_manifest(self, manifest: ConstraintManifest) -> list[str]:
         """
-        Save a constraint manifest to disk.
-        
+        Save a constraint manifest to disk, splitting by constraint.
+
+        Each `StoredConstraint` is written to its own file keyed by the stable
+        `constraint_id` — so logically independent constraints from the same
+        source cluster land in separate files. The `source_cluster_id` field
+        preserves the original grouping for debugging. A sidecar metadata file
+        (`_cluster_{cluster_id}_meta.json`) captures cluster-level context like
+        dependencies and the list of constraint_ids derived from this cluster.
+
         Args:
             manifest: The ConstraintManifest to save.
+
+        Returns:
+            List of file paths written (one per constraint, excluding the sidecar).
         """
-        file_path = self.base_path / f"{manifest.cluster_id}.json"
-        
-        # Serialize to JSON
-        data = manifest.model_dump(mode="json")
-        
-        # Write atomically (write to temp file, then rename)
-        temp_path = file_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, default=str))
-        temp_path.replace(file_path)
-        
-        # Update index
-        await self._update_index(manifest.cluster_id)
-        
+        if not manifest.constraints:
+            logger.debug(
+                "Skipping save_manifest: no constraints to write",
+                cluster_id=manifest.cluster_id,
+            )
+            return []
+
+        written_paths: list[str] = []
+        written_ids: list[str] = []
+
+        for constraint in manifest.constraints:
+            sub_market_ids = constraint.source_markets or manifest.market_ids
+            sub_market_ids_set = set(sub_market_ids)
+            sub = ConstraintManifest(
+                cluster_id=constraint.constraint_id,
+                source_cluster_id=manifest.cluster_id,
+                topic=manifest.topic,
+                market_ids=sub_market_ids,
+                market_exchanges={
+                    mid: exch
+                    for mid, exch in manifest.market_exchanges.items()
+                    if mid in sub_market_ids_set
+                },
+                market_titles={
+                    mid: title
+                    for mid, title in manifest.market_titles.items()
+                    if mid in sub_market_ids_set
+                },
+                constraints=[constraint],
+                dependencies=[],  # cluster-level metadata lives in the sidecar
+                created_at=manifest.created_at,
+                version=manifest.version,
+            )
+
+            file_path = self.base_path / f"{constraint.constraint_id}.json"
+            data = sub.model_dump(mode="json")
+            temp_path = file_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(data, indent=2, default=str))
+            temp_path.replace(file_path)
+            written_paths.append(str(file_path))
+            written_ids.append(constraint.constraint_id)
+            await self._update_index(constraint.constraint_id)
+
+        # Write cluster-level metadata sidecar for traceability.
+        if manifest.dependencies or manifest.topic:
+            await self._save_cluster_metadata(
+                cluster_id=manifest.cluster_id,
+                topic=manifest.topic,
+                dependencies=manifest.dependencies,
+                constraint_ids=written_ids,
+            )
+
         logger.info(
-            "Saved constraint manifest",
-            cluster_id=manifest.cluster_id,
-            constraints=manifest.constraint_count,
+            "Saved constraint manifest (split)",
+            source_cluster_id=manifest.cluster_id,
+            constraints_written=len(written_ids),
             dependencies=manifest.dependency_count,
         )
+        return written_paths
+
+    async def _save_cluster_metadata(
+        self,
+        cluster_id: str,
+        topic: str,
+        dependencies: list[StoredDependency],
+        constraint_ids: list[str],
+    ) -> None:
+        """
+        Write a cluster-level metadata sidecar file.
+
+        Filename is prefixed with `_cluster_` so `load_all_manifests` skips it —
+        sidecars are debugging metadata, not constraint inputs to the solver.
+        """
+        sidecar_path = self.base_path / f"_cluster_{cluster_id}_meta.json"
+        payload = {
+            "cluster_id": cluster_id,
+            "topic": topic,
+            "constraint_ids": constraint_ids,
+            "dependencies": [dep.model_dump(mode="json") for dep in dependencies],
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        temp_path = sidecar_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2, default=str))
+        temp_path.replace(sidecar_path)
+
+    def is_constraint_fresh(self, constraint_id: str, ttl_hours: int) -> bool:
+        """
+        Return True if a constraint manifest file was written within ttl_hours.
+
+        Used by partition_detector.layer3_triage to dedup candidate clusters
+        against recently-persisted constraints.
+        """
+        file_path = self.base_path / f"{constraint_id}.json"
+        try:
+            mtime = file_path.stat().st_mtime
+        except OSError:
+            return False
+        age_s = datetime.utcnow().timestamp() - mtime
+        return age_s < ttl_hours * 3600
     
     async def load_manifest(self, cluster_id: str) -> ConstraintManifest | None:
         """
@@ -272,7 +376,7 @@ class ConstraintStore:
         moved: list[str] = []
 
         for path in self.base_path.glob("*.json"):
-            if path.name == "_index.json":
+            if path.name == "_index.json" or path.name.startswith("_cluster_"):
                 continue
             try:
                 data = json.loads(path.read_text())
@@ -324,10 +428,10 @@ class ConstraintStore:
         # First-pass quarantine: move pre-1.1 manifests aside before loading.
         self.quarantine_legacy_manifests()
 
-        # Get all manifest files (excluding index)
+        # Get all manifest files (excluding index and cluster-metadata sidecars)
         manifest_files = [
             f for f in self.base_path.glob("*.json")
-            if f.name != "_index.json"
+            if f.name != "_index.json" and not f.name.startswith("_cluster_")
         ]
 
         async def load_one(file_path) -> ConstraintManifest | None:
@@ -387,7 +491,7 @@ class ConstraintStore:
         """
         result: dict[str, float] = {}
         for path in self.base_path.glob("*.json"):
-            if path.name == "_index.json":
+            if path.name == "_index.json" or path.name.startswith("_cluster_"):
                 continue
             try:
                 result[path.stem] = path.stat().st_mtime

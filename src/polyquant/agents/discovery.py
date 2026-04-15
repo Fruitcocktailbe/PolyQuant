@@ -38,7 +38,7 @@ import hashlib
 import json
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from polyquant.utils.llm_client import call_llm_json
 from pydantic import BaseModel, Field, model_validator
@@ -48,7 +48,62 @@ from polyquant.utils import config, get_logger
 from polyquant.utils.cache import cache
 from polyquant.utils.market_utils import get_yes_outcome, has_binary_polarity
 
+if TYPE_CHECKING:
+    from polyquant.data.constraint_store import ConstraintStore
+
 logger = get_logger(__name__)
+
+# Shared volume threshold used by NegRisk auto-clustering and native-partition
+# detection. Outcomes below this are phantom/dead and would produce false sums.
+_MIN_OUTCOME_VOLUME = 100
+
+
+def _native_partition_cluster(market: Market) -> "MarketCluster | None":
+    """
+    Build a native-partition cluster for a single multi-outcome market whose
+    outcomes don't follow YES/NO naming (e.g. "Trump wins / Trump loses", or
+    N-way outcomes like "Liverpool / City / Arsenal / ...").
+
+    These are treated as intrinsically exhaustive (the outcomes are the
+    market's whole event space by definition) and are tagged so map_maker's
+    mechanical bypass persists them without an LLM call.
+
+    Returns None if the market has fewer than 2 live outcomes, or if it looks
+    like a degenerate single-outcome event.
+    """
+    if not market.outcomes or len(market.outcomes) < 2:
+        return None
+
+    # Require at least 2 distinct tokens so build_partition_constraint can
+    # emit a valid LogicalConstraint.
+    live_tokens = [
+        (o.token_id or o.outcome_id)
+        for o in market.outcomes
+        if (o.token_id or o.outcome_id)
+    ]
+    if len(set(live_tokens)) < 2:
+        return None
+
+    # Volume floor: intra-market arbitrage is rare, but phantom-priced outcomes
+    # would produce false deviation signals. Skip markets with essentially no
+    # trading activity.
+    if not market.volume or market.volume < _MIN_OUTCOME_VOLUME:
+        return None
+
+    cluster_id = f"native_{market.market_id}"
+    topic = f"[NATIVE] {market.question}"
+    dependency_desc = (
+        "[PARTITION] Native multi-outcome market. Outcomes are mutually "
+        "exclusive and exhaustive; sum of prices must equal 1.0."
+    )
+    return MarketCluster(
+        cluster_id=cluster_id,
+        topic=topic,
+        markets=[market],
+        potential_dependencies=[dependency_desc],
+        constraint_source="native_partition",
+        is_exhaustive=True,
+    )
 
 
 def _hash_cluster_id(market_ids: list[str]) -> str:
@@ -69,12 +124,20 @@ class MarketCluster(BaseModel):
         markets: List of Market objects in this cluster
         potential_dependencies: Initial guesses at dependencies (for Logic Architect)
         created_at: When this cluster was created
+        constraint_source: Where this cluster's constraints come from. Mechanical
+            sources (negrisk, native_partition, cross_market_partition) bypass
+            LogicArchitect + Validator LLM calls in map_maker. "llm_analysis" is
+            the default and uses the full LogicArchitect path.
+        is_exhaustive: Whether the outcome set covers the full event space.
+            Non-exhaustive partitions are dropped in v1 (solver is buy-side-only).
     """
     cluster_id: str = ""
     topic: str
     markets: list[Market] = Field(default_factory=list)
     potential_dependencies: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    constraint_source: str = "llm_analysis"
+    is_exhaustive: bool = True
 
     @model_validator(mode="after")
     def _assign_cluster_id(self) -> "MarketCluster":
@@ -247,6 +310,7 @@ The YES Price is the current market probability (0.00 to 1.00).
         min_liquidity: float | None = None,  # Defaults to config
         skip_processed: bool = True,
         start_offset: int = 0,
+        constraint_store: "ConstraintStore | None" = None,
     ) -> list[MarketCluster]:
         """
         Scan Polymarket for markets and cluster them to find arbitrage.
@@ -301,46 +365,49 @@ The YES Price is the current market probability (0.00 to 1.00).
         )
         clusters: list[MarketCluster] = []
         events_for_llm: list[dict] = []
-        
+        auto_clustered_market_ids: set[str] = set()
+
         for event in events:
             event_id = event["event_id"]
             event_title = event["title"]
             markets: list[Market] = event["markets"]
             neg_risk_id = event.get("neg_risk_market_id")
-            
+
             # Skip already-processed events
             if skip_processed and event_id in self._processed_markets:
                 continue
-            
+
             # Skip if Redis says processed
             if skip_processed and await cache.is_market_processed(f"event_{event_id}"):
                 self._processed_markets.add(event_id)
                 continue
-            
+
             # Filter zombie markets (extreme prices)
             valid_markets = [m for m in markets if not self._is_zombie_market(m)]
-            # Drop markets without resolvable YES/NO polarity. The solver, the
-            # Limitless bridge, and all constraint-building code identify the
-            # YES leg by outcome name; markets whose outcomes can't be mapped
-            # (e.g. "Trump wins" / "Trump loses") cannot be safely traded and
-            # were previously silently misinterpreted as YES = outcomes[0].
-            dropped_ambiguous = 0
+
+            # Split by polarity instead of dropping. Markets with YES/NO
+            # outcomes flow through the standard path; markets without YES/NO
+            # polarity (e.g. "Trump wins / Trump loses" or 3-way sports) go
+            # through _native_partition_cluster, which emits a mechanical
+            # partition constraint without touching LogicArchitect.
             polar_markets: list[Market] = []
+            ambiguous_markets: list[Market] = []
             for m in valid_markets:
                 if has_binary_polarity(m):
                     polar_markets.append(m)
                 else:
-                    dropped_ambiguous += 1
-            if dropped_ambiguous:
-                logger.warning(
-                    "Dropped markets without resolvable YES/NO polarity",
-                    event_title=event_title,
-                    dropped=dropped_ambiguous,
-                    kept=len(polar_markets),
-                )
-            valid_markets = polar_markets
-            if not valid_markets:
+                    ambiguous_markets.append(m)
+
+            # Phase 2b: native partition for ambiguous multi-outcome markets
+            for m in ambiguous_markets:
+                native_cluster = _native_partition_cluster(m)
+                if native_cluster:
+                    clusters.append(native_cluster)
+                    auto_clustered_market_ids.add(m.market_id)
+
+            if not polar_markets:
                 continue
+            valid_markets = polar_markets
             
             # Auto-cluster: NegRisk events with price deviation detection
             # ENHANCED (Week 5): Explicit deviation detection for arbitrage opportunities
@@ -420,8 +487,12 @@ The YES Price is the current market probability (0.00 to 1.00).
                         topic=f"[AUTO] {event_title} (NegRisk, Sum={total_price:.4f}, {market_state})",
                         markets=valid_markets,
                         potential_dependencies=[dependency_desc],
+                        constraint_source="negrisk",
+                        is_exhaustive=True,
                     )
                 )
+                for _m in valid_markets:
+                    auto_clustered_market_ids.add(_m.market_id)
 
                 # Log arbitrage signals for monitoring
                 if deviation > 0.02:  # >2% deviation
@@ -468,14 +539,46 @@ The YES Price is the current market probability (0.00 to 1.00).
             auto_clusters=auto_cluster_count,
             events_for_llm=len(events_for_llm),
         )
-        
-        # ── Phase 3: LLM analysis for within-event + cross-event constraints ──
+
+        # ── Phase 2c: cross-market partition detection on residual polar markets ──
+        # Residual = polar markets from events_for_llm (not already auto-clustered
+        # via NegRisk / native partition paths). Layers 1-4 find groups of separate
+        # binary YES/NO markets that implicitly partition one real-world event.
+        residual_polar: list[Market] = []
+        for ev in events_for_llm:
+            for m in ev["markets"]:
+                if m.market_id not in auto_clustered_market_ids:
+                    residual_polar.append(m)
+
+        cross_clustered_ids: set[str] = set()
+        if residual_polar:
+            from polyquant.agents.partition_detector import detect_cross_market_partitions
+            cross_clusters = await detect_cross_market_partitions(
+                residual_polar, constraint_store
+            )
+            for c in cross_clusters:
+                clusters.append(c)
+                for m in c.markets:
+                    cross_clustered_ids.add(m.market_id)
+            if cross_clusters:
+                logger.info(
+                    "Cross-market partition detection added clusters",
+                    new_clusters=len(cross_clusters),
+                    markets_consumed=len(cross_clustered_ids),
+                )
+
+        # ── Phase 3: LLM analysis for what's left after all mechanical paths ──
         if events_for_llm:
-            # Collect all markets from events needing LLM analysis
+            # Collect markets from events that weren't consumed by Phase 2a/2b/2c
             all_llm_markets: list[Market] = []
-            for event in events_for_llm:
-                all_llm_markets.extend(event["markets"])
-            
+            for ev in events_for_llm:
+                for m in ev["markets"]:
+                    if (
+                        m.market_id not in auto_clustered_market_ids
+                        and m.market_id not in cross_clustered_ids
+                    ):
+                        all_llm_markets.append(m)
+
             if all_llm_markets:
                 logger.info(
                     f"Sending {len(all_llm_markets)} markets from "

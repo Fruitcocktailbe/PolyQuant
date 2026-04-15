@@ -55,6 +55,7 @@ USAGE:
             print(f"Confidence: {dep.confidence}")
 """
 
+import hashlib
 import json
 from decimal import Decimal
 from datetime import datetime
@@ -69,6 +70,99 @@ from polyquant.utils import config, get_logger
 from polyquant.utils.market_utils import get_yes_outcome
 
 logger = get_logger(__name__)
+
+
+def stable_constraint_id(
+    source_cluster_id: str,
+    coefficients: dict[str, float],
+    rhs: float,
+    prefix: str = "c",
+) -> str:
+    """
+    Deterministic SHA-256-derived constraint ID.
+
+    Replaces timestamp-based IDs so identical re-analysis produces the same
+    constraint_id → same manifest file → no stale duplicates on re-run.
+    """
+    payload = json.dumps(
+        {
+            "cluster": source_cluster_id,
+            "coefs": sorted((str(k), float(v)) for k, v in coefficients.items()),
+            "rhs": round(float(rhs), 6),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}_{digest}"
+
+
+def build_partition_constraint(cluster: MarketCluster) -> "LogicalConstraint | None":
+    """
+    Build a partition constraint for a mechanical cluster.
+
+    Handles all three mechanical cluster sources:
+    - "negrisk" / "cross_market_partition": each market contributes its YES token_id
+    - "native_partition": single market contributes each outcome's token_id
+
+    Produces a constraint in the exact shape the FW solver's Dutching detector
+    expects: all coefficients = 1.0, rhs = 1.0. Constraint ID uses a prefix
+    scoped to the cluster source for debuggability.
+
+    Returns None if the cluster has no resolvable tokens (e.g. missing YES
+    outcomes on a cross-market path, or no outcomes on a native path).
+    """
+    source = cluster.constraint_source
+    coefficients: dict[str, float] = {}
+    source_markets: list[str] = []
+
+    if source == "native_partition":
+        if not cluster.markets:
+            return None
+        market = cluster.markets[0]
+        for outcome in market.outcomes:
+            token_id = outcome.token_id or outcome.outcome_id
+            if not token_id:
+                continue
+            coefficients[token_id] = 1.0
+        source_markets = [market.market_id]
+        prefix = f"native_{market.market_id}"
+    else:
+        # negrisk + cross_market_partition: YES leg of each binary market
+        for market in cluster.markets:
+            yes = get_yes_outcome(market)
+            if yes is None:
+                continue
+            token_id = yes.token_id or yes.outcome_id
+            if not token_id:
+                continue
+            coefficients[token_id] = 1.0
+            source_markets.append(market.market_id)
+        if source == "negrisk":
+            # cluster_id is already "negrisk_{event_id}" from discovery
+            prefix = cluster.cluster_id or "negrisk"
+        else:
+            token_hash = hashlib.sha256(
+                ",".join(sorted(coefficients.keys())).encode("utf-8")
+            ).hexdigest()[:16]
+            prefix = f"cross_{token_hash}"
+
+    if len(coefficients) < 2:
+        return None
+
+    constraint_id = prefix  # mechanical prefixes are already unique + stable
+    return LogicalConstraint(
+        constraint_id=constraint_id,
+        description=f"[{source}] Partition: {cluster.topic}",
+        coefficients=coefficients,
+        rhs=1.0,
+        confidence=1.0,
+        source_markets=source_markets,
+        reasoning=(
+            f"Mechanical partition from {source}. Outcomes are mutually "
+            f"exclusive and exhaustive; sum of YES prices must equal 1.0."
+        ),
+        is_exhaustive=cluster.is_exhaustive,
+    )
 
 
 class LogicalConstraint(BaseModel):
@@ -94,6 +188,7 @@ class LogicalConstraint(BaseModel):
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     source_markets: list[str] = Field(default_factory=list)
     reasoning: str = ""
+    is_exhaustive: bool = True
 
 
 class AnalysisResult(BaseModel):
@@ -777,6 +872,12 @@ CRITICAL RULES:
                 # Ideally the prompt produces <= or >=.
                 
                 cons = LogicalConstraint(
+                    constraint_id=stable_constraint_id(
+                        source_cluster_id=cluster.cluster_id,
+                        coefficients=coeffs,
+                        rhs=rhs,
+                        prefix="lla",
+                    ),
                     description=cons_data.get("description", ""),
                     coefficients=coeffs,
                     rhs=rhs,

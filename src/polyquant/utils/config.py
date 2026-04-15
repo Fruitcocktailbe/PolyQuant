@@ -453,6 +453,46 @@ class PolyQuantConfig(BaseSettings):
     )
 
     # =========================================================================
+    # Cross-market partition detection (Map Maker)
+    # =========================================================================
+
+    partition_confidence_threshold: float = Field(
+        default=0.7,
+        ge=0.0, le=1.0,
+        description="Minimum LLM verification confidence to accept a cross-market partition cluster."
+    )
+
+    partition_embedding_threshold: float = Field(
+        default=0.80,
+        ge=0.0, le=1.0,
+        description="Cosine similarity threshold for Layer 2 embedding-based partition candidate clustering."
+    )
+
+    partition_end_date_window_days: int = Field(
+        default=30,
+        ge=1,
+        description="Layer 2 hard prefilter: markets whose end_dates differ by more than this many days never cluster together."
+    )
+
+    partition_min_cluster_size: int = Field(
+        default=2,
+        ge=2,
+        description="Minimum candidate cluster size for cross-market partition detection."
+    )
+
+    partition_max_cluster_size: int = Field(
+        default=10,
+        ge=2,
+        description="Maximum candidate cluster size sent to the LLM verifier (LLM may prune to fewer)."
+    )
+
+    partition_manifest_ttl_hours: int = Field(
+        default=6,
+        ge=1,
+        description="Layer 3 dedup window: skip candidate clusters whose constraint manifest was written within this window."
+    )
+
+    # =========================================================================
     # Solver Fine-tuning
     # =========================================================================
 
