@@ -658,53 +658,19 @@ The YES Price is the current market probability (0.00 to 1.00).
         logger.info(f"Calling LLM for market clustering ({len(markets)} targets)", market_count=len(markets))
 
         try:
-            # Call LLM via OpenRouter with an outer timeout guard.
-            # The OpenAI client has a 45s timeout, but some free models
-            # (e.g., glm-4.5-air:free) ignore it and hang for 10+ minutes.
-            # asyncio.wait_for provides a hard upper bound.
-            # Retry once on timeout/failure — OpenRouter rotates to a different
-            # free model on each call, so the second attempt often succeeds.
-            LLM_CLUSTERING_TIMEOUT = 25  # seconds — just above inner client timeout (20s)
-            MAX_ATTEMPTS = 5  # More rotation chances on openrouter/free auto-router
-            result = None
-
-            for attempt in range(MAX_ATTEMPTS):
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            call_llm_json,
-                            prompt=f"Analyze these {len(markets)} markets for arbitrage opportunities:\n\n{market_descriptions}",
-                            system_prompt=self.CLUSTERING_PROMPT,
-                            temperature=0.2,
-                            model=config.llm_model_discovery,
-                        ),
-                        timeout=LLM_CLUSTERING_TIMEOUT,
-                    )
-                    if result:
-                        break  # Success — exit retry loop
-                    else:
-                        logger.warning(
-                            f"LLM returned empty response (attempt {attempt + 1}/{MAX_ATTEMPTS})",
-                            market_count=len(markets),
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        f"LLM clustering timed out after {LLM_CLUSTERING_TIMEOUT}s "
-                        f"(attempt {attempt + 1}/{MAX_ATTEMPTS})",
-                        market_count=len(markets),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"LLM clustering error (attempt {attempt + 1}/{MAX_ATTEMPTS}): {e}",
-                        market_count=len(markets),
-                    )
-
-                if attempt < MAX_ATTEMPTS - 1:
-                    logger.info("Retrying LLM clustering with fresh model rotation...")
-                    await asyncio.sleep(2)  # Brief pause before retry
+            # call_llm_json owns retries (3x per model across the fallback chain)
+            # and the OpenAI client owns the per-request timeout (45s). The outer
+            # batching layer in cluster_markets() handles batch-level retries.
+            result = await asyncio.to_thread(
+                call_llm_json,
+                prompt=f"Analyze these {len(markets)} markets for arbitrage opportunities:\n\n{market_descriptions}",
+                system_prompt=self.CLUSTERING_PROMPT,
+                temperature=0.2,
+                model=config.llm_model_discovery,
+            )
 
             if not result:
-                raise ValueError("LLM clustering failed after all retry attempts")
+                raise ValueError("LLM clustering returned no result")
 
         except Exception as e:
             logger.warning(f"LLM clustering failed, falling back to manual groups: {e}")

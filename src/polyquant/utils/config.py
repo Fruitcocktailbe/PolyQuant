@@ -446,13 +446,6 @@ class PolyQuantConfig(BaseSettings):
         description="LLM Temperature for generation"
     )
 
-    llm_max_tokens: int = Field(
-        default=4096,
-        ge=256,
-        le=32768,
-        description="Hard cap on LLM output tokens per call. Prevents reasoning models from burning the budget on hidden thinking."
-    )
-
     validator_confidence_threshold: float = Field(
         default=0.8,
         ge=0.0, le=1.0,

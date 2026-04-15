@@ -514,18 +514,14 @@ class ExchangeMatcher:
                 or "Not specified",
             )
             async with sem:
-                try:
-                    res = await asyncio.to_thread(
-                        call_llm_json,
-                        prompt=prompt,
-                        system_prompt="Answer JSON only.",
-                        temperature=0.1,
-                        model=config.llm_model_matcher,
-                    )
-                    await asyncio.sleep(LLM_PACING_SECONDS)
-                except Exception as e:
-                    await asyncio.sleep(LLM_PACING_SECONDS)
-                    res = e
+                res = await asyncio.to_thread(
+                    call_llm_json,
+                    prompt=prompt,
+                    system_prompt="Answer JSON only.",
+                    temperature=0.1,
+                    model=config.llm_model_matcher,
+                )
+                await asyncio.sleep(LLM_PACING_SECONDS)
             async with completed_lock:
                 completed += 1
                 await _notify_llm_progress(
@@ -554,13 +550,12 @@ class ExchangeMatcher:
             if p_market.market_id in self._accepted:
                 continue  # leader already won for this Polymarket
 
-            if isinstance(resp, Exception) or resp is None:
+            if resp is None:
                 pipeline_stats["llm_errors"] += 1
                 logger.warning(
-                    "LLM verification errored — leaving pair unverified",
+                    "LLM verification returned no result — leaving pair unverified",
                     poly=p_market.question[:40],
                     limitless=(l_market.get("title", "") or "")[:40],
-                    err=str(resp) if resp is not None else "None",
                 )
                 continue
 

@@ -16,6 +16,7 @@ USAGE:
     )
 """
 
+import html
 import json
 import time
 from functools import lru_cache
@@ -70,21 +71,48 @@ def get_llm_client() -> OpenAI | None:
 
 
 def _extract_json_block(content: str) -> str:
-    """Strip common markdown code-fence wrappers around a JSON payload."""
+    """
+    Extract a JSON payload from an LLM response.
+
+    Tries, in order: explicit ```json fence, generic ``` fence, the substring
+    from the first `{` to the last `}` (or `[`/`]` for array roots), and finally
+    the stripped content as-is. Also unescapes HTML entities defensively in case
+    Gemini returns escaped output.
+    """
     if not content:
         return ""
-    # Prefer explicit json fences
+
+    content = html.unescape(content)
+
     if "```json" in content:
         try:
             return content.split("```json", 1)[1].split("```", 1)[0].strip()
         except Exception:
             pass
-    # Generic fences
+
     if "```" in content:
         try:
             return content.split("```", 1)[1].split("```", 1)[0].strip()
         except Exception:
             pass
+
+    first_obj = content.find("{")
+    last_obj = content.rfind("}")
+    first_arr = content.find("[")
+    last_arr = content.rfind("]")
+
+    obj_valid = first_obj != -1 and last_obj > first_obj
+    arr_valid = first_arr != -1 and last_arr > first_arr
+
+    if obj_valid and arr_valid:
+        if first_obj <= first_arr:
+            return content[first_obj : last_obj + 1].strip()
+        return content[first_arr : last_arr + 1].strip()
+    if obj_valid:
+        return content[first_obj : last_obj + 1].strip()
+    if arr_valid:
+        return content[first_arr : last_arr + 1].strip()
+
     return content.strip()
 
 
@@ -94,7 +122,6 @@ def _try_once(
     messages: list[dict],
     temperature: float,
     use_json_mode: bool,
-    max_tokens: int,
 ) -> tuple[dict[str, Any] | None, str]:
     """
     Single attempt against a specific model.
@@ -104,6 +131,7 @@ def _try_once(
         "empty"        — model returned empty/None content
         "parse_fail"   — content present but JSON parse failed
         "empty_parsed" — parsed successfully but result was empty/None/{}
+        "truncated"    — finish_reason="length"; response cut off, do not parse
         "rate_limit"   — 429 from upstream (caller should back off)
         "json_mode_unsupported" — model rejected response_format; caller should retry without it
         "error"        — any other exception
@@ -113,7 +141,6 @@ def _try_once(
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
         }
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -165,6 +192,17 @@ def _try_once(
         print(f"--- ⚠️ LLM EMPTY | model={actual_model} | finish_reason={finish_reason} ---")
         return None, "empty"
 
+    if finish_reason == "length":
+        logger.warning(
+            "LLM response truncated (finish_reason=length)",
+            model=actual_model,
+            content_len=len(content),
+        )
+        print(
+            f"--- ⚠️ LLM TRUNCATED | model={actual_model} | content_len={len(content)} ---"
+        )
+        return None, "truncated"
+
     cleaned = _extract_json_block(content)
     try:
         parsed = json.loads(cleaned) if cleaned else None
@@ -205,7 +243,6 @@ def call_llm_json(
     system_prompt: str = "",
     model: str | None = None,
     temperature: float | None = None,
-    max_tokens: int | None = None,
 ) -> dict[str, Any] | None:
     """
     Call the LLM and parse a JSON response.
@@ -229,7 +266,6 @@ def call_llm_json(
 
     primary = model or config.llm_model
     temperature = temperature if temperature is not None else config.llm_temperature
-    effective_max_tokens = max_tokens if max_tokens is not None else getattr(config, "llm_max_tokens", 4096)
 
     # Build the model chain: primary first, then fallbacks (deduped, primary excluded)
     fallbacks = list(getattr(config, "llm_fallback_models", []) or [])
@@ -238,11 +274,16 @@ def call_llm_json(
         if m and m not in model_chain:
             model_chain.append(m)
 
-    # FIX: Some free models (Gemma via Google AI Studio) reject the 'system' role
-    # with "Developer instruction is not enabled". We merge it into the user prompt.
+    # Some free models (Gemma via Google AI Studio) reject the 'system' role
+    # with "Developer instruction is not enabled". Merge it into the user prompt.
     full_prompt = prompt
     if system_prompt:
         full_prompt = f"[SYSTEM_INSTRUCTION]\n{system_prompt}\n\n[USER_PROMPT]\n{prompt}"
+
+    # Google AI Studio's response_format={"type":"json_object"} requires the
+    # literal word "json" somewhere in the prompt or it silently degrades.
+    if "json" not in full_prompt.lower():
+        full_prompt = f"{full_prompt}\n\nRespond with a single JSON object."
 
     messages = [{"role": "user", "content": full_prompt}]
     prompt_chars = len(full_prompt)
@@ -264,7 +305,6 @@ def call_llm_json(
                 messages=messages,
                 temperature=temperature,
                 use_json_mode=use_json_mode,
-                max_tokens=effective_max_tokens,
             )
 
             if status == "ok":
@@ -295,8 +335,8 @@ def call_llm_json(
                 use_json_mode = False
                 continue  # retry same model without response_format
 
-            # empty / parse_fail / empty_parsed / error → stop retrying this model,
-            # fall through to the next candidate
+            # empty / parse_fail / empty_parsed / truncated / error → stop retrying
+            # this model, fall through to the next candidate
             elapsed = time.time() - t0
             print(
                 f"--- ❌ LLM FAIL [{elapsed:.1f}s] | {candidate_model} | reason={status} ---\n"
