@@ -931,6 +931,20 @@ class MapMaker:
 
         mapped = self._exchange_matcher.mapped_pairs
         for m in cluster.markets:
+            # Defensive guard: never look up Limitless equivalents for a market
+            # whose market_id is empty. Historically this caused a cache-poisoning
+            # cascade where mapped.get("") returned a phantom Limitless slug and
+            # every cluster got the same bogus injection. See parser fix at
+            # polymarket_client.py _parse_market for the upstream root cause.
+            if not m.market_id:
+                logger.warning(
+                    "Skipping Limitless injection: market_id is empty",
+                    cluster_id=cluster.cluster_id,
+                    cluster_source=cluster.constraint_source,
+                    question=m.question[:80],
+                )
+                continue
+
             l_id = mapped.get(m.market_id)
             if not l_id:
                 continue

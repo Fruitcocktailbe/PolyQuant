@@ -878,32 +878,57 @@ class PolymarketClient:
                             )
                         )
             except Exception as e:
-                logger.warning("Failed to parse flat outcomes strings", error=str(e), market=data.get("condition_id"))
-        
-        # Parse end date
+                logger.warning("Failed to parse flat outcomes strings", error=str(e), market=data.get("conditionId") or data.get("condition_id"))
+
+        # The `/markets` endpoint returns snake_case (`condition_id`,
+        # `end_date_iso`); the `/events` endpoint returns camelCase
+        # (`conditionId`, `endDate`). Prior code only read the snake_case
+        # spellings, so every market parsed via /events came back with an
+        # empty market_id — breaking URL construction and token→market
+        # lookups downstream.
+        #
+        # Empty market_id cascades into a cache-poisoning bug in
+        # ExchangeMatcher (mapped_pairs keyed by "" → phantom injection on
+        # every cluster), so we widen the fallback chain and WARN if we
+        # still end up empty.
+        condition_id = (
+            data.get("condition_id")
+            or data.get("conditionId")
+            or data.get("questionID")            # NegRisk sub-markets sometimes use this
+            or data.get("question_id")           # snake_case alias
+            or ""
+        )
+        if not condition_id:
+            logger.warning(
+                "Polymarket market has no resolvable conditionId — market_id will be empty",
+                question=(data.get("question") or "")[:80],
+                slug=data.get("slug", ""),
+                available_keys=sorted(data.keys())[:25],
+            )
+        end_date_str = data.get("end_date_iso") or data.get("endDate")
         end_date = None
-        if data.get("end_date_iso"):
+        if end_date_str:
             try:
                 end_date = datetime.fromisoformat(
-                    data["end_date_iso"].replace("Z", "+00:00")
+                    str(end_date_str).replace("Z", "+00:00")
                 )
             except ValueError:
                 pass
-        
+
         return Market(
-            market_id=data.get("condition_id", ""),
+            market_id=condition_id,
             question=data.get("question", ""),
             description=data.get("description", ""),
             outcomes=outcomes,
-            volume=float(data.get("volume", 0)),
-            liquidity=float(data.get("liquidity", 0)),
+            volume=float(data.get("volume", 0) or 0),
+            liquidity=float(data.get("liquidity", 0) or 0),
             end_date=end_date,
             resolved=data.get("closed", False),
             slug=data.get("slug", "") or "",
-            
+
             # Phase 5: Enhanced Metadata Extraction
-            negrisk=data.get("neg_risk", False) or data.get("negrisk", False),
-            group_id=data.get("group_id") or data.get("series_id"),
+            negrisk=data.get("neg_risk", False) or data.get("negrisk", False) or data.get("negRisk", False),
+            group_id=data.get("group_id") or data.get("series_id") or data.get("groupItemTitle"),
             market_type=data.get("type") or data.get("market_type"),
 
             # Phase 6: Conditional market support

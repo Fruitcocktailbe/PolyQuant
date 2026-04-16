@@ -588,9 +588,41 @@ export const Dashboard: React.FC = () => {
                                     No clusters discovered yet...
                                 </div>
                             )}
-                            {state.clusters.map((c, idx) => (
-                                <ClusterCard key={idx} cluster={c} onClick={setSelectedClusterId} />
-                            ))}
+                            {(() => {
+                                const isNegRisk = (c: any) => {
+                                    const topic = String(c?.topic || "");
+                                    const id = String(c?.id || "");
+                                    return /negrisk/i.test(topic) || id.startsWith("negrisk_");
+                                };
+                                const negrisk = state.clusters.filter(isNegRisk);
+                                const other = state.clusters.filter((c) => !isNegRisk(c));
+                                return (
+                                    <>
+                                        {negrisk.length > 0 && (
+                                            <div>
+                                                <div className="px-3 py-1.5 bg-black/30 border-b border-neon-cyan/20 flex items-center justify-between sticky top-0 backdrop-blur-sm">
+                                                    <span className="text-[9px] font-bold text-neon-cyan uppercase tracking-widest">NegRisk Partitions</span>
+                                                    <span className="text-[9px] text-neon-cyan/70 font-mono">{negrisk.length}</span>
+                                                </div>
+                                                {negrisk.map((c, idx) => (
+                                                    <ClusterCard key={`nr-${idx}`} cluster={c} onClick={setSelectedClusterId} />
+                                                ))}
+                                            </div>
+                                        )}
+                                        {other.length > 0 && (
+                                            <div>
+                                                <div className="px-3 py-1.5 bg-black/30 border-b border-neon-purple/20 flex items-center justify-between sticky top-0 backdrop-blur-sm">
+                                                    <span className="text-[9px] font-bold text-neon-purple uppercase tracking-widest">Other Arbitrage</span>
+                                                    <span className="text-[9px] text-neon-purple/70 font-mono">{other.length}</span>
+                                                </div>
+                                                {other.map((c, idx) => (
+                                                    <ClusterCard key={`ot-${idx}`} cluster={c} onClick={setSelectedClusterId} />
+                                                ))}
+                                            </div>
+                                        )}
+                                    </>
+                                );
+                            })()}
                         </div>
                     </div>
 

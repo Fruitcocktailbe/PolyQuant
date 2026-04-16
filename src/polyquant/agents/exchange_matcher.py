@@ -191,15 +191,29 @@ class ExchangeMatcher:
             logger.warning(f"Failed to load market pairs cache: {e}")
             return
 
+        # Historical corruption guard: earlier parser bugs caused some
+        # Polymarket markets to have an empty market_id, which got written
+        # into the cache as an empty-string key. An empty key in mapped_pairs
+        # causes phantom Limitless injection on every cluster via
+        # mapped.get("") → returns the same slug for every market. Drop any
+        # entry with an empty key (or empty Limitless id) on load so old
+        # poisoned caches self-clean after the parser fix ships.
+        dropped_empty_keys = 0
+        dropped_empty_values = 0
+
         if isinstance(data, dict) and ("accepted" in data or "rejected" in data):
             for pid, entry in (data.get("accepted") or {}).items():
                 try:
+                    if not pid:
+                        dropped_empty_keys += 1
+                        continue
                     lid = entry["limitless_id"]
                     # Drop legacy entries that stored Limitless's numeric `id`
                     # instead of the URL `slug`. The orderbook endpoint expects
                     # a slug, so any all-digit value here is a stale entry from
                     # before the slug fix and would 404 downstream.
-                    if not isinstance(lid, str) or lid.isdigit():
+                    if not isinstance(lid, str) or not lid or lid.isdigit():
+                        dropped_empty_values += 1
                         continue
                     self._accepted[pid] = _AcceptedEntry(
                         limitless_id=lid,
@@ -211,6 +225,9 @@ class ExchangeMatcher:
                     continue
             for key, entry in (data.get("rejected") or {}).items():
                 try:
+                    if not key:
+                        dropped_empty_keys += 1
+                        continue
                     self._rejected[key] = _RejectedEntry(
                         similarity=float(entry.get("similarity", 0.0)),
                         reasoning=entry.get("reasoning", ""),
@@ -221,22 +238,48 @@ class ExchangeMatcher:
         elif isinstance(data, dict):
             # Legacy flat format: {poly_id: limitless_id}
             for pid, lid in data.items():
-                if isinstance(lid, str):
-                    self._accepted[pid] = _AcceptedEntry(
-                        limitless_id=lid,
-                        similarity=0.0,
-                        reasoning="legacy import",
-                        verified_at="",
-                    )
+                if not pid:
+                    dropped_empty_keys += 1
+                    continue
+                if not isinstance(lid, str) or not lid:
+                    dropped_empty_values += 1
+                    continue
+                self._accepted[pid] = _AcceptedEntry(
+                    limitless_id=lid,
+                    similarity=0.0,
+                    reasoning="legacy import",
+                    verified_at="",
+                )
+
+        if dropped_empty_keys or dropped_empty_values:
+            logger.warning(
+                "Dropped corrupted entries from market_pairs.json on load",
+                dropped_empty_keys=dropped_empty_keys,
+                dropped_empty_values=dropped_empty_values,
+                hint="Caused by historical empty-market_id parser bug; "
+                     "entries will be re-verified on next run",
+            )
+
         logger.info(
             f"Loaded matcher cache: {len(self._accepted)} accepted, {len(self._rejected)} rejected"
         )
 
     def _save_cache(self) -> None:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Sanitize on write too — even if a runtime bug slips an empty-key
+        # pair into self._accepted / self._rejected, we refuse to persist it
+        # so the cache never re-poisons itself.
         payload = {
-            "accepted": {pid: e.to_dict() for pid, e in self._accepted.items()},
-            "rejected": {k: e.to_dict() for k, e in self._rejected.items()},
+            "accepted": {
+                pid: e.to_dict()
+                for pid, e in self._accepted.items()
+                if pid and e.limitless_id
+            },
+            "rejected": {
+                k: e.to_dict()
+                for k, e in self._rejected.items()
+                if k
+            },
         }
         tmp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
         with open(tmp, "w") as f:
