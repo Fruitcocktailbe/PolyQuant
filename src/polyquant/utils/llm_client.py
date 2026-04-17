@@ -73,9 +73,17 @@ def _is_openrouter_model(model: str) -> bool:
 
 
 def _rate_limit_key(model: str) -> str:
-    """Key used by the rate limiter. All OpenRouter free models share a single
-    pooled bucket because OpenRouter enforces limits at the account level."""
-    if _is_openrouter_model(model) and model.endswith(":free"):
+    """Key used by the rate limiter. All OpenRouter free-tier models share a
+    single pooled bucket because OpenRouter enforces limits at the account
+    level. The pool covers:
+      - Individual free models (id ends with ":free", e.g.
+        "meta-llama/llama-3.3-70b-instruct:free")
+      - The `openrouter/free` meta-router, which internally dispatches to a
+        free model and therefore bills against the same free-tier quota
+    """
+    if _is_openrouter_model(model) and (
+        model.endswith(":free") or model == "openrouter/free"
+    ):
         return _OPENROUTER_FREE_POOL_KEY
     return model
 

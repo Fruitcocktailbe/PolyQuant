@@ -28,11 +28,25 @@ def test_is_openrouter_model_by_slash_rule():
 
 def test_free_openrouter_models_share_pool_key():
     # All OpenRouter :free models are rate-limited as a single pool because
-    # OpenRouter bills at the account level, not per model.
+    # OpenRouter bills at the account level, not per model. The
+    # `openrouter/free` meta-router also dispatches through the free pool and
+    # must share the same bucket — otherwise it'd wall-clock ahead of the
+    # individual free models under concurrent load.
     a = llm._rate_limit_key("deepseek/deepseek-chat-v3-0324:free")
     b = llm._rate_limit_key("meta-llama/llama-3.3-70b-instruct:free")
     c = llm._rate_limit_key("qwen/qwen-2.5-72b-instruct:free")
-    assert a == b == c == llm._OPENROUTER_FREE_POOL_KEY
+    router = llm._rate_limit_key("openrouter/free")
+    assert a == b == c == router == llm._OPENROUTER_FREE_POOL_KEY
+
+
+def test_openrouter_free_router_routes_to_openrouter_provider(monkeypatch):
+    # Sanity: `openrouter/free` contains a '/', so _client_for_model must
+    # hand it to the OpenRouter factory, not Google AI Studio.
+    google_sentinel = object()
+    openrouter_sentinel = object()
+    monkeypatch.setattr(llm, "get_llm_client", lambda: google_sentinel)
+    monkeypatch.setattr(llm, "_get_openrouter_client", lambda: openrouter_sentinel)
+    assert llm._client_for_model("openrouter/free") is openrouter_sentinel
 
 
 def test_google_models_each_get_their_own_bucket():

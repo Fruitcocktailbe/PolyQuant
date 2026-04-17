@@ -536,32 +536,29 @@ class PolyQuantConfig(BaseSettings):
 
     llm_fallback_models: list[str] = Field(
         default_factory=lambda: [
-            # Google AI Studio fallbacks (same account as primary — useful when
-            # one tier's RPM ceiling is hit but not the others')
+            # ----- Tier 1: Google AI Studio free tier (same key as primary) -----
+            # Useful when one Google tier's RPM is hit but others still have
+            # headroom. All share the same DAILY quota, though — when the day
+            # cap is gone, all three go dark.
             "gemini-2.5-flash-lite",
             "gemini-2.5-flash",
-            # OpenRouter free models — different provider account, genuinely
-            # independent quota. Only invoked when openrouter_api_key is set;
-            # otherwise llm_client silently skips them. Models are identified
-            # by the "/" in their id (OpenRouter format: provider/model:tag).
-            # OpenRouter's catalog rotates — if a 404 "no endpoints found"
-            # appears in logs, the id has been deprecated; update here. List
-            # any-time-current ids first. Check https://openrouter.ai/models
-            # filtered by ":free" for live options.
-            "deepseek/deepseek-chat:free",
-            "deepseek/deepseek-r1:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "google/gemini-2.0-flash-exp:free",
-            "qwen/qwen-2.5-72b-instruct:free",
-            "mistralai/mistral-small-3.1-24b-instruct:free",
+
+            # ----- Tier 2: OpenRouter FREE router -----
+            # One magic id — OpenRouter auto-routes to whichever free model is
+            # currently live AND supports the capabilities we ask for (JSON mode,
+            # etc.). Cleaner than hardcoding rotating `:free` ids, which go 404
+            # whenever OpenRouter rotates its catalog. Requires OPENROUTER_API_KEY.
+            # Free-tier cap: 50 req/day (1000 with a one-time $10 deposit).
+            # See https://openrouter.ai/docs/guides/routing/routers/free-models-router
+            "openrouter/free",
         ],
         description=(
             "Fallback chain when primary returns empty/invalid JSON or is "
-            "rate-limited. Ordered by free-tier quota headroom. Google models "
-            "come first (fastest when quota available); OpenRouter free "
-            "models come after (kick in when Google's daily quota is "
-            "exhausted — requires openrouter_api_key). On 404 'no endpoints "
-            "found' a model is dead-listed for the rest of the run."
+            "rate-limited. Two tiers: Google-free (direct) → OpenRouter-free "
+            "router (auto-picks a live free model). Intentionally free-only — "
+            "no paid models so the chain can never accidentally spend OpenRouter "
+            "credit during tests. On 404 'no endpoints found' a model is "
+            "dead-listed for the rest of the run."
         )
     )
 
