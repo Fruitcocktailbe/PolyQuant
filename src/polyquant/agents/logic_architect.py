@@ -58,7 +58,7 @@ USAGE:
 import hashlib
 import json
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from polyquant.utils.llm_client import call_llm_json
@@ -564,10 +564,17 @@ CRITICAL RULES:
             # === TEMPORAL DATA (informational, not for filtering) ===
             time_info = f"VOLUME: ${market.volume:,.0f}"
             if market.end_date:
-                now = datetime.utcnow()
-                hours_remaining = (market.end_date - now).total_seconds() / 3600
+                # Match the end_date's tz-awareness — Polymarket/Limitless
+                # ship tz-aware ISO timestamps, and subtracting a naïve
+                # datetime.utcnow() throws "can't subtract offset-naive and
+                # offset-aware datetimes" once they reach this code path.
+                end_dt = market.end_date
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                hours_remaining = (end_dt - now).total_seconds() / 3600
                 if hours_remaining > 0:
-                    time_info += f"\nCLOSES: {market.end_date.isoformat()} ({hours_remaining:.1f}h remaining)"
+                    time_info += f"\nCLOSES: {end_dt.isoformat()} ({hours_remaining:.1f}h remaining)"
 
             resolution = self._extract_resolution_criteria(market.description)
 

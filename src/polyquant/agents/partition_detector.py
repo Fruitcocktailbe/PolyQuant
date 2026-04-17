@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -134,7 +134,13 @@ def end_date_bucket(end_date: datetime | None, window_days: int) -> str:
     """
     if end_date is None:
         return "no_end_date"
-    anchor = datetime(2000, 1, 1)
+    # Polymarket/Limitless ship tz-aware end_dates; our anchor must match or
+    # Python raises `can't subtract offset-naive and offset-aware datetimes`.
+    # Normalise defensively: naive inputs are assumed UTC (the project-wide
+    # convention — see _to_datetime in match_prefilter.py).
+    if end_date.tzinfo is None:
+        end_date = end_date.replace(tzinfo=timezone.utc)
+    anchor = datetime(2000, 1, 1, tzinfo=timezone.utc)
     days_since = (end_date - anchor).days
     bucket_index = days_since // max(1, window_days)
     return f"bucket_{bucket_index}"
