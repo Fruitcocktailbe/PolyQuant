@@ -32,6 +32,20 @@ logger = get_logger(__name__)
 # Google AI Studio OpenAI-compatible endpoint
 GOOGLE_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+# OpenRouter — a proxy that exposes many model providers (DeepSeek, Meta,
+# Anthropic, Google, Qwen, Mistral) through one OpenAI-compatible endpoint.
+# We use it as a second-provider safety net: when Google AI Studio's daily
+# quota runs out, OpenRouter's free-tier models (identified by a "/" in the
+# id and a ":free" suffix) keep the pipeline alive on an independent account.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Per-account pooled RPM for OpenRouter free-tier models. OpenRouter enforces
+# limits at the account level, not per-model — rotating between free models
+# doesn't multiply the budget, it just distributes load across providers for
+# latency/reliability. 20 RPM is OpenRouter's documented free-tier ceiling.
+_OPENROUTER_FREE_POOL_KEY = "__openrouter_free__"
+_OPENROUTER_FREE_POOL_RPM = 20
+
 # Google AI Studio free-tier request-per-minute limits. Source:
 # https://ai.google.dev/gemini-api/docs/rate-limits
 # We pace calls at (60 / RPM) * safety_margin to stay below the ceiling.
@@ -39,11 +53,28 @@ _MODEL_RPM: dict[str, int] = {
     "gemini-2.5-pro": 5,
     "gemini-2.5-flash": 10,
     "gemini-2.5-flash-lite": 15,
+    # OpenRouter pool gets rate-limited as a single bucket via the key above.
+    _OPENROUTER_FREE_POOL_KEY: _OPENROUTER_FREE_POOL_RPM,
 }
 _DEFAULT_RPM = 5  # Conservative fallback for unknown models
 _RPM_SAFETY_MARGIN = 1.15  # Pad the interval by 15% to account for clock skew / request overhead
 _DEFAULT_RETRY_AFTER_S = 60.0  # If 429 lacks Retry-After, wait one full minute
 _MAX_BLOCK_SKIP_S = 120.0  # Skip a model in the fallback chain if it's blocked this long or more
+
+
+def _is_openrouter_model(model: str) -> bool:
+    """OpenRouter model ids always contain a '/' (e.g. 'deepseek/deepseek-chat:free').
+    Google AI Studio model ids never do. This is the single source of truth for
+    provider routing."""
+    return "/" in model
+
+
+def _rate_limit_key(model: str) -> str:
+    """Key used by the rate limiter. All OpenRouter free models share a single
+    pooled bucket because OpenRouter enforces limits at the account level."""
+    if _is_openrouter_model(model) and model.endswith(":free"):
+        return _OPENROUTER_FREE_POOL_KEY
+    return model
 
 
 class _RateLimiter:
@@ -54,6 +85,10 @@ class _RateLimiter:
     its free-tier RPM, and records 429 back-off windows so concurrent callers
     share the same block. `wait_if_needed` sleeps before the call (proactive
     pacing); `record_429` sets a hard block consumed by subsequent callers.
+
+    Models are keyed by `_rate_limit_key(model)` so OpenRouter free-tier
+    models share a single pool (matching OpenRouter's account-level billing)
+    while each Google model has its own bucket (Google meters per-model).
     """
 
     def __init__(self) -> None:
@@ -61,38 +96,41 @@ class _RateLimiter:
         self._last_call: dict[str, float] = {}
         self._blocked_until: dict[str, float] = {}
 
-    def _min_interval(self, model: str) -> float:
-        rpm = _MODEL_RPM.get(model, _DEFAULT_RPM)
+    def _min_interval(self, key: str) -> float:
+        rpm = _MODEL_RPM.get(key, _DEFAULT_RPM)
         return (60.0 / rpm) * _RPM_SAFETY_MARGIN
 
     def wait_if_needed(self, model: str) -> None:
         """Block until the next call to `model` is allowed under RPM + 429 state."""
+        key = _rate_limit_key(model)
         while True:
             with self._lock:
                 now = time.time()
-                blocked = self._blocked_until.get(model, 0.0)
-                last = self._last_call.get(model, 0.0)
-                next_allowed = max(blocked, last + self._min_interval(model))
+                blocked = self._blocked_until.get(key, 0.0)
+                last = self._last_call.get(key, 0.0)
+                next_allowed = max(blocked, last + self._min_interval(key))
                 wait = next_allowed - now
                 if wait <= 0:
                     # Reserve this slot immediately so concurrent waiters space out.
-                    self._last_call[model] = now
+                    self._last_call[key] = now
                     return
             # Sleep outside the lock so other threads can compute their own waits.
-            logger.debug(f"Rate limiter: waiting {wait:.1f}s for {model}")
+            logger.debug(f"Rate limiter: waiting {wait:.1f}s for {model} (key={key})")
             time.sleep(wait)
 
     def record_429(self, model: str, retry_after_s: float) -> None:
+        key = _rate_limit_key(model)
         with self._lock:
-            self._blocked_until[model] = max(
-                self._blocked_until.get(model, 0.0),
+            self._blocked_until[key] = max(
+                self._blocked_until.get(key, 0.0),
                 time.time() + retry_after_s,
             )
 
     def blocked_for(self, model: str) -> float:
         """Seconds until `model` becomes available again (0 if free)."""
+        key = _rate_limit_key(model)
         with self._lock:
-            blocked = self._blocked_until.get(model, 0.0)
+            blocked = self._blocked_until.get(key, 0.0)
             return max(0.0, blocked - time.time())
 
 
@@ -101,11 +139,14 @@ _rate_limiter = _RateLimiter()
 
 def _parse_retry_after(exc: Exception) -> float:
     """
-    Extract a retry-after duration from a Google AI Studio / OpenAI 429 error.
+    Extract a retry-after duration from a 429 error.
 
-    Checks in order: the `Retry-After` header on the response, Google's
-    `retryDelay` field inside the error body details, and finally a sensible
-    default.
+    Checks in order:
+    1. `Retry-After` header (standard — set by both Google and OpenRouter).
+    2. `X-RateLimit-Reset` header (OpenRouter only — unix epoch ms timestamp
+       when the bucket refills; we convert to a relative delay).
+    3. Google's `retryDelay` field inside the error body details.
+    4. Sensible default.
     """
     try:
         response = getattr(exc, "response", None)
@@ -115,6 +156,19 @@ def _parse_retry_after(exc: Exception) -> float:
                 retry_after = headers.get("retry-after") or headers.get("Retry-After")
                 if retry_after:
                     return float(retry_after)
+                # OpenRouter ships X-RateLimit-Reset as a future unix-ms timestamp.
+                reset = (
+                    headers.get("x-ratelimit-reset")
+                    or headers.get("X-RateLimit-Reset")
+                )
+                if reset:
+                    try:
+                        reset_ms = float(reset)
+                        delta = (reset_ms / 1000.0) - time.time()
+                        if delta > 0:
+                            return min(delta, 300.0)  # cap at 5 min
+                    except (TypeError, ValueError):
+                        pass
     except Exception:
         pass
 
@@ -133,6 +187,19 @@ def _parse_retry_after(exc: Exception) -> float:
     return _DEFAULT_RETRY_AFTER_S
 
 
+def _read_api_key(attr: str) -> str:
+    """Unwrap a SecretStr config field; return empty string when missing or
+    obviously a placeholder."""
+    try:
+        wrapped = getattr(config, attr, None)
+        key = wrapped.get_secret_value() if wrapped else ""
+    except Exception:
+        key = ""
+    if not key or len(key) < 10 or "your-" in key.lower():
+        return ""
+    return key
+
+
 @lru_cache(maxsize=1)
 def get_llm_client() -> OpenAI | None:
     """
@@ -140,24 +207,20 @@ def get_llm_client() -> OpenAI | None:
 
     Returns:
         OpenAI client configured for Google's OpenAI-compat endpoint, or None
-        if the configured key is missing/invalid.
+        if the configured key is missing/invalid. OpenRouter is handled by a
+        separate lazy client factory (`_get_openrouter_client`).
     """
-    try:
-        api_key_wrapped = getattr(config, "gemini_api_key", None)
-        api_key = api_key_wrapped.get_secret_value() if api_key_wrapped else ""
-    except Exception:
-        api_key = ""
-
-    if not api_key or len(api_key) < 10 or "your-" in api_key.lower():
-        logger.warning("LLM keys not configured — LLM clustering/matching disabled")
+    api_key = _read_api_key("gemini_api_key")
+    if not api_key:
+        logger.warning("Google AI Studio key not configured — LLM clustering/matching disabled")
         return None
 
     if api_key.startswith("sk-or-"):
         logger.error(
             "GEMINI_API_KEY looks like an OpenRouter key (sk-or-...). "
-            "PolyQuant now calls Google AI Studio directly — generate a new key "
-            "at https://aistudio.google.com/apikey (format: AIzaSy...) and put "
-            "it in .env as GEMINI_API_KEY. LLM features disabled until fixed."
+            "Google and OpenRouter keys are now handled as separate fields — "
+            "put your Google AI Studio key (format: AIzaSy...) in GEMINI_API_KEY "
+            "and your OpenRouter key (sk-or-v1-...) in OPENROUTER_API_KEY."
         )
         return None
 
@@ -169,6 +232,41 @@ def get_llm_client() -> OpenAI | None:
 
     logger.info("Google AI Studio LLM client initialized", base_url=GOOGLE_OPENAI_BASE_URL)
     return client
+
+
+@lru_cache(maxsize=1)
+def _get_openrouter_client() -> OpenAI | None:
+    """Lazy singleton for the OpenRouter client. Returns None when no
+    openrouter_api_key is set (silently — OpenRouter is an optional
+    safety-net provider, not a hard dependency)."""
+    api_key = _read_api_key("openrouter_api_key")
+    if not api_key:
+        return None
+
+    # OpenRouter recommends identifying the caller via HTTP-Referer/X-Title
+    # headers. These are public app identifiers, not secrets, and help
+    # OpenRouter surface per-app analytics in their dashboard.
+    client = OpenAI(
+        base_url=OPENROUTER_BASE_URL,
+        api_key=api_key,
+        timeout=45.0,
+        default_headers={
+            "HTTP-Referer": "https://github.com/polyquant",
+            "X-Title": "PolyQuant MapMaker",
+        },
+    )
+    logger.info("OpenRouter LLM client initialized", base_url=OPENROUTER_BASE_URL)
+    return client
+
+
+def _client_for_model(model: str) -> OpenAI | None:
+    """Route to the right provider client based on the model id format.
+
+    Returns None when the required API key isn't configured — callers treat
+    that as a silent skip (the model is removed from the fallback chain)."""
+    if _is_openrouter_model(model):
+        return _get_openrouter_client()
+    return get_llm_client()
 
 
 def _extract_json_block(content: str) -> str:
@@ -371,19 +469,40 @@ def call_llm_json(
     Returns:
         Parsed JSON dict, or None on terminal failure (all models exhausted).
     """
-    client = get_llm_client()
-    if not client:
-        return None
-
+    # Note: we resolve a client per-model inside the loop below because the
+    # chain can mix Google and OpenRouter models. When neither provider has a
+    # usable key, the chain is empty and we bail out early.
     primary = model or config.llm_model
     temperature = temperature if temperature is not None else config.llm_temperature
 
     # Build the model chain: primary first, then fallbacks (deduped, primary excluded)
     fallbacks = list(getattr(config, "llm_fallback_models", []) or [])
-    model_chain: list[str] = [primary]
+    raw_chain: list[str] = [primary]
     for m in fallbacks:
-        if m and m not in model_chain:
-            model_chain.append(m)
+        if m and m not in raw_chain:
+            raw_chain.append(m)
+
+    # Filter out any model whose provider isn't configured. OpenRouter models
+    # are silently dropped when no OPENROUTER_API_KEY is set — the user can
+    # add the key later without any other changes.
+    model_chain: list[str] = []
+    dropped_no_provider: list[str] = []
+    for candidate in raw_chain:
+        if _client_for_model(candidate) is not None:
+            model_chain.append(candidate)
+        else:
+            dropped_no_provider.append(candidate)
+    if dropped_no_provider:
+        logger.debug(
+            "Skipped models with no configured provider key",
+            skipped=dropped_no_provider,
+        )
+    if not model_chain:
+        logger.warning(
+            "No LLM provider configured — LLM clustering/matching disabled. "
+            "Set GEMINI_API_KEY and/or OPENROUTER_API_KEY."
+        )
+        return None
 
     # Some free models (Gemma via Google AI Studio) reject the 'system' role
     # with "Developer instruction is not enabled". Merge it into the user prompt.
@@ -420,6 +539,18 @@ def call_llm_json(
             )
             continue
 
+        # Resolve the right client for this model — Google AI Studio or
+        # OpenRouter — from the shared cached factories. The chain-building
+        # step above already dropped models with no configured provider, so
+        # this lookup should always succeed; defensive None-check anyway.
+        candidate_client = _client_for_model(candidate_model)
+        if candidate_client is None:
+            logger.debug(
+                "Candidate model has no provider client at call time — skipping",
+                model=candidate_model,
+            )
+            continue
+
         prefix = "🤖 LLM FALLBACK" if is_fallback else "🤖 LLM START"
         print(f"\n--- {prefix}: {candidate_model} | Prompt: {prompt_chars:,} chars ---")
         t0 = time.time()
@@ -428,7 +559,7 @@ def call_llm_json(
 
         for attempt in range(max_retries):
             parsed, status = _try_once(
-                client=client,
+                client=candidate_client,
                 model=candidate_model,
                 messages=messages,
                 temperature=temperature,

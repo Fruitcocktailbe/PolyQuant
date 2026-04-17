@@ -26,13 +26,13 @@ class TestLLMPinning(unittest.TestCase):
         mock_client.chat.completions.create.return_value = mock_response
 
         # 1. Test with default config value
-        config.llm_model = "test/default-model"
+        config.llm_model = "test-default-model"
         call_llm_json("Hello")
         
         # Verify call used the config model
         mock_client.chat.completions.create.assert_called()
         args, kwargs = mock_client.chat.completions.create.call_args
-        self.assertEqual(kwargs["model"], "test/default-model")
+        self.assertEqual(kwargs["model"], "test-default-model")
 
     @patch("polyquant.utils.llm_client.get_llm_client")
     def test_explicit_model_override(self, mock_get_client):
@@ -46,12 +46,12 @@ class TestLLMPinning(unittest.TestCase):
         mock_client.chat.completions.create.return_value = mock_response
 
         # 2. Test explicit override in function call
-        config.llm_model = "test/wrong-model"
-        call_llm_json("Hello", model="test/pinned-model")
+        config.llm_model = "test-wrong-model"
+        call_llm_json("Hello", model="test-pinned-model")
         
         # Verify call used the explicit model, not the config one
         args, kwargs = mock_client.chat.completions.create.call_args
-        self.assertEqual(kwargs["model"], "test/pinned-model")
+        self.assertEqual(kwargs["model"], "test-pinned-model")
 
     @patch("polyquant.utils.llm_client.get_llm_client")
     def test_temperature_pinning(self, mock_get_client):

@@ -60,6 +60,16 @@ class PolyQuantConfig(BaseSettings):
         description="Google Gemini API Key",
     )
 
+    openrouter_api_key: SecretStr = Field(
+        default=SecretStr(""),
+        description=(
+            "OpenRouter API key (optional, format: sk-or-v1-...). When set, "
+            "free-tier OpenRouter models are added to the fallback chain, "
+            "giving the pipeline a second-provider safety net when Google AI "
+            "Studio's daily quota is exhausted. Get a key at openrouter.ai."
+        ),
+    )
+
     alchemy_api_key: SecretStr = Field(
         default=SecretStr(""),
         description="Alchemy API key for Polygon blockchain data"
@@ -526,10 +536,28 @@ class PolyQuantConfig(BaseSettings):
 
     llm_fallback_models: list[str] = Field(
         default_factory=lambda: [
+            # Google AI Studio fallbacks (same account as primary — useful when
+            # one tier's RPM ceiling is hit but not the others')
             "gemini-2.5-flash-lite",
             "gemini-2.5-flash",
+            # OpenRouter free models — different provider account, genuinely
+            # independent quota. Only invoked when openrouter_api_key is set;
+            # otherwise llm_client silently skips them. Models are identified
+            # by the "/" in their id (OpenRouter format: provider/model:tag).
+            # Ordered by a mix of quality and reliability on JSON output.
+            "deepseek/deepseek-chat-v3-0324:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "google/gemini-2.0-flash-exp:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "mistralai/mistral-small-3.1-24b-instruct:free",
         ],
-        description="Fallback chain when primary returns empty/invalid JSON. Ordered by free-tier quota headroom."
+        description=(
+            "Fallback chain when primary returns empty/invalid JSON or is "
+            "rate-limited. Ordered by free-tier quota headroom. Google models "
+            "come first (fastest when quota available); OpenRouter free "
+            "models come after (kick in when Google's daily quota is "
+            "exhausted — requires openrouter_api_key)."
+        )
     )
 
     llm_temperature: float = Field(
