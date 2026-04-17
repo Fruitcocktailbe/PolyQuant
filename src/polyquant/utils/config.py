@@ -509,56 +509,51 @@ class PolyQuantConfig(BaseSettings):
     # LLM Configuration
     # =========================================================================
 
+    # Test phase: route all agents through OpenRouter's free-models router.
+    # Google AI Studio's daily quota keeps getting exhausted before the map
+    # run finishes, so we're skipping Google entirely until we decide whether
+    # to add paid credits. `openrouter/free` + `require_parameters: true`
+    # (injected in llm_client) auto-picks a live free model that supports
+    # JSON mode on every call.
     llm_model: str = Field(
-        default="gemini-2.5-flash-lite",
-        description="Primary LLM model (Google AI Studio). Default for any caller that doesn't specify a per-agent model."
+        default="openrouter/free",
+        description="Primary LLM model. Set to OpenRouter's free-models router during test phase."
     )
 
     llm_model_discovery: str = Field(
-        default="gemini-2.5-flash-lite",
-        description="Model for DiscoveryAgent clustering (hot path, 15 RPM / 1000 RPD on free tier)."
+        default="openrouter/free",
+        description="Model for DiscoveryAgent clustering."
     )
 
     llm_model_logic: str = Field(
-        default="gemini-2.5-pro",
-        description="Model for LogicArchitect constraint extraction (reasoning-heavy, 5 RPM / 100 RPD on free tier)."
+        default="openrouter/free",
+        description="Model for LogicArchitect constraint extraction."
     )
 
     llm_model_validator: str = Field(
-        default="gemini-2.5-flash",
-        description="Model for ValidatorAgent (balanced quality/quota, 10 RPM / 250 RPD on free tier)."
+        default="openrouter/free",
+        description="Model for ValidatorAgent."
     )
 
     llm_model_matcher: str = Field(
-        default="gemini-2.5-flash-lite",
-        description="Model for ExchangeMatcher Polymarket<->Limitless LLM matching (high volume, shares flash-lite pool with discovery)."
+        default="openrouter/free",
+        description="Model for ExchangeMatcher Polymarket<->Limitless LLM matching."
     )
 
     llm_fallback_models: list[str] = Field(
         default_factory=lambda: [
-            # ----- Tier 1: Google AI Studio free tier (same key as primary) -----
-            # Useful when one Google tier's RPM is hit but others still have
-            # headroom. All share the same DAILY quota, though — when the day
-            # cap is gone, all three go dark.
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
-
-            # ----- Tier 2: OpenRouter FREE router -----
-            # One magic id — OpenRouter auto-routes to whichever free model is
-            # currently live AND supports the capabilities we ask for (JSON mode,
-            # etc.). Cleaner than hardcoding rotating `:free` ids, which go 404
-            # whenever OpenRouter rotates its catalog. Requires OPENROUTER_API_KEY.
-            # Free-tier cap: 50 req/day (1000 with a one-time $10 deposit).
-            # See https://openrouter.ai/docs/guides/routing/routers/free-models-router
+            # Single-entry chain during the free-only test phase. The primary
+            # IS `openrouter/free`, so this list is only used when the user
+            # overrides `llm_model` per-call. Kept for structural consistency
+            # — the dedupe in call_llm_json drops duplicates of the primary.
             "openrouter/free",
         ],
         description=(
-            "Fallback chain when primary returns empty/invalid JSON or is "
-            "rate-limited. Two tiers: Google-free (direct) → OpenRouter-free "
-            "router (auto-picks a live free model). Intentionally free-only — "
-            "no paid models so the chain can never accidentally spend OpenRouter "
-            "credit during tests. On 404 'no endpoints found' a model is "
-            "dead-listed for the rest of the run."
+            "Fallback chain. During test phase we're routing everything through "
+            "OpenRouter's free-models router. Google AI Studio was removed from "
+            "the chain because its daily quota is reliably exhausted mid-run "
+            "and the fallback was wasting calls on 429s. Re-add Google entries "
+            "here once the daily quota is no longer the binding constraint."
         )
     )
 

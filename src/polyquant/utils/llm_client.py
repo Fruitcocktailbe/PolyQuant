@@ -385,6 +385,17 @@ def _try_once(
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
+        # OpenRouter-specific: tell the free router to ONLY dispatch to models
+        # that support every parameter we're sending. Without this, the router
+        # will happily pick e.g. gemma-3n-e2b-it, which returns a 400
+        # "JSON mode is not enabled" when we ask for response_format. With
+        # `require_parameters: true`, such models are filtered out upstream.
+        # See https://openrouter.ai/docs/features/provider-routing#required-parameters
+        if _is_openrouter_model(model) and use_json_mode:
+            kwargs["extra_body"] = {
+                "provider": {"require_parameters": True},
+            }
+
         response = client.chat.completions.create(**kwargs)
 
     except Exception as e:
