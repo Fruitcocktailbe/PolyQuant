@@ -355,7 +355,11 @@ def layer3_triage(
         "post_filter_below_min": 0,
         "fresh_manifest": 0,
     }
-    now = datetime.utcnow()
+    # Market end_dates arrive tz-aware from Polymarket's ISO-8601 payloads;
+    # a naïve utcnow() here crashes the whole map run on the first comparison.
+    # Align on UTC and normalise stray naïve end_dates defensively (matches
+    # the end_date_bucket fix above).
+    now = datetime.now(timezone.utc)
     ttl_hours = config.partition_manifest_ttl_hours
     min_size = config.partition_min_cluster_size
     max_size = config.partition_max_cluster_size
@@ -373,8 +377,12 @@ def layer3_triage(
         for m in candidate:
             if m.resolved:
                 continue
-            if m.end_date is not None and m.end_date <= now:
-                continue
+            m_end = m.end_date
+            if m_end is not None:
+                if m_end.tzinfo is None:
+                    m_end = m_end.replace(tzinfo=timezone.utc)
+                if m_end <= now:
+                    continue
             yes = get_yes_outcome(m)
             if yes is None:
                 continue

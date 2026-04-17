@@ -320,9 +320,13 @@ class PolymarketClient:
         )
         data = response.json()
 
-        markets = []
+        markets: list[Market] = []
+        skipped_unminted = 0
         for item in data:
             market = self._parse_market(item)
+            if market is None:
+                skipped_unminted += 1
+                continue
             if market.liquidity >= min_liquidity:
                 markets.append(market)
 
@@ -330,6 +334,7 @@ class PolymarketClient:
             f"Fetched {len(data)} markets ({len(markets)} after filtering)",
             total=len(data),
             after_filter=len(markets),
+            skipped_unminted_conditionId=skipped_unminted,
         )
 
         return markets, len(data)
@@ -377,6 +382,10 @@ class PolymarketClient:
         # while being robust to out-of-order rows.
         max_consecutive_below_batches = 3
         consecutive_empty_batches = 0
+        # Pre-live markets (future matches / unminted CTF conditions) return
+        # from _parse_market as None; aggregate the count across the whole
+        # scan and log once at the end instead of per-market warnings.
+        skipped_unminted = 0
 
         try:
             while True:
@@ -407,9 +416,17 @@ class PolymarketClient:
                     if event_liq < min_liquidity:
                         continue
 
-                    # Parse markets within the event
+                    # Parse markets within the event; drop pre-live markets
+                    # (unminted conditionId returns None from _parse_market)
+                    # and keep a running tally for a single aggregate log line.
                     raw_markets = event_data.get("markets", [])
-                    parsed_markets = [self._parse_market(m) for m in raw_markets]
+                    parsed_markets: list[Market] = []
+                    for m in raw_markets:
+                        parsed = self._parse_market(m)
+                        if parsed is None:
+                            skipped_unminted += 1
+                            continue
+                        parsed_markets.append(parsed)
                     event_slug = event_data.get("slug", "") or ""
                     for pm in parsed_markets:
                         pm.event_slug = event_slug
@@ -465,6 +482,7 @@ class PolymarketClient:
                 events=len(all_events),
                 total_markets=total_markets,
                 api_calls=offset // batch_size + 1,
+                skipped_unminted_conditionId=skipped_unminted,
             )
             
             return all_events
@@ -850,8 +868,18 @@ class PolymarketClient:
             logger.error("Failed to fetch USDC balance", error=str(e))
             return Decimal("0")
 
-    def _parse_market(self, data: dict[str, Any]) -> Market:
-        """Parse API response into Market object."""
+    def _parse_market(self, data: dict[str, Any]) -> Market | None:
+        """Parse API response into Market object.
+
+        Returns None when the market has no resolvable on-chain conditionId.
+        Polymarket's /events endpoint ships metadata for pre-live markets
+        (future matches, future events) before the CTF conditionId is minted;
+        those markets are worthless to the map maker (no market_id, no tokens
+        to reference, and passing an empty-id Market through would poison the
+        ExchangeMatcher cache — see the empty-key guard in _load_cache).
+        Callers aggregate the skip count and log it once per scan instead of
+        per-market warnings.
+        """
         outcomes = []
         
         # In the /events endpoint, tokens aren't provided directly. 
@@ -917,12 +945,15 @@ class PolymarketClient:
             or ""
         )
         if not condition_id:
-            logger.warning(
-                "Polymarket market has no resolvable conditionId — market_id will be empty",
+            # Expected for pre-live markets (future games/events that haven't
+            # had their on-chain CTF condition minted yet). Debug-level only;
+            # callers aggregate a single INFO line per scan with the count.
+            logger.debug(
+                "Polymarket market has no resolvable conditionId — skipping",
                 question=(data.get("question") or "")[:80],
                 slug=data.get("slug", ""),
-                available_keys=sorted(data.keys())[:25],
             )
+            return None
         end_date_str = data.get("end_date_iso") or data.get("endDate")
         end_date = None
         if end_date_str:
