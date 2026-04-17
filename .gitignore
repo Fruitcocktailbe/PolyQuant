@@ -102,7 +102,6 @@ PolyQuant_Walkthrough.docx
 
 # Temporary / debug files
 tmp_*
-verif*
 verification_output*
 
 # Redis artifacts
