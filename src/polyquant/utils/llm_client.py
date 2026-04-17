@@ -429,11 +429,16 @@ def _try_once(
             )
             return None, "model_dead"
         # Some free models reject response_format — detect and signal retry.
-        # Match only on the parameter name itself to avoid false positives on
-        # generic "not supported" errors unrelated to JSON mode.
+        # We match several phrasings because different providers word the same
+        # rejection differently: OpenAI-compat uses "response_format", Google
+        # AI Studio says "JSON mode is not enabled", some list it under
+        # "structured output". All three mean the same thing: drop the param
+        # and let the text-mode parser salvage a JSON object from prose.
         if use_json_mode and (
             "response_format" in lowered
             or "json_object" in lowered
+            or "json mode" in lowered
+            or "structured output" in lowered
         ):
             logger.info(
                 "Model rejected response_format — retrying without JSON mode",
@@ -590,8 +595,14 @@ def call_llm_json(
 
     # Google AI Studio's response_format={"type":"json_object"} requires the
     # literal word "json" somewhere in the prompt or it silently degrades.
+    # The stronger wording also helps text-mode calls (openrouter/free routed
+    # to models without JSON mode) return clean output we can parse without
+    # stripping preamble/postamble.
     if "json" not in full_prompt.lower():
-        full_prompt = f"{full_prompt}\n\nRespond with a single JSON object."
+        full_prompt = (
+            f"{full_prompt}\n\nRespond with ONLY a single JSON object, "
+            "no prose, no markdown fences."
+        )
 
     messages = [{"role": "user", "content": full_prompt}]
     prompt_chars = len(full_prompt)
@@ -643,7 +654,16 @@ def call_llm_json(
         prefix = "🤖 LLM FALLBACK" if is_fallback else "🤖 LLM START"
         print(f"\n--- {prefix}: {candidate_model} | Prompt: {prompt_chars:,} chars ---")
         t0 = time.time()
-        use_json_mode = True
+        # `openrouter/free` is a meta-router that dispatches to a random free
+        # model each call. Many of those models (notably Google-routed Gemma
+        # variants — gemma-3-4b-it, gemma-3n-e2b-it) reject
+        # response_format=json_object with a 400. `provider.require_parameters`
+        # is supposed to filter these out but isn't honored for the free
+        # router in practice. Dropping JSON mode up front avoids the guaranteed
+        # first-try failure; `_extract_json_block` salvages a JSON object from
+        # free-text responses. Pinned OpenRouter models (e.g. a specific
+        # `:free` slug) and all Google Gemini models keep JSON mode on.
+        use_json_mode = candidate_model != "openrouter/free"
 
         for attempt in range(max_retries):
             parsed, status = _try_once(

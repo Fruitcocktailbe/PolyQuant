@@ -146,3 +146,120 @@ def test_parse_retry_after_falls_back_to_default_when_no_headers():
 
     delay = llm._parse_retry_after(FakeExc())
     assert delay == llm._DEFAULT_RETRY_AFTER_S
+
+
+# ---------------------------------------------------------------------------
+# JSON-mode gating — openrouter/free dispatches to a grab-bag of free models,
+# some of which reject response_format. The rest of these tests lock in which
+# model ids get JSON mode and which go text-mode.
+# ---------------------------------------------------------------------------
+
+
+class _CaptureClient:
+    """Minimal stub for OpenAI client — records the kwargs of the last .create() call
+    and returns a canned JSON response so call_llm_json completes successfully."""
+
+    def __init__(self):
+        self.last_kwargs: dict | None = None
+        outer = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                outer.last_kwargs = kwargs
+
+                class _Msg:
+                    content = '{"ok": true}'
+
+                class _Choice:
+                    message = _Msg()
+                    finish_reason = "stop"
+
+                class _Resp:
+                    choices = [_Choice()]
+                    model = kwargs.get("model", "unknown")
+
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        self.chat = _Chat()
+
+
+def test_openrouter_free_does_not_request_json_mode(monkeypatch):
+    # The free router fails on models that don't support response_format, so
+    # we drop the param up front and rely on text-mode JSON parsing.
+    client = _CaptureClient()
+    monkeypatch.setattr(llm, "_client_for_model", lambda m: client)
+    monkeypatch.setattr(llm, "_is_model_dead", lambda m: False)
+
+    result = llm.call_llm_json("Return JSON.", model="openrouter/free")
+    assert result == {"ok": True}
+    assert client.last_kwargs is not None
+    assert "response_format" not in client.last_kwargs
+    # require_parameters is gated on use_json_mode, so no extra_body either.
+    assert "extra_body" not in client.last_kwargs
+
+
+def test_openrouter_pinned_free_model_still_uses_json_mode(monkeypatch):
+    # Guard against over-broad gating: pinned `:free` slugs route to one known
+    # provider whose JSON-mode support we've vetted when we added it.
+    client = _CaptureClient()
+    monkeypatch.setattr(llm, "_client_for_model", lambda m: client)
+    monkeypatch.setattr(llm, "_is_model_dead", lambda m: False)
+
+    result = llm.call_llm_json(
+        "Return JSON.", model="deepseek/deepseek-chat-v3-0324:free"
+    )
+    assert result == {"ok": True}
+    assert client.last_kwargs is not None
+    assert client.last_kwargs.get("response_format") == {"type": "json_object"}
+    # OpenRouter models also get the require_parameters hint.
+    assert client.last_kwargs.get("extra_body") == {
+        "provider": {"require_parameters": True}
+    }
+
+
+def test_google_model_still_uses_json_mode(monkeypatch):
+    # Gemini 2.5 family fully supports response_format — no reason to drop it.
+    client = _CaptureClient()
+    monkeypatch.setattr(llm, "_client_for_model", lambda m: client)
+    monkeypatch.setattr(llm, "_is_model_dead", lambda m: False)
+
+    result = llm.call_llm_json("Return JSON.", model="gemini-2.5-flash")
+    assert result == {"ok": True}
+    assert client.last_kwargs is not None
+    assert client.last_kwargs.get("response_format") == {"type": "json_object"}
+    # Google models get no extra_body (no OpenRouter-specific hints).
+    assert "extra_body" not in client.last_kwargs
+
+
+def test_json_mode_unsupported_detects_gemma_phrasing(monkeypatch):
+    # Safety net for the detection pattern: if someone re-enables JSON mode
+    # on `openrouter/free` and hits gemma, the in-loop retry must fire.
+    class _FailingCompletions:
+        def create(self, **kwargs):
+            raise RuntimeError(
+                "Error code: 400 - JSON mode is not enabled for "
+                "models/gemma-3-4b-it"
+            )
+
+    class _FailingChat:
+        completions = _FailingCompletions()
+
+    class FailingClient:
+        chat = _FailingChat()
+
+    # Skip the rate limiter in this test — we're only exercising error
+    # classification, not pacing behavior.
+    monkeypatch.setattr(llm._rate_limiter, "wait_if_needed", lambda m: None)
+
+    parsed, status = llm._try_once(
+        client=FailingClient(),
+        model="openrouter/free",
+        messages=[{"role": "user", "content": "x"}],
+        temperature=0.0,
+        use_json_mode=True,
+    )
+    assert parsed is None
+    assert status == "json_mode_unsupported"
