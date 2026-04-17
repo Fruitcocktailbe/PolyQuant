@@ -59,7 +59,10 @@ _MODEL_RPM: dict[str, int] = {
 _DEFAULT_RPM = 5  # Conservative fallback for unknown models
 _RPM_SAFETY_MARGIN = 1.15  # Pad the interval by 15% to account for clock skew / request overhead
 _DEFAULT_RETRY_AFTER_S = 60.0  # If 429 lacks Retry-After, wait one full minute
-_MAX_BLOCK_SKIP_S = 120.0  # Skip a model in the fallback chain if it's blocked this long or more
+# Any block longer than this makes the chain jump to the next unblocked
+# fallback (when one exists). Kept small — even 10s of Gemini sleep wastes
+# meaningful throughput when 5 OpenRouter fallbacks are idle and ready.
+_MAX_BLOCK_SKIP_S = 5.0
 
 
 def _is_openrouter_model(model: str) -> bool:
@@ -135,6 +138,32 @@ class _RateLimiter:
 
 
 _rate_limiter = _RateLimiter()
+
+
+# Models that returned a permanent error (typically 404 "no endpoints found"
+# on OpenRouter when we pin to a stale/deprecated id). Populated at runtime
+# inside _try_once; read by call_llm_json when building the per-call chain.
+# Module-global so the state persists across calls in the same process.
+_permanently_dead_models: set[str] = set()
+_dead_models_lock = threading.Lock()
+
+
+def _mark_model_dead(model: str, reason: str) -> None:
+    with _dead_models_lock:
+        if model not in _permanently_dead_models:
+            _permanently_dead_models.add(model)
+            logger.warning(
+                "Marking model permanently dead for the rest of this run",
+                model=model,
+                reason=reason,
+                hint="Fix the id in config.llm_fallback_models "
+                "(check https://openrouter.ai/models for current :free ids).",
+            )
+
+
+def _is_model_dead(model: str) -> bool:
+    with _dead_models_lock:
+        return model in _permanently_dead_models
 
 
 def _parse_retry_after(exc: Exception) -> float:
@@ -333,6 +362,7 @@ def _try_once(
         "truncated"    — finish_reason="length"; response cut off, do not parse
         "rate_limit"   — 429 from upstream (caller should back off)
         "json_mode_unsupported" — model rejected response_format; caller should retry without it
+        "model_dead"   — 404 / "no endpoints" / invalid-model — permanently unavailable this run
         "error"        — any other exception
     """
     # Proactive per-model pacing: sleep until we're inside the RPM budget.
@@ -360,10 +390,28 @@ def _try_once(
                 retry_after_s=retry_after,
             )
             return None, "rate_limit"
+        # Permanent model errors — 404 / "no endpoints found" / "invalid model".
+        # These typically mean the id in our fallback list is deprecated or
+        # wrong; retrying will never succeed. Mark the model dead so future
+        # call chains skip it immediately.
+        lowered = error_str.lower()
+        if (
+            "404" in error_str
+            or "no endpoints" in lowered
+            or "invalid model" in lowered
+            or "model not found" in lowered
+            or "model_not_found" in lowered
+        ):
+            _mark_model_dead(model, reason=error_str[:200])
+            logger.error(
+                "LLM model unavailable (permanent) — skipping for rest of run",
+                error=error_str,
+                model=model,
+            )
+            return None, "model_dead"
         # Some free models reject response_format — detect and signal retry.
         # Match only on the parameter name itself to avoid false positives on
         # generic "not supported" errors unrelated to JSON mode.
-        lowered = error_str.lower()
         if use_json_mode and (
             "response_format" in lowered
             or "json_object" in lowered
@@ -484,10 +532,16 @@ def call_llm_json(
 
     # Filter out any model whose provider isn't configured. OpenRouter models
     # are silently dropped when no OPENROUTER_API_KEY is set — the user can
-    # add the key later without any other changes.
+    # add the key later without any other changes. Also drop any model that
+    # was marked permanently dead earlier in the run (stale id / 404 /
+    # "no endpoints found") so we never waste another round trip on it.
     model_chain: list[str] = []
     dropped_no_provider: list[str] = []
+    dropped_dead: list[str] = []
     for candidate in raw_chain:
+        if _is_model_dead(candidate):
+            dropped_dead.append(candidate)
+            continue
         if _client_for_model(candidate) is not None:
             model_chain.append(candidate)
         else:
@@ -496,6 +550,11 @@ def call_llm_json(
         logger.debug(
             "Skipped models with no configured provider key",
             skipped=dropped_no_provider,
+        )
+    if dropped_dead:
+        logger.debug(
+            "Skipped models marked permanently dead this run",
+            skipped=dropped_dead,
         )
     if not model_chain:
         logger.warning(
@@ -518,26 +577,37 @@ def call_llm_json(
     messages = [{"role": "user", "content": full_prompt}]
     prompt_chars = len(full_prompt)
 
-    max_retries = 2  # Per-model retries for rate-limit / json-mode quirks
+    # Per-model retries are only useful for `json_mode_unsupported` (retry
+    # without response_format) — 429 drops immediately to the next model now
+    # because the old "sleep 60s mid-chain then retry" behaviour was wasting
+    # minutes per call when multiple fallbacks were ready.
+    max_retries = 2
     last_failure_was_rate_limit = False
 
     for model_idx, candidate_model in enumerate(model_chain):
         is_fallback = model_idx > 0
 
-        # Skip any model that's 429-blocked for longer than we're willing to wait
-        # on a sibling. Sibling models share the same account quota, so there's
-        # rarely any point in cross-falling-back when the block is short.
+        # Skip any currently-blocked model when a later fallback is ready. This
+        # matters for the primary too, not just fallbacks — if Google's daily
+        # quota is exhausted (blocked 60s+) and OpenRouter is idle, we should
+        # jump straight to OpenRouter instead of sleeping for 60s of pacing.
         block_s = _rate_limiter.blocked_for(candidate_model)
-        if is_fallback and block_s > _MAX_BLOCK_SKIP_S:
-            print(
-                f"--- ⏭️  LLM SKIP: {candidate_model} | blocked for {block_s:.0f}s ---"
+        if block_s > _MAX_BLOCK_SKIP_S:
+            later_ready = any(
+                _rate_limiter.blocked_for(later) <= _MAX_BLOCK_SKIP_S
+                for later in model_chain[model_idx + 1 :]
             )
-            logger.info(
-                "Skipping fallback model — still rate-limited",
-                model=candidate_model,
-                block_s=block_s,
-            )
-            continue
+            if later_ready:
+                print(
+                    f"--- ⏭️  LLM SKIP: {candidate_model} | blocked for "
+                    f"{block_s:.0f}s; jumping to unblocked fallback ---"
+                )
+                logger.info(
+                    "Skipping blocked model — fallback available",
+                    model=candidate_model,
+                    block_s=block_s,
+                )
+                continue
 
         # Resolve the right client for this model — Google AI Studio or
         # OpenRouter — from the shared cached factories. The chain-building
@@ -555,7 +625,6 @@ def call_llm_json(
         print(f"\n--- {prefix}: {candidate_model} | Prompt: {prompt_chars:,} chars ---")
         t0 = time.time()
         use_json_mode = True
-        last_failure_was_rate_limit = False
 
         for attempt in range(max_retries):
             parsed, status = _try_once(
@@ -574,20 +643,24 @@ def call_llm_json(
             if status == "rate_limit":
                 last_failure_was_rate_limit = True
                 block_s = _rate_limiter.blocked_for(candidate_model)
-                # Only retry the same model if the block will clear quickly.
-                # Otherwise drop through: siblings are likely blocked too, but
-                # we still give them one shot further down the chain.
-                if attempt < max_retries - 1 and 0 < block_s <= _MAX_BLOCK_SKIP_S:
-                    print(
-                        f"--- ⚠️  LLM RATE LIMITED (429) | {candidate_model} | "
-                        f"waiting {block_s:.0f}s (retry {attempt + 1}/{max_retries}) ---\n"
-                    )
-                    time.sleep(block_s)
-                    continue
                 elapsed = time.time() - t0
+                # Don't waste 60s sleeping on the SAME model when 5 fallbacks
+                # are waiting — jump straight to the next candidate. The block
+                # persists in the rate-limiter so the chain-level skip above
+                # will automatically route around this model on the next call.
                 print(
                     f"--- ❌ LLM RATE LIMITED [{elapsed:.1f}s] | {candidate_model} | "
-                    f"block={block_s:.0f}s ---\n"
+                    f"block={block_s:.0f}s — trying next fallback ---\n"
+                )
+                break
+
+            if status == "model_dead":
+                # Model is permanently unavailable (404 / stale id). Dead-list
+                # is now populated; future calls will skip it at chain build.
+                elapsed = time.time() - t0
+                print(
+                    f"--- 🚫 LLM DEAD [{elapsed:.1f}s] | {candidate_model} | "
+                    f"removed from fallback chain for this run ---\n"
                 )
                 break
 
@@ -603,9 +676,22 @@ def call_llm_json(
             )
             break
 
-    logger.error(
-        "All LLM models exhausted",
-        models_tried=model_chain,
-        last_failure_was_rate_limit=last_failure_was_rate_limit,
-    )
+    if last_failure_was_rate_limit:
+        # Every provider returned 429. Most likely the user has burned the
+        # free-tier daily cap on both Google AI Studio and OpenRouter. Give a
+        # concrete next step instead of just "exhausted".
+        logger.error(
+            "All LLM providers rate-limited. Likely daily quota exhausted on "
+            "Google AI Studio AND OpenRouter. Options: (a) wait for quota "
+            "reset (~midnight Pacific for Google), (b) deposit $10 one-time "
+            "at openrouter.ai/credits to lift the 50/day cap to 1000/day, "
+            "(c) add more providers (Groq, Cerebras) to llm_fallback_models.",
+            models_tried=model_chain,
+        )
+    else:
+        logger.error(
+            "All LLM models exhausted",
+            models_tried=model_chain,
+            last_failure_was_rate_limit=last_failure_was_rate_limit,
+        )
     return None

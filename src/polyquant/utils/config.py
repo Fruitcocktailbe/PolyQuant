@@ -544,8 +544,12 @@ class PolyQuantConfig(BaseSettings):
             # independent quota. Only invoked when openrouter_api_key is set;
             # otherwise llm_client silently skips them. Models are identified
             # by the "/" in their id (OpenRouter format: provider/model:tag).
-            # Ordered by a mix of quality and reliability on JSON output.
-            "deepseek/deepseek-chat-v3-0324:free",
+            # OpenRouter's catalog rotates — if a 404 "no endpoints found"
+            # appears in logs, the id has been deprecated; update here. List
+            # any-time-current ids first. Check https://openrouter.ai/models
+            # filtered by ":free" for live options.
+            "deepseek/deepseek-chat:free",
+            "deepseek/deepseek-r1:free",
             "meta-llama/llama-3.3-70b-instruct:free",
             "google/gemini-2.0-flash-exp:free",
             "qwen/qwen-2.5-72b-instruct:free",
@@ -556,7 +560,8 @@ class PolyQuantConfig(BaseSettings):
             "rate-limited. Ordered by free-tier quota headroom. Google models "
             "come first (fastest when quota available); OpenRouter free "
             "models come after (kick in when Google's daily quota is "
-            "exhausted — requires openrouter_api_key)."
+            "exhausted — requires openrouter_api_key). On 404 'no endpoints "
+            "found' a model is dead-listed for the rest of the run."
         )
     )
 
