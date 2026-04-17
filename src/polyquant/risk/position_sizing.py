@@ -327,14 +327,20 @@ class PositionSizer:
         max_t = min(max_total_exposure, max_single_trade_exposure)
         
         # 2. Liquidity constraints (bottleneck detection) with adaptive depth caps.
-        # Illiquid legs (< $1k depth) get a smaller slice because unwind slippage is
-        # nonlinear in size; liquid legs (> $10k depth) can take a larger slice.
+        # `self.limits.max_orderbook_depth_pct` is the baseline the caller asked for;
+        # adaptive tiering adjusts around it: illiquid legs (<$1k depth) get a tighter
+        # cushion because unwind slippage is nonlinear in size, liquid legs (>$10k
+        # depth) can take a larger slice. Δ=0.2 matches historical config defaults
+        # (baseline 0.5 → illiquid 0.3 / liquid 0.7). Clamped to [0.05, 0.95].
+        _ADAPTIVE_DELTA = 0.2
+        base_cap = self.limits.max_orderbook_depth_pct
+
         def _pick_depth_cap(depth_i: float) -> float:
             if depth_i >= 10_000.0:
-                return config.orderbook_depth_cap_liquid
+                return min(0.95, base_cap + _ADAPTIVE_DELTA)
             if depth_i <= 1_000.0:
-                return config.orderbook_depth_cap_illiquid
-            return config.orderbook_depth_cap
+                return max(0.05, base_cap - _ADAPTIVE_DELTA)
+            return base_cap
 
         # stake_i = T * (p_i / sum_implied)
         # We require stake_i <= depth_i * cap  =>  T <= (depth_i * cap * sum_implied) / p_i

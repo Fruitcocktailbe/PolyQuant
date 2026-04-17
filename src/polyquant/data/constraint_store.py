@@ -44,9 +44,31 @@ logger = get_logger(__name__)
 # `correlations` field was dropped from the manifest schema (Navigator runs
 # its own CorrelationEngine live and never read the persisted field). Bumped
 # from "1.2" → "1.3" when token_labels/market_urls lookups were added for the
-# dashboard's human-readable constraint view. Older manifests are
-# auto-quarantined on load.
-CURRENT_MANIFEST_VERSION = "1.3"
+# dashboard's human-readable constraint view. Bumped from "1.3" → "1.4" when
+# `cluster_type` was promoted to a first-class field so downstream consumers
+# (Navigator, dashboard, report) can filter/group by cluster class without
+# parsing cluster_id prefixes. Older manifests are auto-quarantined on load.
+CURRENT_MANIFEST_VERSION = "1.4"
+
+
+def _infer_cluster_type(cluster_id: str) -> str:
+    """Backfill cluster_type for pre-v1.4 manifests from the cluster_id prefix.
+
+    Used on load when the persisted field is empty so downstream consumers
+    never see a blank `cluster_type` for a valid-but-legacy manifest.
+    """
+    if not cluster_id:
+        return ""
+    # Order matters: longer-prefix matches take precedence.
+    if cluster_id.startswith("cross_event_"):
+        return "cross_event_logical"
+    if cluster_id.startswith("cross_market_") or cluster_id.startswith("cross_"):
+        return "cross_market_partition"
+    if cluster_id.startswith("negrisk_"):
+        return "negrisk"
+    if cluster_id.startswith("limitless_native_") or cluster_id.startswith("native_"):
+        return "native_partition"
+    return "llm_analysis"
 
 # Manifests older than this are deleted on startup. Stale manifests reference
 # markets that have likely resolved or moved, so keeping them around just
@@ -128,6 +150,11 @@ class ConstraintManifest(BaseModel):
     """
     cluster_id: str
     source_cluster_id: str = ""  # original cluster before per-constraint split
+    # v1.4 discriminator — one of: "negrisk", "native_partition",
+    # "cross_market_partition", "llm_analysis", "cross_event_logical",
+    # "cross_exchange_pair", or "" for pre-v1.4 manifests loaded from disk
+    # (callers can backfill from cluster_id prefix if needed).
+    cluster_type: str = ""
     topic: str = ""
     market_ids: list[str] = Field(default_factory=list)
     market_exchanges: dict[str, str] = Field(default_factory=dict)  # market_id -> exchange
@@ -277,6 +304,7 @@ class ConstraintStore:
             sub = ConstraintManifest(
                 cluster_id=constraint.constraint_id,
                 source_cluster_id=manifest.cluster_id,
+                cluster_type=manifest.cluster_type,
                 topic=manifest.topic,
                 market_ids=sub_market_ids,
                 market_exchanges={
@@ -386,6 +414,13 @@ class ConstraintStore:
         try:
             data = json.loads(file_path.read_text())
             manifest = ConstraintManifest.model_validate(data)
+            # v1.4 backfill: legacy manifests (pre-v1.4) stored cluster type
+            # implicitly in the cluster_id prefix. Fill it in on load so the
+            # rest of the system never needs to parse cluster_id strings.
+            if not manifest.cluster_type:
+                manifest.cluster_type = _infer_cluster_type(
+                    manifest.source_cluster_id or manifest.cluster_id
+                )
             
             logger.debug(
                 "Loaded constraint manifest",
@@ -480,6 +515,12 @@ class ConstraintStore:
 
                 data = json.loads(content)
                 manifest = ConstraintManifest.model_validate(data)
+                # v1.4 backfill: legacy manifests stored cluster type
+                # implicitly in the cluster_id prefix.
+                if not manifest.cluster_type:
+                    manifest.cluster_type = _infer_cluster_type(
+                        manifest.source_cluster_id or manifest.cluster_id
+                    )
                 return manifest
 
             except Exception as e:

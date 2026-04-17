@@ -58,6 +58,88 @@ from polyquant.utils import config, get_logger
 logger = get_logger(__name__)
 
 
+def _is_partition_shape(constraint: LogicalConstraint) -> bool:
+    """A constraint is treated as partition-shaped when every coefficient is
+    +1.0 (within float noise) and the RHS is close to 1.0. This covers the
+    structural family the architect is most likely to hallucinate members
+    into — NegRisk sums, native partitions, cross-market partitions."""
+    if not constraint.coefficients:
+        return False
+    if abs(constraint.rhs - 1.0) > 0.05:
+        return False
+    return all(abs(c - 1.0) < 1e-6 for c in constraint.coefficients.values())
+
+
+def _expected_partition_tokens(cluster: Any) -> set[str]:
+    """Derive the authoritative token set for a cluster's partition shape.
+
+    For binary polar markets (YES/NO labelled), a partition sum ranges over
+    YES legs only — mirroring `build_partition_constraint`. For non-polar
+    multi-outcome markets (native partitions), all outcome tokens participate.
+    Returns an empty set when the cluster isn't amenable to this check
+    (e.g. LLM-only cross-event clusters where the architect is the authority).
+    """
+    if cluster is None:
+        return set()
+
+    from polyquant.utils.market_utils import (
+        get_yes_outcome,
+        has_binary_polarity,
+    )
+
+    source = getattr(cluster, "constraint_source", "")
+    markets = getattr(cluster, "markets", []) or []
+    expected: set[str] = set()
+
+    if source == "native_partition" and len(markets) == 1:
+        for outcome in markets[0].outcomes:
+            token = outcome.token_id or outcome.outcome_id
+            if token:
+                expected.add(token)
+        return expected
+
+    # NegRisk / cross_market_partition / cross_event clusters: sum-to-1 over
+    # the YES leg of each polar market in the cluster.
+    for m in markets:
+        if not has_binary_polarity(m):
+            continue
+        yes = get_yes_outcome(m)
+        if yes is None:
+            continue
+        token = yes.token_id or yes.outcome_id
+        if token:
+            expected.add(token)
+    return expected
+
+
+def _deterministic_partition_check(
+    constraint: LogicalConstraint,
+    expected_tokens: set[str],
+) -> str | None:
+    """If `constraint` is partition-shaped, assert its coefficient set matches
+    `expected_tokens` exactly. Returns a failure reason string, or None when
+    the check passes or does not apply.
+
+    Catches two hallucination modes:
+    - LLM invents a token id that isn't in the cluster (phantom member).
+    - LLM omits a market from a NegRisk group, leaving the sum short.
+    """
+    if not _is_partition_shape(constraint):
+        return None
+    actual_tokens = set(constraint.coefficients.keys())
+    phantom = actual_tokens - expected_tokens
+    missing = expected_tokens - actual_tokens
+    if phantom:
+        return f"phantom_tokens={sorted(phantom)[:3]}"
+    if missing:
+        # Some architect outputs legitimately drop low-volume NegRisk legs. We
+        # only flag when more than one is missing — a single drop is within
+        # the cleanup behaviour we expect.
+        if len(missing) > 1:
+            return f"missing_tokens={sorted(missing)[:3]}"
+    return None
+
+
 class ValidationIssue(BaseModel):
     """
     Represents an issue found during validation.
@@ -220,21 +302,33 @@ Be thorough and conservative. Flag anything that could cause issues."""
         """Async context manager - cleanup."""
         pass
     
-    async def validate(self, analysis: AnalysisResult) -> ValidatedResult:
+    async def validate(
+        self,
+        analysis: AnalysisResult,
+        *,
+        cluster: Any = None,
+    ) -> ValidatedResult:
         """
         Validate an analysis result from the Logic Architect.
-        
+
         This is the main entry point. It performs multiple validation
         passes and aggregates the results.
-        
+
         Validation Passes:
-        1. Mathematical consistency check
-        2. Edge case detection
-        3. Confidence calibration
-        
+        1. Deterministic partition-shape check (when the originating cluster
+           is provided — catches hallucinated membership without an LLM call)
+        2. Mathematical consistency check (LLM)
+        3. Edge case detection (LLM)
+        4. Confidence calibration
+
         Args:
             analysis: AnalysisResult from the Logic Architect
-            
+            cluster: Optional MarketCluster the analysis came from. When
+                supplied, enables the deterministic partition-shape check
+                that rejects constraints whose token set doesn't match the
+                cluster's actual outcomes. Kept optional for back-compat
+                with callers that only have the AnalysisResult.
+
         Returns:
             ValidatedResult with validation status and any issues
         """
@@ -247,17 +341,42 @@ Be thorough and conservative. Flag anything that could cause issues."""
                 validated_constraints=analysis.constraints,
                 validation_notes="No-LLM mode: Validation skipped."
             )
-        
+
         logger.info(
             "Validating analysis",
             cluster_id=analysis.cluster_id,
             dependency_count=len(analysis.dependencies),
             constraint_count=len(analysis.constraints),
         )
-        
+
+        # Deterministic partition-shape pass. Runs before the LLM call so we
+        # can short-circuit without burning quota when the architect clearly
+        # hallucinated a partition member set.
+        expected_tokens = _expected_partition_tokens(cluster) if cluster else set()
+        deterministic_issues: list[ValidationIssue] = []
+        if expected_tokens:
+            for cons in analysis.constraints:
+                reason = _deterministic_partition_check(cons, expected_tokens)
+                if reason:
+                    deterministic_issues.append(
+                        ValidationIssue(
+                            severity="error",
+                            category="consistency",
+                            description=(
+                                "Partition-shape constraint failed "
+                                f"deterministic token-set check ({reason})."
+                            ),
+                            affected_constraints=[cons.constraint_id],
+                            suggested_fix=(
+                                "Re-run architect; coefficient keys must "
+                                "match the cluster's outcome tokens exactly."
+                            ),
+                        )
+                    )
+
         # Format the analysis for the prompt
         analysis_text = self._format_analysis(analysis)
-        
+
         try:
             # Call Gemini for validation
             response = await self._call_gemini(analysis_text)
@@ -276,14 +395,31 @@ Be thorough and conservative. Flag anything that could cause issues."""
                     )
                 ],
             )
-        
+
+        # Merge deterministic findings in and drop any constraints they
+        # flagged — they override the LLM verdict because they're structural
+        # facts, not model output.
+        if deterministic_issues:
+            blocked_ids = {
+                cid
+                for issue in deterministic_issues
+                for cid in issue.affected_constraints
+            }
+            result.issues = list(result.issues) + deterministic_issues
+            result.validated_constraints = [
+                c for c in result.validated_constraints
+                if c.constraint_id not in blocked_ids
+            ]
+            result.is_valid = len(result.validated_constraints) > 0
+
         logger.info(
             "Validation complete",
             is_valid=result.is_valid,
             error_count=result.error_count,
             warning_count=result.warning_count,
+            deterministic_rejections=len(deterministic_issues),
         )
-        
+
         return result
     
     async def validate_single_constraint(

@@ -59,16 +59,20 @@ _MIN_OUTCOME_VOLUME = 100
 
 def _native_partition_cluster(market: Market) -> "MarketCluster | None":
     """
-    Build a native-partition cluster for a single multi-outcome market whose
-    outcomes don't follow YES/NO naming (e.g. "Trump wins / Trump loses", or
-    N-way outcomes like "Liverpool / City / Arsenal / ...").
+    Build a native-partition cluster for a single market whose outcome set is
+    intrinsically exhaustive (the outcomes are the whole event space by
+    definition). Works for both polar YES/NO binaries (YES + NO = 1 by CTF
+    split/merge mechanics) and non-polar multi-outcome markets ("Trump wins /
+    Trump loses", N-way sports, etc.).
 
-    These are treated as intrinsically exhaustive (the outcomes are the
-    market's whole event space by definition) and are tagged so map_maker's
-    mechanical bypass persists them without an LLM call.
+    These clusters are tagged `constraint_source="native_partition"` so
+    map_maker's mechanical bypass persists them without an LLM call. For
+    binary markets this gives the solver an explicit `YES + NO = 1` identity
+    that lets it exploit intra-market YES + NO < $1 arb (rare but real).
 
     Returns None if the market has fewer than 2 live outcomes, or if it looks
-    like a degenerate single-outcome event.
+    like a degenerate single-outcome event, or if volume is below the phantom
+    floor.
     """
     if not market.outcomes or len(market.outcomes) < 2:
         return None
@@ -228,7 +232,13 @@ The YES Price is the current market probability (0.00 to 1.00).
         self._polymarket: PolymarketClient | None = None
         self._llm_available = False
         self._processed_markets: set[str] = set()
-        
+        # Per-run telemetry — map_maker reads these when assembling its
+        # end-of-run report. Updated by scan_markets() on every call.
+        self.last_tag_skip_counts: dict[str, int] = {}
+        self.last_standalone_binary_count: int = 0
+        self.last_limitless_discovery_stats: dict[str, int] = {}
+        self.last_cross_event_cluster_count: int = 0
+
         logger.info("DiscoveryAgent initialized")
     
     async def __aenter__(self) -> "DiscoveryAgent":
@@ -368,11 +378,21 @@ The YES Price is the current market probability (0.00 to 1.00).
         skipped_by_memory = 0
         skipped_by_cache = 0
 
+        # Gap 4: case-insensitive excluded-tag filter. Build once per run so
+        # the per-event check is an O(1) set intersection. `skipped_by_tag`
+        # tallies per-tag drops for the report.
+        excluded_tags_lc: set[str] = {t.strip().lower() for t in (config.excluded_tags or []) if t}
+        skipped_by_tag: dict[str, int] = {}
+        # Market-id → event tag labels (original casing). Threaded into
+        # partition_detector's Layer 1 so tag-sharing markets group tighter.
+        market_tag_map: dict[str, list[str]] = {}
+
         for event in events:
             event_id = event["event_id"]
             event_title = event["title"]
             markets: list[Market] = event["markets"]
             neg_risk_id = event.get("neg_risk_market_id")
+            event_tags: list[str] = event.get("tags", []) or []
 
             # Skip already-processed events
             if skip_processed and event_id in self._processed_markets:
@@ -384,6 +404,28 @@ The YES Price is the current market probability (0.00 to 1.00).
                 self._processed_markets.add(event_id)
                 skipped_by_cache += 1
                 continue
+
+            # Gap 4: skip events whose tag set intersects excluded_tags.
+            if excluded_tags_lc:
+                event_tags_lc = {t.strip().lower() for t in event_tags if t}
+                hit = event_tags_lc & excluded_tags_lc
+                if hit:
+                    for tag in hit:
+                        skipped_by_tag[tag] = skipped_by_tag.get(tag, 0) + 1
+                    continue
+
+            # Populate the tag map for every market we're about to process so
+            # downstream partition_detector can use tag priors.
+            for _m in markets:
+                market_tag_map[_m.market_id] = list(event_tags)
+
+            # Drop already-resolved markets before any other filtering. The
+            # /events endpoint occasionally returns markets with closed=True
+            # that haven't been purged from the active set yet. Keeping them
+            # wastes LLM budget on constraints the Navigator would refuse to
+            # trade anyway, and the settled prices can distort deviation
+            # signals (price "sums" far away from 1.0 that aren't real arbs).
+            markets = [m for m in markets if not getattr(m, "resolved", False)]
 
             # Filter zombie markets (extreme prices)
             valid_markets = [m for m in markets if not self._is_zombie_market(m)]
@@ -495,12 +537,17 @@ The YES Price is the current market probability (0.00 to 1.00).
                 })
         
         auto_cluster_count = len(clusters)
-        events_processed = len(events) - skipped_by_memory - skipped_by_cache
+        skipped_by_tag_total = sum(skipped_by_tag.values())
+        events_processed = (
+            len(events) - skipped_by_memory - skipped_by_cache - skipped_by_tag_total
+        )
         logger.info(
             "Phase 2 cache-skip summary",
             events_fetched=len(events),
             skipped_by_memory=skipped_by_memory,
             skipped_by_cache=skipped_by_cache,
+            skipped_by_tag=skipped_by_tag_total,
+            skipped_by_tag_breakdown=dict(skipped_by_tag) if skipped_by_tag else None,
             events_processed=events_processed,
             hint=(
                 "Use --force to bypass the 24h event-processed cache"
@@ -541,7 +588,7 @@ The YES Price is the current market probability (0.00 to 1.00).
         if residual_polar:
             from polyquant.agents.partition_detector import detect_cross_market_partitions
             cross_clusters = await detect_cross_market_partitions(
-                residual_polar, constraint_store
+                residual_polar, constraint_store, tag_map=market_tag_map
             )
             for c in cross_clusters:
                 clusters.append(c)
@@ -553,6 +600,127 @@ The YES Price is the current market probability (0.00 to 1.00).
                     new_clusters=len(cross_clusters),
                     markets_consumed=len(cross_clustered_ids),
                 )
+
+        # ── Phase 2d: standalone binary YES/NO partition emission (Gap 3) ──
+        # Every binary YES/NO market not absorbed by NegRisk (2a) or cross-market
+        # partition detection (2c) gets its own trivial `native_partition` cluster
+        # encoding the CTF-mechanical identity YES + NO = 1. Gives the solver an
+        # explicit structural constraint for intra-market YES + NO < $1 arb
+        # (rare but legitimate) and costs zero LLM quota since it routes through
+        # map_maker's mechanical bypass.
+        standalone_binary_count = 0
+        for ev in events_for_llm:
+            for m in ev["markets"]:
+                if m.market_id in auto_clustered_market_ids:
+                    continue
+                if m.market_id in cross_clustered_ids:
+                    continue
+                if not has_binary_polarity(m):
+                    continue
+                binary_cluster = _native_partition_cluster(m)
+                if binary_cluster is None:
+                    continue
+                clusters.append(binary_cluster)
+                auto_clustered_market_ids.add(m.market_id)
+                standalone_binary_count += 1
+        if standalone_binary_count:
+            logger.info(
+                "Phase 2d: emitted standalone binary native_partition clusters",
+                clusters=standalone_binary_count,
+            )
+        self.last_standalone_binary_count = standalone_binary_count
+        self.last_tag_skip_counts = dict(skipped_by_tag)
+
+        # ── Phase 2d.25: conditional-parent clustering ──
+        # Polymarket's conditional markets have a parent_market_id whose
+        # outcome must resolve YES for the child to pay out. That imposes
+        # P(child) <= P(parent) as a hard structural constraint. Cluster
+        # by parent_id and emit SUBSET constraints deterministically — the
+        # LLM path was never primed for this shape and silently missed it.
+        from polyquant.agents.ladder_detector import detect_conditional_subsets
+
+        conditional_candidates = [
+            m
+            for ev in events_for_llm
+            for m in ev["markets"]
+            if m.market_id not in auto_clustered_market_ids
+            and m.market_id not in cross_clustered_ids
+        ]
+        conditional_clusters = detect_conditional_subsets(conditional_candidates)
+        if conditional_clusters:
+            clusters.extend(conditional_clusters)
+            for cc in conditional_clusters:
+                for m in cc.markets:
+                    auto_clustered_market_ids.add(m.market_id)
+            logger.info(
+                "Phase 2d.25: emitted conditional-parent clusters",
+                clusters=len(conditional_clusters),
+            )
+
+        # ── Phase 2d.5: monotonic ladder detection ──
+        # Classic Polymarket structure: several binary YES/NO markets sharing a
+        # common question template but differing in a numeric threshold (e.g.
+        # "BTC >= $100k?" / ">= $120k?" / ">= $150k?"). Higher thresholds must
+        # imply lower ones, producing chained SUBSET inequalities the solver
+        # can exploit. Deterministic detection here replaces reliance on the
+        # LLM to spot ladders — otherwise a noisy LLM run silently drops the
+        # opportunity. Ladder clusters consume markets the same way NegRisk
+        # clusters do so they don't double-count in later phases.
+        from polyquant.agents.ladder_detector import detect_monotonic_ladders
+
+        ladder_candidates = [
+            m
+            for ev in events_for_llm
+            for m in ev["markets"]
+            if m.market_id not in auto_clustered_market_ids
+            and m.market_id not in cross_clustered_ids
+        ]
+        ladder_clusters = detect_monotonic_ladders(ladder_candidates)
+        if ladder_clusters:
+            clusters.extend(ladder_clusters)
+            for lc in ladder_clusters:
+                for m in lc.markets:
+                    auto_clustered_market_ids.add(m.market_id)
+            logger.info(
+                "Phase 2d.5: emitted monotonic ladder clusters",
+                clusters=len(ladder_clusters),
+                rung_total=sum(len(c.markets) for c in ladder_clusters),
+            )
+
+        # ── Phase 2e: cross-event logical clustering (Gap 1) ──
+        # Two strategies:
+        # * representative_top_k (legacy): pull top-K markets per mechanical
+        #   cluster and semantic-cluster only those — cheap but drops ~70% of
+        #   candidate pairs on the floor when top-3² is the visible universe.
+        # * all_pairs_ann (default): embed EVERY polar market and find
+        #   neighbours across cluster boundaries. Much better coverage for the
+        #   cost of one extra embedding pass per run.
+        cross_strategy = getattr(
+            config, "cross_event_pool_strategy", "representative_top_k"
+        )
+        if cross_strategy == "all_pairs_ann":
+            all_polar_for_ann: list[Market] = []
+            polar_seen: set[str] = set()
+            for c in clusters:
+                for m in c.markets:
+                    if not m.market_id or m.market_id in polar_seen:
+                        continue
+                    if not has_binary_polarity(m):
+                        continue
+                    polar_seen.add(m.market_id)
+                    all_polar_for_ann.append(m)
+            cross_event_clusters = self._build_cross_event_clusters_all_pairs(
+                all_polar_markets=all_polar_for_ann
+            )
+        else:
+            cross_event_clusters = self._build_cross_event_clusters(clusters)
+        if cross_event_clusters:
+            clusters.extend(cross_event_clusters)
+            logger.info(
+                "Phase 2e: emitted cross_event_logical clusters",
+                new_clusters=len(cross_event_clusters),
+            )
+        self.last_cross_event_cluster_count = len(cross_event_clusters)
 
         # ── Phase 3: LLM analysis for what's left after all mechanical paths ──
         if events_for_llm:
@@ -587,9 +755,363 @@ The YES Price is the current market probability (0.00 to 1.00).
             total_clusters=len(clusters),
             total_markets=sum(len(c.markets) for c in clusters),
         )
-        
+
         return clusters
-    
+
+    def _select_mechanical_cluster_representatives(
+        self,
+        clusters: list[MarketCluster],
+        k: int = 3,
+    ) -> list[tuple[MarketCluster, Market]]:
+        """Gap 1: top-K representative markets per mechanical cluster.
+
+        "Top-K" = highest-liquidity Polymarket markets in each mechanical
+        cluster (negrisk / native_partition / cross_market_partition). Returns
+        a list of (source_cluster, market) tuples so the caller can reason
+        about which event a representative came from.
+
+        Markets appearing in multiple mechanical clusters are de-duplicated by
+        market_id — the first cluster to pick them wins. Clusters with <2
+        markets (degenerate) are skipped entirely.
+        """
+        MECHANICAL_SOURCES = {
+            "negrisk", "native_partition", "cross_market_partition"
+        }
+        seen: set[str] = set()
+        reps: list[tuple[MarketCluster, Market]] = []
+        for cluster in clusters:
+            if cluster.constraint_source not in MECHANICAL_SOURCES:
+                continue
+            if len(cluster.markets) < 2:
+                continue
+            sorted_markets = sorted(
+                cluster.markets,
+                key=lambda m: (m.liquidity or 0.0),
+                reverse=True,
+            )
+            picked = 0
+            for m in sorted_markets:
+                if m.market_id in seen:
+                    continue
+                # Representative must have a resolvable YES leg so the
+                # cross-event constraint can coefficient it directly.
+                if not has_binary_polarity(m):
+                    continue
+                seen.add(m.market_id)
+                reps.append((cluster, m))
+                picked += 1
+                if picked >= k:
+                    break
+        return reps
+
+    def _build_cross_event_clusters_all_pairs(
+        self,
+        *,
+        all_polar_markets: list[Market],
+    ) -> list[MarketCluster]:
+        """Gap 1 (§2.4 upgrade): embed every polar market in scope and cluster
+        by semantic similarity across cluster boundaries.
+
+        Old path (representative_top_k) evaluated only K markets per mechanical
+        cluster — with K=3 on 50 clusters that's 150/500 markets considered,
+        dropping ~70% of candidate cross-event pairs on the floor. The all-
+        pairs approach embeds the full polar universe once (MiniLM, cheap),
+        builds a cosine-sim graph, and forms connected components above the
+        similarity threshold. Components whose members span ≥2 source events
+        become cross_event_logical clusters.
+
+        Returns [] when sentence-transformers is unavailable or fewer than 2
+        markets are eligible, matching the fallback behaviour of the legacy
+        top-K path.
+        """
+        if len(all_polar_markets) < 2:
+            return []
+
+        try:
+            from sentence_transformers import SentenceTransformer, util  # type: ignore
+        except Exception as e:
+            logger.info(
+                "All-pairs cross-event clustering skipped: sentence-transformers missing",
+                error=str(e),
+            )
+            return []
+
+        questions = [m.question for m in all_polar_markets]
+        try:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            embeddings = model.encode(questions, convert_to_tensor=True)
+            sim_matrix = util.cos_sim(embeddings, embeddings).cpu().numpy()
+        except Exception as e:
+            logger.warning("All-pairs cross-event embedding failed", error=str(e))
+            return []
+
+        threshold = config.cross_event_similarity_threshold
+        top_k = config.cross_event_all_pairs_top_k
+        n = len(all_polar_markets)
+
+        # Per-node top-K neighbours above threshold. Symmetric graph — we
+        # take the union of (i→j) and (j→i) edges.
+        adjacency: dict[int, set[int]] = {i: set() for i in range(n)}
+        import numpy as _np
+        for i in range(n):
+            row = sim_matrix[i].copy()
+            row[i] = -1.0  # drop self-edge
+            order = _np.argsort(row)[::-1][:top_k]
+            for j in order:
+                j_int = int(j)
+                if row[j_int] < threshold:
+                    break
+                adjacency[i].add(j_int)
+                adjacency[j_int].add(i)
+
+        # Union-find to extract connected components.
+        parent = list(range(n))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for i, neighbours in adjacency.items():
+            for j in neighbours:
+                _union(i, j)
+
+        components: dict[int, list[int]] = {}
+        for i in range(n):
+            components.setdefault(_find(i), []).append(i)
+
+        max_size = config.cross_event_max_cluster_size
+        cross_clusters: list[MarketCluster] = []
+        for root, idxs in components.items():
+            if len(idxs) < 2:
+                continue
+            # Keep the top-`max_size` markets in the component by liquidity
+            # so the LLM prompt stays bounded. Use market's liquidity field.
+            component_markets = [all_polar_markets[i] for i in idxs]
+            component_markets.sort(
+                key=lambda m: m.liquidity or 0.0, reverse=True
+            )
+            component_markets = component_markets[:max_size]
+            source_event_ids = {
+                (getattr(m, "event_slug", "") or m.market_id)
+                for m in component_markets
+            }
+            if len(source_event_ids) < 2:
+                # All in one event — not cross-event, skip.
+                continue
+            content = ",".join(sorted(m.market_id for m in component_markets))
+            cluster_hash = hashlib.sha1(content.encode()).hexdigest()[:16]
+            topic = (
+                f"[CROSS-EVENT-ANN] {component_markets[0].question[:60]} "
+                f"… (+{len(component_markets) - 1} more)"
+            )
+            cross_clusters.append(
+                MarketCluster(
+                    cluster_id=f"cross_event_ann_{cluster_hash}",
+                    topic=topic,
+                    markets=component_markets,
+                    potential_dependencies=[
+                        "[CROSS-EVENT-ANN] Markets semantically related across "
+                        "mechanical-cluster boundaries. LLM should look for "
+                        "SUBSET / MUTUALLY_EXCLUSIVE / COALITION relationships."
+                    ],
+                    constraint_source="cross_event_logical",
+                    is_exhaustive=False,
+                )
+            )
+        return cross_clusters
+
+    def _build_cross_event_clusters(
+        self,
+        clusters: list[MarketCluster],
+    ) -> list[MarketCluster]:
+        """Gap 1: semantic pre-cluster representatives drawn from *different*
+        mechanical clusters, emit one `cross_event_logical` cluster per
+        semantic group of size ≥2 whose members span ≥2 source events.
+
+        Returns [] if:
+        - sentence-transformers is unavailable (keeps map_maker resilient on
+          low-resource hosts)
+        - fewer than 2 representatives survive selection
+        - no semantic group spans >1 source event
+
+        The emitted cluster routes through LogicArchitect/Validator in map_maker
+        (NOT the mechanical bypass), so the LLM does the reasoning; the
+        `cluster_type` stamp makes it identifiable downstream.
+        """
+        k = config.cross_event_representatives_per_cluster
+        reps = self._select_mechanical_cluster_representatives(clusters, k=k)
+        if len(reps) < 2:
+            return []
+
+        try:
+            from sentence_transformers import SentenceTransformer, util  # type: ignore
+        except Exception as e:
+            logger.info(
+                "Cross-event pre-clustering skipped: sentence-transformers missing",
+                error=str(e),
+            )
+            return []
+
+        questions = [m.question for _, m in reps]
+        try:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            embeddings = model.encode(questions, convert_to_tensor=True)
+            sim_matrix = util.cos_sim(embeddings, embeddings).cpu().numpy()
+        except Exception as e:
+            logger.warning("Cross-event embedding failed", error=str(e))
+            return []
+
+        threshold = config.cross_event_similarity_threshold
+        visited: set[int] = set()
+        groups: list[list[int]] = []
+        for i in range(len(reps)):
+            if i in visited:
+                continue
+            group = [i]
+            visited.add(i)
+            for j in range(i + 1, len(reps)):
+                if j in visited:
+                    continue
+                if sim_matrix[i][j] >= threshold:
+                    group.append(j)
+                    visited.add(j)
+            if len(group) >= 2:
+                groups.append(group)
+
+        cross_clusters: list[MarketCluster] = []
+        for group in groups:
+            source_cluster_ids = {reps[i][0].cluster_id for i in group}
+            if len(source_cluster_ids) < 2:
+                # All reps from the same mechanical cluster — not cross-event.
+                continue
+            member_markets = [reps[i][1] for i in group]
+            topic = f"[CROSS-EVENT] {member_markets[0].question[:60]} … (+{len(member_markets) - 1} more)"
+            content = ",".join(sorted(m.market_id for m in member_markets))
+            cluster_hash = hashlib.sha1(content.encode()).hexdigest()[:16]
+            cross_clusters.append(
+                MarketCluster(
+                    cluster_id=f"cross_event_{cluster_hash}",
+                    topic=topic,
+                    markets=member_markets,
+                    potential_dependencies=[
+                        "[CROSS-EVENT] Representatives drawn from multiple mechanical "
+                        "clusters. LLM should look for SUBSET / MUTUALLY_EXCLUSIVE "
+                        "relationships BETWEEN events; partition constraints are "
+                        "already emitted upstream and must NOT be re-emitted."
+                    ],
+                    constraint_source="cross_event_logical",
+                    is_exhaustive=False,
+                )
+            )
+        return cross_clusters
+
+    async def discover_standalone_limitless_clusters(
+        self,
+        mapped_limitless_slugs: set[str],
+    ) -> list[MarketCluster]:
+        """
+        Gap 5b: emit `native_partition` clusters for standalone Limitless binary
+        markets not covered by cross-exchange matching.
+
+        `mapped_limitless_slugs` is the set of Limitless slugs that already
+        appear as aliases on Polymarket-anchored clusters (per the
+        ExchangeMatcher). Everything else in the active Limitless universe
+        above the liquidity floor gets its own YES+NO=1 cluster so the
+        solver can exploit pure-Limitless intra-market arb.
+
+        Returns [] if Limitless fetch fails — this path must never take
+        down the whole map build.
+        """
+        from polyquant.data.limitless_client import (
+            LimitlessClient,
+            limitless_market_to_market,
+        )
+
+        floor = config.min_liquidity_limitless_discovery
+        markets_raw: list[dict] = []
+        try:
+            async with LimitlessClient() as l_client:
+                markets_raw = await l_client.get_markets(limit=20)
+        except Exception as e:
+            logger.warning(
+                "Limitless-first discovery: fetch failed, skipping",
+                error=str(e),
+            )
+            return []
+
+        # Apply the floor here (Limitless API doesn't support server-side
+        # liquidity filtering) and drop anything already aliased to a
+        # Polymarket cluster via the ExchangeMatcher.
+        standalone_clusters: list[MarketCluster] = []
+        emitted_slugs: set[str] = set()
+        skipped_already_mapped = 0
+        skipped_below_floor = 0
+        skipped_parse_fail = 0
+
+        for raw in markets_raw:
+            slug = raw.get("slug")
+            if not isinstance(slug, str) or not slug:
+                continue
+            if slug in mapped_limitless_slugs:
+                skipped_already_mapped += 1
+                continue
+            try:
+                vol = float(raw.get("volumeFormatted") or raw.get("volume") or 0)
+                liq = float(raw.get("liquidityFormatted") or raw.get("liquidity") or 0)
+            except (TypeError, ValueError):
+                vol, liq = 0.0, 0.0
+            if vol > 1_000_000:
+                vol /= 1_000_000
+            if liq > 1_000_000:
+                liq /= 1_000_000
+            if max(vol, liq) < floor:
+                skipped_below_floor += 1
+                continue
+
+            market = limitless_market_to_market(raw)
+            if market is None:
+                skipped_parse_fail += 1
+                continue
+
+            cluster = _native_partition_cluster(market)
+            if cluster is None:
+                continue
+            # Distinguish from Polymarket native_partition clusters so the
+            # report (and future Navigator consumers) can filter by exchange.
+            cluster = cluster.model_copy(update={
+                "cluster_id": f"limitless_native_{market.market_id}",
+                "topic": f"[LIMITLESS-NATIVE] {market.question}",
+            })
+            standalone_clusters.append(cluster)
+            emitted_slugs.add(slug)
+
+        logger.info(
+            "Limitless-first discovery complete",
+            markets_fetched=len(markets_raw),
+            standalone_clusters=len(standalone_clusters),
+            skipped_already_mapped=skipped_already_mapped,
+            skipped_below_floor=skipped_below_floor,
+            skipped_parse_fail=skipped_parse_fail,
+            floor=floor,
+        )
+        # Expose on the agent so map_maker can pull counts for the report.
+        self.last_limitless_discovery_stats = {
+            "markets_fetched": len(markets_raw),
+            "standalone_clusters": len(standalone_clusters),
+            "skipped_already_mapped": skipped_already_mapped,
+            "skipped_below_floor": skipped_below_floor,
+            "skipped_parse_fail": skipped_parse_fail,
+            "floor": floor,
+        }
+        return standalone_clusters
+
     async def _cluster_markets(self, markets: list[Market]) -> list[MarketCluster]:
         """
         Use LLM (via OpenRouter) to cluster markets by topic.
@@ -840,8 +1362,6 @@ The YES Price is the current market probability (0.00 to 1.00).
             interval_seconds: Seconds between scans
             callback: Async function to call with new clusters
         """
-        import asyncio
-        
         logger.info(
             "Starting continuous market scan",
             interval=interval_seconds,

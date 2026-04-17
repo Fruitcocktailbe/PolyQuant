@@ -45,6 +45,101 @@ def limitless_no_token(slug: str) -> str:
     return f"{slug}{LIMITLESS_NO_SUFFIX}"
 
 
+def limitless_market_to_market(raw: Dict[str, Any]) -> "Any | None":
+    """
+    Build a polyquant.data.market_models.Market instance from a raw Limitless
+    dict (as returned by `LimitlessClient.get_markets`).
+
+    Used by Gap 5b Limitless-first discovery so standalone Limitless binary
+    markets can be clustered as `native_partition` on the Limitless side
+    (YES + NO = 1), unlocking pure-Limitless intra-market arb.
+
+    Returns None if the dict is missing a slug or lacks the minimum fields
+    needed to construct a Market. All fields are best-effort — downstream
+    code already handles missing end_date / volume gracefully.
+    """
+    from datetime import datetime as _dt
+    from decimal import Decimal as _Dec
+    from polyquant.data.market_models import Market, Outcome
+
+    slug = raw.get("slug")
+    if not isinstance(slug, str) or not slug:
+        return None
+    title = raw.get("title") or ""
+    if not title:
+        return None
+
+    def _parse_ts(val: Any) -> "_dt | None":
+        if val is None or val == "":
+            return None
+        if isinstance(val, (int, float)):
+            ts = float(val)
+            if ts > 1e12:
+                ts /= 1000.0
+            try:
+                return _dt.fromtimestamp(ts)
+            except (OSError, ValueError, OverflowError):
+                return None
+        if isinstance(val, str):
+            s = val.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                return _dt.fromisoformat(s)
+            except ValueError:
+                return None
+        return None
+
+    end_raw = (
+        raw.get("expirationDate")
+        or raw.get("expirationTimestamp")
+        or raw.get("endDate")
+    )
+    end_date = _parse_ts(end_raw)
+
+    try:
+        vol = float(raw.get("volumeFormatted") or raw.get("volume") or 0)
+        liq = float(raw.get("liquidityFormatted") or raw.get("liquidity") or 0)
+    except (TypeError, ValueError):
+        vol, liq = 0.0, 0.0
+    # Limitless sometimes ships raw micro-USDC; normalize the same way
+    # exchange_matcher._limitless_dollars does.
+    if vol > 1_000_000:
+        vol /= 1_000_000
+    if liq > 1_000_000:
+        liq /= 1_000_000
+
+    yes_outcome = Outcome(
+        outcome_id=limitless_yes_token(slug),
+        name="Yes",
+        price=_Dec("0.5"),
+        token_id=limitless_yes_token(slug),
+    )
+    no_outcome = Outcome(
+        outcome_id=limitless_no_token(slug),
+        name="No",
+        price=_Dec("0.5"),
+        token_id=limitless_no_token(slug),
+    )
+
+    return Market(
+        market_id=slug,
+        question=title,
+        description=raw.get("description") or "",
+        outcomes=[yes_outcome, no_outcome],
+        volume=vol,
+        liquidity=liq,
+        end_date=end_date,
+        resolved=False,
+        slug=slug,
+        resolution_source=(
+            raw.get("resolutionSource")
+            or raw.get("rules")
+            or None
+        ),
+    )
+
+
 def parse_limitless_token(token_id: str) -> tuple[str, bool] | None:
     """
     Parse a Limitless token_id into (slug, is_yes).

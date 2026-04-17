@@ -365,7 +365,19 @@ class PolymarketClient:
         all_events: list[dict[str, Any]] = []
         offset = 0
         batch_size = 100
-        
+
+        # The old implementation broke out of pagination as soon as a single
+        # below-threshold event appeared, assuming the API returned a strictly
+        # monotonic liquidity ordering. In practice order=liquidity has
+        # straggler rows from concurrent trading activity, so we'd silently
+        # drop above-threshold events that sorted past a low-liquidity outlier.
+        # Now: filter per-event; only stop paginating once we see
+        # `max_consecutive_below_batches` full batches in a row that contained
+        # zero above-threshold events. This preserves near-O(N_above) cost
+        # while being robust to out-of-order rows.
+        max_consecutive_below_batches = 3
+        consecutive_empty_batches = 0
+
         try:
             while True:
                 response = await self._retry_get(
@@ -381,19 +393,20 @@ class PolymarketClient:
                     },
                 )
                 data = response.json()
-                
+
                 if not data:
                     break
-                
-                hit_threshold = False
+
+                kept_from_batch = 0
                 for event_data in data:
                     event_liq = float(event_data.get("liquidity", 0) or 0)
-                    
-                    # Since sorted by liquidity desc, once we're below threshold, stop
+
+                    # Per-event filter (not an early-stop). Stragglers below
+                    # the threshold are skipped without short-circuiting the
+                    # pagination loop.
                     if event_liq < min_liquidity:
-                        hit_threshold = True
-                        break
-                    
+                        continue
+
                     # Parse markets within the event
                     raw_markets = event_data.get("markets", [])
                     parsed_markets = [self._parse_market(m) for m in raw_markets]
@@ -415,18 +428,30 @@ class PolymarketClient:
                         ),
                         "tags": [t.get("label", "") for t in event_data.get("tags", [])],
                     })
-                
+                    kept_from_batch += 1
+
                 offset += len(data)
-                
+
+                if kept_from_batch == 0:
+                    consecutive_empty_batches += 1
+                else:
+                    consecutive_empty_batches = 0
+
                 logger.debug(
                     "Events batch fetched",
                     batch=len(data),
+                    kept=kept_from_batch,
                     total_so_far=len(all_events),
                     last_liquidity=f"${float(data[-1].get('liquidity', 0) or 0):,.0f}",
+                    empty_batches_streak=consecutive_empty_batches,
                 )
-                
+
                 # Stop conditions
-                if hit_threshold:
+                if consecutive_empty_batches >= max_consecutive_below_batches:
+                    logger.debug(
+                        "Stopping pagination: sustained below-threshold stream",
+                        streak=consecutive_empty_batches,
+                    )
                     break
                 if len(data) < batch_size:
                     break
@@ -825,13 +850,6 @@ class PolymarketClient:
             logger.error("Failed to fetch USDC balance", error=str(e))
             return Decimal("0")
 
-    def is_ws_healthy(self, max_age_seconds: float = 30.0) -> bool:
-        """Whether the WebSocket connection is receiving fresh data."""
-        if hasattr(self, 'ws_client') and self.ws_client:
-            return self.ws_client.is_connection_healthy(max_age_seconds=max_age_seconds)
-        return False  # No WS = not healthy
-
-    
     def _parse_market(self, data: dict[str, Any]) -> Market:
         """Parse API response into Market object."""
         outcomes = []

@@ -301,10 +301,12 @@ class SCIPSolver:
                 bid = ob.best_bid or 0
                 ask = ob.best_ask or 1
                 
-                # Profit from buy = (estimated_value - ask_price) * size
-                # For arbitrage, we look for mispricings
+                # Both buy and sell cross the spread (cost = ask - bid per unit).
+                # The arbitrage signal lives in the constraint structure; the
+                # objective penalizes naive spread-crossing so SCIP only trades
+                # when the constraints force it.
                 profit_expr += (bid - ask) * x_buy[outcome_id]
-                profit_expr += (ask - bid) * x_sell[outcome_id]
+                profit_expr += (bid - ask) * x_sell[outcome_id]
         
         model.setObjective(profit_expr, sense="maximize")
         

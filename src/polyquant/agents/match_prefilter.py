@@ -65,13 +65,98 @@ _SUFFIX_MULT: dict[str, float] = {
 }
 
 
+# Canonicalization aliases for resolution-source strings. Used as a HINT only —
+# two markets whose sources canonicalize identically still need LLM verification
+# that they describe the same real-world event (different AP stories share source
+# but not event). Conversely, differing sources don't imply different events
+# (AP vs. NYT projections of the same election call are the same event).
+_RESOLUTION_SOURCE_ALIASES: dict[str, str] = {
+    "ap": "associated press",
+    "associated-press": "associated press",
+    "cg": "coingecko",
+    "coin-gecko": "coingecko",
+    "cb": "coinbase",
+    "bbg": "bloomberg",
+    "reuters.com": "reuters",
+    "nyt": "new york times",
+    "nytimes": "new york times",
+    "wsj": "wall street journal",
+    "cnn.com": "cnn",
+    "bbc.co.uk": "bbc",
+    "bbc.com": "bbc",
+}
+
+_PUNCT_RE = re.compile(r"[^\w\s]+")
+_WS_RE = re.compile(r"\s+")
+
+
+def canonicalize_resolution_source(source: Any) -> str:
+    """
+    Normalize a resolution-source string for weak-positive comparison.
+
+    Returns an empty string for missing / unspecified inputs so callers can
+    detect the "unknown" case explicitly.
+
+    This is NOT a source-of-truth equality check — it only collapses obvious
+    spelling variants (casing, punctuation, stock abbreviations). The LLM
+    still decides whether two markets resolve on the same real-world event.
+    """
+    if source is None:
+        return ""
+    s = str(source).strip().lower()
+    if not s or s in ("not specified", "unknown", "n/a", "none"):
+        return ""
+    # Remove URLs' protocol/path noise before alias lookup — sources often
+    # ship as "https://ap.org/..." which should collapse to "associated press".
+    s = re.sub(r"^https?://(www\.)?", "", s)
+    s = s.split("/")[0]  # keep host only
+    # Apply whole-host alias lookup BEFORE punctuation stripping so entries
+    # like "reuters.com" → "reuters" match. If no host-level alias, fall
+    # through to punctuation stripping + token-level alias lookup below.
+    if s in _RESOLUTION_SOURCE_ALIASES:
+        return _RESOLUTION_SOURCE_ALIASES[s]
+    s = _PUNCT_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s).strip()
+    if not s:
+        return ""
+    # Alias expansion — token-level so "ap official call" → "associated press official call".
+    tokens = [_RESOLUTION_SOURCE_ALIASES.get(tok, tok) for tok in s.split()]
+    return " ".join(tokens)
+
+
+_DRAW_OUTCOME_TOKENS = frozenset({"draw", "tie", "drawn", "d", "x"})
+
+
+def _detect_draw_leg(outcome_names: list[str]) -> bool:
+    """True when any outcome name is a direct synonym for a draw/tie result.
+
+    Single-character matches ("D", "X") require exact equality — substring
+    matching on 1-char tokens would flag virtually everything.
+    """
+    for raw in outcome_names:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name in _DRAW_OUTCOME_TOKENS:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class Fingerprint:
     """Structural fingerprint of a market for compatibility checking."""
-    expiry_week: int | None       # ISO week-since-epoch bucket, or None if unknown
-    outcome_count: int             # 2 for binary, N otherwise
+    expiry_seconds: float | None   # unix seconds (UTC), or None if unknown
+    outcome_count: int | None      # 2 for binary, N otherwise; None when the
+                                   # source exchange didn't supply an outcome
+                                   # list (defer to the LLM rather than silently
+                                   # assuming binary and dropping real matches)
     numeric_bounds: tuple[float, ...]  # normalized numeric bounds extracted from question
     domain: str                    # one of DOMAIN_KEYWORDS keys, or "other"
+    has_draw_leg: bool = False     # True when outcome names include draw/tie
+                                   # (used by 3-way ↔ 2-way sports moneyline
+                                   # projection in compatible())
 
 
 def _to_datetime(value: Any) -> datetime | None:
@@ -109,13 +194,21 @@ def _to_datetime(value: Any) -> datetime | None:
     return None
 
 
-def _expiry_week_bucket(end_date: Any) -> int | None:
+def _expiry_seconds(end_date: Any) -> float | None:
+    """Parse an end-date into unix seconds (UTC). Returns None if unparseable."""
     dt = _to_datetime(end_date)
     if dt is None:
         return None
-    # Days since unix epoch // 7 = stable weekly bucket independent of ISO calendar quirks
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    return int((dt - epoch).days // 7)
+    return dt.timestamp()
+
+
+def _expiry_week_bucket(end_date: Any) -> int | None:
+    """Legacy helper retained for backwards compatibility with old callers
+    and tests. New code should use `_expiry_seconds` + an hours-based delta."""
+    secs = _expiry_seconds(end_date)
+    if secs is None:
+        return None
+    return int(secs // (7 * 86400))
 
 
 def _looks_like_year(raw: str, suffix: str, value: float) -> bool:
@@ -163,30 +256,39 @@ def _classify_domain(text: str) -> str:
     return best[0]
 
 
-def _polymarket_outcome_count(market: Any) -> int:
+def _polymarket_outcome_count(market: Any) -> int | None:
     outcomes = getattr(market, "outcomes", None)
     if outcomes is None:
-        return 2
+        return None
     return max(2, len(outcomes))
 
 
-def _limitless_outcome_count(market: dict[str, Any]) -> int:
+def _limitless_outcome_count(market: dict[str, Any]) -> int | None:
     # Limitless binary markets typically expose 2 outcomes; multi-outcome markets
-    # ship them under "outcomes" or "tokens".
+    # ship them under "outcomes" or "tokens". When none of those keys exist we
+    # can't tell whether the market is binary or an N-way AMM — silently
+    # defaulting to 2 caused group markets to be rejected against correctly
+    # fingerprinted N-ary Polymarket markets. Return None to signal
+    # "unknown" and let the LLM handle the disambiguation.
     for key in ("outcomes", "tokens", "outcomeTokens"):
         val = market.get(key)
         if isinstance(val, list) and len(val) > 0:
             return max(2, len(val))
-    return 2
+    return None
 
 
 def fingerprint_polymarket(market: Any) -> Fingerprint:
     question = getattr(market, "question", "") or ""
+    outcomes = getattr(market, "outcomes", None) or []
+    outcome_names = [
+        getattr(o, "name", "") for o in outcomes
+    ]
     return Fingerprint(
-        expiry_week=_expiry_week_bucket(getattr(market, "end_date", None)),
+        expiry_seconds=_expiry_seconds(getattr(market, "end_date", None)),
         outcome_count=_polymarket_outcome_count(market),
         numeric_bounds=_extract_numbers(question),
         domain=_classify_domain(question),
+        has_draw_leg=_detect_draw_leg(outcome_names),
     )
 
 
@@ -197,11 +299,24 @@ def fingerprint_limitless(market: dict[str, Any]) -> Fingerprint:
         or market.get("expirationTimestamp")
         or market.get("endDate")
     )
+    outcome_names: list[str] = []
+    for key in ("outcomes", "tokens", "outcomeTokens"):
+        val = market.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, str):
+                    outcome_names.append(item)
+                elif isinstance(item, dict):
+                    for field in ("name", "title", "outcome"):
+                        if isinstance(item.get(field), str):
+                            outcome_names.append(item[field])
+                            break
     return Fingerprint(
-        expiry_week=_expiry_week_bucket(end_raw),
+        expiry_seconds=_expiry_seconds(end_raw),
         outcome_count=_limitless_outcome_count(market),
         numeric_bounds=_extract_numbers(title),
         domain=_classify_domain(title),
+        has_draw_leg=_detect_draw_leg(outcome_names),
     )
 
 
@@ -223,7 +338,8 @@ def compatible(
     a: Fingerprint,
     b: Fingerprint,
     *,
-    expiry_slack_weeks: int = 1,
+    expiry_tolerance_hours: float = 24.0,
+    crypto_expiry_tolerance_hours: float | None = None,
 ) -> bool:
     """
     Decide whether two fingerprints are structurally compatible.
@@ -231,18 +347,52 @@ def compatible(
     Returns False as soon as a hard mismatch is found. Unknown fields (None
     expiry, "other" domain, empty numeric bounds) defer to downstream layers
     rather than rejecting on missing data.
+
+    `expiry_tolerance_hours` is the maximum allowed drift between resolution
+    deadlines for general-domain pairs. `crypto_expiry_tolerance_hours` is a
+    tighter fallback applied when either side is classified as `crypto` —
+    BTC/ETH snapshot markets resolve on point-in-time prices that diverge
+    meaningfully inside a 24h window, so the default tolerance is too loose
+    there. Pass None to reuse `expiry_tolerance_hours` for crypto too (legacy
+    behaviour).
     """
-    # Outcome cardinality: binary must match binary; N-ary must match N-ary
-    if (a.outcome_count == 2) != (b.outcome_count == 2):
-        return False
+    # Outcome cardinality: binary must match binary; N-ary must match N-ary,
+    # except for the sports moneyline projection case — a 3-way market with a
+    # draw leg can legitimately match a 2-way market on the same sports event
+    # once the LLM confirms the draw resolution rule (draw_is_no vs
+    # double_chance). Gate that narrow exception on BOTH sides being sports
+    # and the N-ary side actually having a draw leg; otherwise keep the
+    # original hard reject.
+    #
+    # Unknown outcome_count (None) means the source exchange didn't expose an
+    # outcome list — defer to the LLM rather than hard-reject, which used to
+    # silently drop group markets that shipped without the "outcomes" key.
+    if a.outcome_count is not None and b.outcome_count is not None:
+        a_binary = a.outcome_count == 2
+        b_binary = b.outcome_count == 2
+        if a_binary != b_binary:
+            nary_side = b if a_binary else a
+            both_sports = a.domain == "sports" and b.domain == "sports"
+            moneyline_projection_ok = (
+                nary_side.outcome_count == 3
+                and nary_side.has_draw_leg
+                and both_sports
+            )
+            if not moneyline_projection_ok:
+                return False
 
     # Domain bucket: if both sides classified into a known domain, they must agree
     if a.domain != "other" and b.domain != "other" and a.domain != b.domain:
         return False
 
-    # Expiry: if both known, must be within slack
-    if a.expiry_week is not None and b.expiry_week is not None:
-        if abs(a.expiry_week - b.expiry_week) > expiry_slack_weeks:
+    # Expiry: if both known, must be within tolerance. Crypto pairs get a
+    # tighter window because a 12:00 UTC vs 12:25 UTC snapshot are different
+    # events even though they share a 24h window.
+    effective_tolerance = expiry_tolerance_hours
+    if crypto_expiry_tolerance_hours is not None and "crypto" in (a.domain, b.domain):
+        effective_tolerance = crypto_expiry_tolerance_hours
+    if a.expiry_seconds is not None and b.expiry_seconds is not None:
+        if abs(a.expiry_seconds - b.expiry_seconds) > effective_tolerance * 3600.0:
             return False
 
     # Numeric bounds

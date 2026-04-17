@@ -589,37 +589,70 @@ export const Dashboard: React.FC = () => {
                                 </div>
                             )}
                             {(() => {
-                                const isNegRisk = (c: any) => {
-                                    const topic = String(c?.topic || "");
+                                // Gap 1: prefer the explicit cluster_type field (v1.4+).
+                                // Fall back to cluster_id prefix for legacy manifests that
+                                // haven't been re-built since the schema bump.
+                                const classifyCluster = (c: any): string => {
+                                    const ct = String(c?.cluster_type || "");
+                                    if (ct) return ct;
                                     const id = String(c?.id || "");
-                                    return /negrisk/i.test(topic) || id.startsWith("negrisk_");
+                                    if (id.startsWith("cross_event_")) return "cross_event_logical";
+                                    if (id.startsWith("negrisk_")) return "negrisk";
+                                    if (id.startsWith("limitless_native_") || id.startsWith("native_")) return "native_partition";
+                                    if (id.startsWith("cross_market_") || id.startsWith("cross_")) return "cross_market_partition";
+                                    return "llm_analysis";
                                 };
-                                const negrisk = state.clusters.filter(isNegRisk);
-                                const other = state.clusters.filter((c) => !isNegRisk(c));
+
+                                // Visual identity per cluster class (Gap 1 step 9).
+                                const CLUSTER_GROUPS: Array<{
+                                    type: string;
+                                    label: string;
+                                    color: string;  // tailwind color token
+                                }> = [
+                                    { type: "negrisk", label: "NegRisk Partitions", color: "cyan" },
+                                    { type: "native_partition", label: "Native Partition (YES+NO=1)", color: "green" },
+                                    { type: "cross_market_partition", label: "Cross-Market Partition", color: "teal" },
+                                    { type: "cross_event_logical", label: "Cross-Event Logical (Gap 1)", color: "orange" },
+                                    { type: "cross_exchange_pair", label: "Cross-Exchange Pair", color: "red" },
+                                    { type: "llm_analysis", label: "LLM Analysis", color: "purple" },
+                                ];
+
+                                const grouped: Record<string, any[]> = {};
+                                for (const c of state.clusters) {
+                                    const t = classifyCluster(c);
+                                    (grouped[t] = grouped[t] || []).push(c);
+                                }
+
                                 return (
                                     <>
-                                        {negrisk.length > 0 && (
-                                            <div>
-                                                <div className="px-3 py-1.5 bg-black/30 border-b border-neon-cyan/20 flex items-center justify-between sticky top-0 backdrop-blur-sm">
-                                                    <span className="text-[9px] font-bold text-neon-cyan uppercase tracking-widest">NegRisk Partitions</span>
-                                                    <span className="text-[9px] text-neon-cyan/70 font-mono">{negrisk.length}</span>
+                                        {CLUSTER_GROUPS.map(({ type, label, color }) => {
+                                            const items = grouped[type] || [];
+                                            if (items.length === 0) return null;
+                                            return (
+                                                <div key={type}>
+                                                    <div
+                                                        className={`px-3 py-1.5 bg-black/30 border-b flex items-center justify-between sticky top-0 backdrop-blur-sm`}
+                                                        style={{ borderColor: `var(--neon-${color}, rgba(255,255,255,0.2))` }}
+                                                    >
+                                                        <span
+                                                            className="text-[9px] font-bold uppercase tracking-widest"
+                                                            style={{ color: `var(--neon-${color}, #fff)` }}
+                                                        >
+                                                            {label}
+                                                        </span>
+                                                        <span
+                                                            className="text-[9px] font-mono"
+                                                            style={{ color: `var(--neon-${color}, rgba(255,255,255,0.7))` }}
+                                                        >
+                                                            {items.length}
+                                                        </span>
+                                                    </div>
+                                                    {items.map((c, idx) => (
+                                                        <ClusterCard key={`${type}-${idx}`} cluster={c} onClick={setSelectedClusterId} />
+                                                    ))}
                                                 </div>
-                                                {negrisk.map((c, idx) => (
-                                                    <ClusterCard key={`nr-${idx}`} cluster={c} onClick={setSelectedClusterId} />
-                                                ))}
-                                            </div>
-                                        )}
-                                        {other.length > 0 && (
-                                            <div>
-                                                <div className="px-3 py-1.5 bg-black/30 border-b border-neon-purple/20 flex items-center justify-between sticky top-0 backdrop-blur-sm">
-                                                    <span className="text-[9px] font-bold text-neon-purple uppercase tracking-widest">Other Arbitrage</span>
-                                                    <span className="text-[9px] text-neon-purple/70 font-mono">{other.length}</span>
-                                                </div>
-                                                {other.map((c, idx) => (
-                                                    <ClusterCard key={`ot-${idx}`} cluster={c} onClick={setSelectedClusterId} />
-                                                ))}
-                                            </div>
-                                        )}
+                                            );
+                                        })}
                                     </>
                                 );
                             })()}

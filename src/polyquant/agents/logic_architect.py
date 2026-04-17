@@ -313,6 +313,19 @@ Complex multi-market dependencies.
 Example: "Dems win Senate" + "Dems win House" → higher P("Dems win both chambers")
 Use when simple SUBSET/PARTITION doesn't capture the logic.
 
+**E. COALITION (Sub-group partition)**
+A subset of outcomes inside a larger NegRisk event whose prices must sum to
+the price of a companion binary market on the aggregate.
+Example: "2028 presidential winner" NegRisk event has {Trump, DeSantis, Haley,
+Newsom, Harris, Sanders}. A separate binary "Will a Republican win 2028?"
+exists. Then P(Trump) + P(DeSantis) + P(Haley) MUST equal P(Republican_YES).
+Constraint: `z[Trump] + z[DeSantis] + z[Haley] - z[Republican_YES] = 0`
+emitted as two >= inequalities (one for each direction).
+Structural test: is there a clear companion binary market whose resolution
+is "at least one of this subset resolved YES"? If yes, emit the coalition
+equality. These are high-value arbitrage sources that the partition-only
+path silently misses.
+
 ═══════════════════════════════════════════════════════════════
 SECTION 3: USING PRICE/VOLUME DATA (FOR STRUCTURE, NOT FILTERING)
 ═══════════════════════════════════════════════════════════════
@@ -374,7 +387,8 @@ Before outputting JSON, you MUST use a `<thinking>` block:
 1. **Identify NegRisk Groups**: Find all "TYPE: NegRisk" markets — emit a PARTITION constraint for each, unconditionally.
 2. **Find Mutual Exclusions**: Look for outcomes that cannot both resolve YES.
 3. **Find Implications**: Look for A→B relationships. Validate direction with the P(A) <= P(B) sanity check.
-4. **Build constraints**: For each structural relationship, write the linear inequality and the token IDs involved.
+4. **Find Coalitions**: When the cluster contains BOTH a NegRisk event AND a companion binary on an aggregate (e.g. "Republican wins 2028" alongside individual GOP candidates), emit a COALITION constraint equating the sum of the sub-group outcomes to the binary's YES token. These are easy to miss but frequently mispriced.
+5. **Build constraints**: For each structural relationship, write the linear inequality and the token IDs involved.
 
 ═══════════════════════════════════════════════════════════════
 CRITICAL RULES:
@@ -459,7 +473,10 @@ CRITICAL RULES:
 
 
         try:
-            response = await self._call_gemini(market_descriptions)
+            response = await self._call_gemini(
+                market_descriptions,
+                cluster_source=cluster.constraint_source,
+            )
         except ValueError as e:
             # Raised by _call_gemini when the LLM returned empty/unparseable JSON
             # (distinct from transport/network errors below)
@@ -694,10 +711,6 @@ CRITICAL RULES:
         """
         from datetime import datetime
 
-        if not hasattr(self, '_order_book_cache'):
-            self._order_book_cache = {}
-            self._order_book_timestamps = {}
-
         now = datetime.utcnow()
         TTL = 300  # 5 minutes
 
@@ -747,25 +760,54 @@ CRITICAL RULES:
 
         return order_books
 
-    async def _call_gemini(self, market_descriptions: str) -> dict[str, Any]:
+    # Gap 1 addendum — prepended to the system prompt when the cluster was
+    # synthesized from representatives drawn across mechanical clusters. The
+    # LLM should look for inter-event implications only; partition constraints
+    # are already emitted upstream and must NOT be re-emitted.
+    CROSS_EVENT_PROMPT_ADDENDUM = """
+IMPORTANT — CROSS-EVENT CLUSTER CONTEXT:
+These markets were sampled from MULTIPLE independent source events (each event
+already has its own mechanical partition / NegRisk Σ=1 constraint emitted
+upstream). Your task on THIS cluster is narrower:
+
+- Look ONLY for inter-event SUBSET or MUTUALLY_EXCLUSIVE relationships.
+- DO NOT emit PARTITION constraints — they are already handled upstream.
+- If no inter-event logical link exists, return an empty constraint list
+  rather than fabricating one.
+
+Example cross-event SUBSET: "Trump wins 2028" (from NegRisk event A) implies
+"Republican wins 2028" (from NegRisk event B). Emit this as a SUBSET constraint
+referencing both token_ids.
+
+"""
+
+    async def _call_gemini(
+        self,
+        market_descriptions: str,
+        cluster_source: str = "",
+    ) -> dict[str, Any]:
         """
         Call the LLM via OpenRouter for market analysis.
         """
         import asyncio
-        
+
         logger.debug("Calling LLM for constraint analysis")
-        
+
+        system_prompt = self.ANALYSIS_PROMPT
+        if cluster_source == "cross_event_logical":
+            system_prompt = self.CROSS_EVENT_PROMPT_ADDENDUM + self.ANALYSIS_PROMPT
+
         result = await asyncio.to_thread(
             call_llm_json,
             prompt=f"Analyze these markets for logical dependencies:\n\n{market_descriptions}",
-            system_prompt=self.ANALYSIS_PROMPT,
+            system_prompt=system_prompt,
             temperature=0.1,
             model=config.llm_model_logic,
         )
-        
+
         if not result:
             raise ValueError("LLM returned empty response")
-        
+
         return result
     
     def _sanitize_single_outcome(self, outcome_str: str, market_id: str, cluster: MarketCluster) -> str:
@@ -1014,7 +1056,12 @@ CRITICAL RULES:
 
             # If we found both prices, validate
             if source_price is not None and target_price is not None:
-                tolerance = 0.05  # 5% tolerance for price noise
+                # Implication P(A) <= P(B) is a HARD structural claim, not a
+                # noisy signal: tolerating 5% let mild hallucinations through
+                # where the architect had the direction backwards. 2% (the
+                # project-wide TIGHT_TOLERANCE) is still forgiving of normal
+                # bid-ask noise but catches direction flips.
+                tolerance = 0.02
 
                 if source_price > (target_price + tolerance):
                     # VIOLATION: Price(A) > Price(B) but A implies B
@@ -1155,8 +1202,11 @@ CRITICAL RULES:
                 # Calculate actual price sum
                 price_sum = sum(o.price for o in market.outcomes)
 
-                # Dynamic constraint based on deviation
-                coeffs = {o.outcome_id: 1.0 for o in market.outcomes}
+                # Dynamic constraint based on deviation.
+                # Use token_id (the order-book key) when available; fall back to
+                # outcome_id only if the market predates token_id population.
+                # Mismatching keys here means the constraint never binds the book.
+                coeffs = {(o.token_id or o.outcome_id): 1.0 for o in market.outcomes}
 
                 if price_sum < (1.0 - TIGHT_TOLERANCE):
                     # UNDERPRICED: Use inequality constraint
@@ -1173,7 +1223,7 @@ CRITICAL RULES:
                     # OVERPRICED: Convert to >= by negating
                     # Original: sum(z) <= price_sum
                     # Converted: -sum(z) >= -price_sum
-                    coeffs = {o.outcome_id: -1.0 for o in market.outcomes}
+                    coeffs = {(o.token_id or o.outcome_id): -1.0 for o in market.outcomes}
                     rhs = -price_sum
                     constraint_type = "OVERPRICED_PARTITION"
                     reasoning = (
@@ -1221,7 +1271,7 @@ CRITICAL RULES:
 
             # Only create constraint if prices suggest partition structure
             if (1.0 - LOOSE_TOLERANCE) <= price_sum <= (1.0 + LOOSE_TOLERANCE):
-                coeffs = {o.outcome_id: 1.0 for o in market.outcomes}
+                coeffs = {(o.token_id or o.outcome_id): 1.0 for o in market.outcomes}
 
                 # Determine constraint type based on deviation
                 if price_sum < (1.0 - TIGHT_TOLERANCE):
@@ -1235,7 +1285,7 @@ CRITICAL RULES:
 
                 elif price_sum > (1.0 + TIGHT_TOLERANCE):
                     # Convert to <= by negating
-                    coeffs = {o.outcome_id: -1.0 for o in market.outcomes}
+                    coeffs = {(o.token_id or o.outcome_id): -1.0 for o in market.outcomes}
                     rhs = -price_sum
                     constraint_type = "OVERPRICED_IMPLIED_PARTITION"
                     reasoning = (

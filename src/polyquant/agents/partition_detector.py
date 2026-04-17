@@ -150,11 +150,21 @@ def _tag_signature(tags: list[str] | None) -> str:
     return "|".join(cleaned)
 
 
-def _market_tags(market: Market) -> list[str]:
-    """Best-effort extraction of tags from a Market. Tags live on the event,
-    which isn't attached to Market here, so we fall back to no_tags."""
-    del market  # tags are event-level, not market-level — fallback per plan
-    return []
+def _market_tags(
+    market: Market,
+    tag_map: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Return tags for a market.
+
+    Tags live on the Polymarket *event*, not the Market, so the caller passes
+    an explicit `tag_map` keyed by market_id. When no map is provided (legacy
+    callers), fall back to no_tags — Layer 1's template key then degenerates
+    to (template, "no_tags", end_bucket), which is still correct, just a
+    weaker grouping prior.
+    """
+    if tag_map is None:
+        return []
+    return tag_map.get(market.market_id, [])
 
 
 # -----------------------------------------------------------------------------
@@ -163,6 +173,7 @@ def _market_tags(market: Market) -> list[str]:
 
 def layer1_template_cluster(
     markets: list[Market],
+    tag_map: dict[str, list[str]] | None = None,
 ) -> tuple[list[list[Market]], set[str]]:
     """
     Group markets by (template_key, tag_signature, end_date_bucket).
@@ -170,6 +181,12 @@ def layer1_template_cluster(
     Returns (clusters, matched_market_ids). Markets that didn't match any
     template are excluded from `matched_market_ids` so Layer 2 can process
     them.
+
+    `tag_map` is keyed by market_id and threads event-level tags into the
+    Layer 1 bucket key — two markets sharing a tag and a template are far
+    more likely to partition one real-world event. When omitted, the tag
+    component degenerates to "no_tags" and behaviour matches the pre-tag
+    baseline (correctness preserved, just a weaker prior).
     """
     buckets: dict[tuple[str, str, str], list[Market]] = {}
     matched: set[str] = set()
@@ -186,7 +203,7 @@ def layer1_template_cluster(
         template_key, _slot = extracted
         key = (
             template_key,
-            _tag_signature(_market_tags(market)),
+            _tag_signature(_market_tags(market, tag_map)),
             end_date_bucket(market.end_date, window_days),
         )
         buckets.setdefault(key, []).append(market)
@@ -604,6 +621,7 @@ async def layer4_verify(cluster: list[Market]) -> PartitionVerification | None:
 async def detect_cross_market_partitions(
     markets: list[Market],
     store: "ConstraintStore | None",
+    tag_map: dict[str, list[str]] | None = None,
 ) -> list["MarketCluster"]:
     """
     End-to-end cross-market partition detection.
@@ -635,8 +653,9 @@ async def detect_cross_market_partitions(
         )
         return []
 
-    # Layer 1
-    l1_clusters, matched = layer1_template_cluster(polar_markets)
+    # Layer 1 — tag_map threads event-level tags into the bucket key so
+    # tag-sharing markets group more tightly (Gap 4 prior).
+    l1_clusters, matched = layer1_template_cluster(polar_markets, tag_map=tag_map)
 
     # Layer 2 on the residual
     residual = [m for m in polar_markets if m.market_id not in matched]

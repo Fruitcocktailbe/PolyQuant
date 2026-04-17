@@ -4,38 +4,37 @@ from polyquant.risk.position_sizing import PositionSizer, PositionLimits
 
 
 def test_calculate_dutching_sizes_valid_arb():
-    # Set up conservative limits, turning off capital limits to test liquidity bottleneck
+    # Turn off capital limits so the liquidity bottleneck dominates.
+    # NOTE: v0.4 added adaptive depth tiering based on `depth_i`, which supersedes
+    # `limits.max_orderbook_depth_pct` in the dutching path. For depth_i <= $1k the
+    # illiquid cap applies (config.orderbook_depth_cap_illiquid, default 0.3).
     limits = PositionLimits(
-        max_single_trade_pct=1.0, # 100% (No limit)
+        max_single_trade_pct=1.0,
         max_total_exposure_pct=1.0,
-        max_orderbook_depth_pct=0.5, # 50% max depth
-        kelly_fraction=1.0 # unused
+        max_orderbook_depth_pct=0.5,  # ignored by dutching path; kept for PositionSizer contract
+        kelly_fraction=1.0,
     )
     sizer = PositionSizer(capital=10000.0, limits=limits)
-    
+
     # Mocking: Limitless YES trading at 0.40 (odds 1.5)
     # Polymarket NO trading at 0.50 (odds 1.0)
-    # Implied probs = 0.40 + 0.50 = 0.90. Expected Arb margin = (1/0.9) - 1 = 11.11%
+    # Implied probs = 0.40 + 0.50 = 0.90. Expected arb margin = (1/0.9) - 1 = 11.11%
     odds_list = [1.5, 1.0]
-    
-    # Depth: Limitless=$500, Poly=$1000
-    # Limitless max take = 500 * 0.5 = 250
-    # Poly max take = 1000 * 0.5 = 500
+
+    # Depth: Limitless=$500, Poly=$1000. Both <= $1k → illiquid tier (cap=0.3).
+    # Leg 0 max_t = (500*0.3)*0.9/0.4 = 337.5  (bottleneck)
+    # Leg 1 max_t = (1000*0.3)*0.9/0.5 = 540
+    # T = 337.5 → stake_0 = 337.5*0.4/0.9 = 150 → shares = 150/0.4 = 375
+    #           stake_1 = 337.5*0.5/0.9 = 187.5 → shares = 187.5/0.5 = 375
     depth_list = [500.0, 1000.0]
-    
+
     sizes = sizer.calculate_dutching_sizes(odds_list, depth_list)
 
     assert len(sizes) == 2
+    assert math.isclose(sizes[0].recommended_size, 375.0, rel_tol=1e-5)
+    assert sizes[0].limited_by.startswith("leg_0_liquidity")
+    assert math.isclose(sizes[1].recommended_size, 375.0, rel_tol=1e-5)
 
-    # Verify Limitless YES: $250 stake at $0.40/share = 625 shares (bottleneck hit)
-    assert math.isclose(sizes[0].recommended_size, 625.0, rel_tol=1e-5)
-    assert sizes[0].limited_by == "leg_0_liquidity"
-
-    # Verify Polymarket NO: $312.50 stake at $0.50/share = 625 shares
-    # (T = 562.5, NO prob = 0.5, Stake = 562.5 * 0.5 / 0.9 = 312.50; shares = 312.50/0.5)
-    assert math.isclose(sizes[1].recommended_size, 625.0, rel_tol=1e-5)
-
-    # Verify expected values are 11.11% profit margin
     expected_margin = (1.0 / 0.9) - 1.0
     assert math.isclose(sizes[0].expected_value, expected_margin, rel_tol=1e-5)
     assert math.isclose(sizes[1].expected_value, expected_margin, rel_tol=1e-5)
@@ -74,27 +73,24 @@ def test_calculate_dutching_roi():
     )
     sizer = PositionSizer(capital=10000.0, limits=limits)
 
-    # 11.1% margin opportunity
+    # 11.1% margin opportunity. Depths 500/1000 both fall into the v0.4 illiquid
+    # tier (cap=0.3), so T = 337.5 and total dollar stake = 150 + 187.5 = 337.5.
     odds_list = [1.5, 1.0]
     depth_list = [500.0, 1000.0]
 
     sizes = sizer.calculate_dutching_sizes(odds_list, depth_list)
 
-    # Verify expected value represents ROI
     # Expected margin = (1/0.9) - 1 = 0.1111...
     expected_roi = (1.0 / 0.9) - 1.0
     assert math.isclose(sizes[0].expected_value, expected_roi, rel_tol=1e-5)
 
-    # Reconstruct dollar stakes from shares: dollar_stake = shares * price = shares * probability
-    # Total capital deployed = 250 + 312.50 = 562.50
-    # Expected profit = 562.50 * 0.1111 = 62.50
-    # ROI = 62.50 / 562.50 = 0.1111
+    # ROI is margin-invariant (it's a property of the prices, not the stake size).
     dollar_stakes = [s.recommended_size * s.probability for s in sizes]
     total_dollar_stake = sum(dollar_stakes)
     expected_profit = total_dollar_stake * expected_roi
     calculated_roi = expected_profit / total_dollar_stake
     assert math.isclose(calculated_roi, expected_roi, rel_tol=1e-5)
-    assert math.isclose(total_dollar_stake, 562.50, rel_tol=1e-5)
+    assert math.isclose(total_dollar_stake, 337.50, rel_tol=1e-5)
 
 
 def test_dutching_liquidity_cushion():
@@ -113,10 +109,11 @@ def test_dutching_liquidity_cushion():
 
     sizes = sizer.calculate_dutching_sizes(odds_list, depth_list)
 
-    # Verify sizing is constrained by low depth
-    # Max dollar take from leg 0: 300 * 0.3 = 90 → 90 / 0.40 price = 225 shares
-    assert math.isclose(sizes[0].recommended_size, 225.0, rel_tol=1e-5)
-    assert sizes[0].limited_by == "leg_0_liquidity"
+    # Baseline cap = 0.3; both depths ($300, $600) fall into the illiquid tier,
+    # which subtracts Δ=0.2 → effective cap 0.1 on each leg.
+    # Max dollar take leg 0: 300 * 0.1 = 30 → 30 / 0.40 = 75 shares.
+    assert math.isclose(sizes[0].recommended_size, 75.0, rel_tol=1e-5)
+    assert sizes[0].limited_by.startswith("leg_0_liquidity")
 
 
 def test_partition_size_limit():

@@ -7,13 +7,12 @@ user commands (like the Kill Switch).
 """
 
 import asyncio
-import os
 import pathlib
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import List, Dict, Any
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import logging
 
@@ -61,6 +60,20 @@ class Monitor:
         self.state = SystemState()
         self.active_connections: List[WebSocket] = []
         self._log_queue: asyncio.Queue = asyncio.Queue()
+        # Retain broadcast tasks so the event loop doesn't GC them mid-send.
+        # Without this, asyncio.create_task(...) refs are dropped immediately
+        # and Python 3.10+ may collect the task before it finishes.
+        self._broadcast_tasks: set[asyncio.Task] = set()
+
+    def _spawn_broadcast(self, message: Dict[str, Any]) -> None:
+        """Schedule a non-blocking broadcast and keep a reference to the task."""
+        try:
+            task = asyncio.create_task(self.broadcast(message))
+        except RuntimeError:
+            # No event loop running (e.g. during shutdown); drop the message.
+            return
+        self._broadcast_tasks.add(task)
+        task.add_done_callback(self._broadcast_tasks.discard)
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -98,7 +111,7 @@ class Monitor:
         
         if updated:
             # Fire-and-forget: don't block pipeline waiting for broadcasts
-            asyncio.create_task(self.broadcast({"type": "state_update", "data": self.state.model_dump()}))
+            self._spawn_broadcast({"type": "state_update", "data": self.state.model_dump()})
 
     async def record_trade(self, fill: Dict[str, Any]):
         """Record an executed trade and broadcast."""
@@ -108,8 +121,8 @@ class Monitor:
         if len(self.state.trades_executed) > 50:
             self.state.trades_executed.pop(0)
         
-        # Broadcast
-        asyncio.create_task(self.broadcast({"type": "state_update", "data": self.state.model_dump()}))
+        # Broadcast (task retained to survive GC)
+        self._spawn_broadcast({"type": "state_update", "data": self.state.model_dump()})
 
     async def log(self, message: str, level: str = "INFO"):
         """Append a log message and broadcast it."""
@@ -119,8 +132,8 @@ class Monitor:
         if len(self.state.logs) > 100:
             self.state.logs.pop(0)
         
-        # Fire-and-forget log broadcast
-        asyncio.create_task(self.broadcast({"type": "log", "data": log_entry}))
+        # Fire-and-forget log broadcast (task retained to survive GC)
+        self._spawn_broadcast({"type": "log", "data": log_entry})
 
     async def emit_pipeline_event(
         self,
@@ -158,9 +171,7 @@ class Monitor:
         if len(self.state.pipeline_events) > 200:
             self.state.pipeline_events = self.state.pipeline_events[-200:]
 
-        asyncio.create_task(
-            self.broadcast({"type": "state_update", "data": self.state.model_dump()})
-        )
+        self._spawn_broadcast({"type": "state_update", "data": self.state.model_dump()})
 
     async def update_llm_progress(
         self,
@@ -205,8 +216,10 @@ class WebLogHandler(logging.Handler):
     def __init__(self, monitor_instance: Monitor):
         super().__init__()
         self.monitor = monitor_instance
-        # Don't log our own WebSocket broadcasts or we'll loop infinitely
-        self.addFilter(logging.Filter("polyquant.api.server"))
+        # No infinite-loop risk: monitor.log() schedules a broadcast task; it
+        # does not itself emit a log record. (A previous filter scoped to
+        # "polyquant.api.server" inverted Python's filter semantics and silently
+        # dropped every other module's logs from the UI.)
         # Only allow info and above for the UI to save bandwidth
         self.setLevel(logging.INFO)
 
@@ -407,7 +420,6 @@ async def get_cluster_details(cluster_id: str):
         manifest = await _constraint_store.load_manifest(cluster_id)
         if manifest:
             return manifest.model_dump()
-    from fastapi import HTTPException
     raise HTTPException(status_code=404, detail="Cluster not found")
 
 # -----------------------------------------------------------------------------
@@ -435,7 +447,6 @@ if STATIC_DIR.exists():
         """Fallback for React SPA routing."""
         # Don't intercept API or WS calls
         if rest_of_path.startswith(("api", "ws", "status", "kill")):
-            from fastapi.responses import JSONResponse
             return JSONResponse({"error": "not found"}, status_code=404)
              
         # Check if file exists in dist (e.g. favicon.ico)

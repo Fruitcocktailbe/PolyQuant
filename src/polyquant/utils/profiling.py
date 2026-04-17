@@ -37,7 +37,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, TypeVar, ParamSpec
+from typing import Callable, TypeVar, ParamSpec
 
 import numpy as np
 
@@ -76,11 +76,11 @@ class LatencyTracker:
     """
     Tracks latency measurements for operations.
 
-    Thread-safe singleton for collecting timing data across the application.
+    Singleton for collecting timing data across the application. Single-loop
+    use only — no concurrent-safety primitives.
     """
 
     _instance = None
-    _lock = asyncio.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -283,16 +283,3 @@ def print_latency_report():
 def reset_measurements():
     """Reset all latency measurements."""
     _tracker.reset()
-
-
-# Export public API
-__all__ = [
-    "LatencyTracker",
-    "LatencyStats",
-    "timed_operation",
-    "async_timed",
-    "sync_timed",
-    "get_tracker",
-    "print_latency_report",
-    "reset_measurements",
-]

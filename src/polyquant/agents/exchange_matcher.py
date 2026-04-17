@@ -19,7 +19,7 @@ import os
 import json
 import asyncio
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Tuple
 from pathlib import Path
 
@@ -38,6 +38,7 @@ from polyquant.agents.match_prefilter import (
     fingerprint_polymarket,
     fingerprint_limitless,
     compatible,
+    _limitless_outcome_count,
 )
 
 logger = get_logger(__name__)
@@ -55,18 +56,39 @@ ENCODE_CHUNK_SIZE = 500      # bounds peak RAM on the 2 GB Lightsail VM
 
 LLM_VERIFY_PROMPT = """
 You are an arbitrage trading engine.
-Your task is to determine if two prediction markets represent the SAME real-world outcome.
-They must be logically equivalent, even if they use different wording or different standard sources.
+Your task is to determine if two prediction markets resolve based on the SAME real-world event.
 
-Examples of MATCH:
-- "Will BTC hit $100k in 2025?" vs "Will Bitcoin reach $100k before 2026?" (Same outcome)
-- "Trump to win election" vs "Donald Trump victor in 2024" (Same logical outcome)
-- "Fed cuts rates in Sept" vs "Federal Reserve 25bps+ rate cut by Sept" (Equivalent financial outcome)
+CRITICAL DISTINCTIONS:
+- Different resolution SOURCES (e.g. "AP call" vs "NYT projection" for the same election winner)
+  describing the SAME real-world event are A MATCH. Different oracles reporting the same fact
+  still pay out on the same fact.
+- The same source FAMILY pointing at DIFFERENT real-world events is NOT a match. A CoinGecko
+  12:00 UTC BTC snapshot and a Coinbase 12:05 UTC BTC snapshot are different events even though
+  both are crypto price oracles.
+- Different timeframes for the same underlying question are NOT a match (e.g. "BTC hits 100k in
+  May" vs "BTC hits 100k in June"). Small phrasing differences around the same deadline are fine.
+
+POLARITY — THIS IS LOAD-BEARING:
+Both exchanges label outcomes "Yes" / "No". A match is only usable if Polymarket YES resolves
+on the SAME condition as Limitless YES. If the questions are worded in opposite directions,
+the Yes/No tokens represent OPPOSITE events even though both are labeled "Yes". Trading the
+pair as aligned would produce a sign-inverted position — real capital loss.
+
+Examples of MATCH (aligned polarity):
+- "Will BTC hit $100k by 2026?" vs "Will Bitcoin reach $100k before Jan 2026?" → YES aligned
+- "Trump to win 2024 election" vs "Donald Trump victor in 2024" → YES aligned
+- "AP calls election for Harris" vs "NYT projects Harris wins" → YES aligned
+
+Examples of MATCH but INVERTED polarity:
+- "Will Trump be elected?" (YES = Trump elected) vs "Will Trump fail to be elected?"
+  (YES = Trump NOT elected) — same event, opposite polarity → set yes_polarity_aligned=false
+- "Will the bill pass?" vs "Will the bill be rejected?" — same event, inverted → false
 
 Examples of NOT A MATCH:
-- "Who will win the election?" vs "Will Trump win the election?" (Different structure: multiple choice vs binary)
-- "Will BTC hit 100k in May?" vs "Will BTC hit 100k in June?" (Different timeframes)
-- "Will ETH be above $3000?" vs "Will ETH be above $3000 OR BTC above $100k?" (One has extra conditions)
+- "Who will win the election?" vs "Will Trump win the election?" (multi-choice vs binary)
+- "Will BTC hit 100k in May?" vs "Will BTC hit 100k in June?" (different timeframes)
+- "Will ETH be above $3000?" vs "Will ETH be above $3000 OR BTC above $100k?" (extra conditions)
+- "BTC price at 12:00 UTC" vs "BTC price at 12:05 UTC" (same source family, different snapshots)
 
 Polymarket Question: {p_q}
 Polymarket Description: {p_d}
@@ -78,12 +100,60 @@ Limitless Candidate Description: {l_d}
 Limitless Resolution Source: {l_res}
 Limitless End Date: {l_end}
 
-Respond ONLY in JSON. Return a boolean "is_match" and a short "reasoning".
+SPORTS MONEYLINE PROJECTION (only relevant when one side is a 3-way market
+home/draw/away and the other is 2-way YES/NO):
+When pairing a Polymarket 3-way moneyline with a Limitless 2-way, resolution on
+a draw is the key subtlety. Set "draw_rule" to:
+- "draw_is_no": Limitless YES resolves only when the home side wins outright; draw
+  and away both pay NO. This is the normal "outright win" bookmaker behaviour.
+- "double_chance": Limitless YES covers home-or-draw (home doesn't lose); only an
+  away win pays NO.
+- "none": this is not a 3-way ↔ 2-way pairing (both sides are binary, or both
+  are 3-way).
+- "unclear": the Limitless rules text doesn't make the draw handling obvious.
+  Return unclear whenever you can't tell with confidence — we won't trade the
+  pair if draw handling is ambiguous.
+Also return "home_outcome_name": the exact outcome name on the Polymarket 3-way
+side that corresponds to the Limitless YES leg (e.g. "Manchester United" for a
+"Will Manchester United win?" binary). Leave empty when draw_rule is "none".
+
+Respond ONLY in JSON with these fields:
+- "is_match" (bool): overall judgment — do these pay out on the same tradable outcome?
+- "same_real_world_event" (bool): do both markets pay out on the same underlying real-world
+  event/fact, regardless of source wording or question direction? This is the core correctness
+  question — a false here must make the pair unsafe to trade even if surface text looks similar.
+- "timeframes_match" (bool): are the resolution windows effectively identical, allowing for
+  natural phrasing differences (e.g. "by end of 2026" vs "before Jan 1 2027")?
+- "yes_polarity_aligned" (bool): when both markets resolve to YES, are they resolving on the
+  SAME direction of the real-world event? True for normal matches; false when one question is
+  phrased as the negation of the other (e.g. "Will X happen?" vs "Will X fail to happen?").
+  If you cannot tell with confidence, return false — a wrong true here is a sign-inverted trade.
+- "draw_rule" (str): one of "none" / "draw_is_no" / "double_chance" / "unclear" as described
+  above. MUST be "none" for binary-vs-binary pairs; MUST be one of the other three values for
+  3-way vs 2-way sports pairs.
+- "home_outcome_name" (str): exact Polymarket outcome name mapped to Limitless YES when the
+  pair is 3-way vs 2-way; empty string otherwise.
+- "reasoning" (str): short justification, mention polarity and draw handling explicitly.
+
 {{
     "is_match": true/false,
+    "same_real_world_event": true/false,
+    "timeframes_match": true/false,
+    "yes_polarity_aligned": true/false,
+    "draw_rule": "none" | "draw_is_no" | "double_chance" | "unclear",
+    "home_outcome_name": "...",
     "reasoning": "..."
 }}
 """
+
+
+# Bump when the accepted-entry schema changes in a way that makes old entries
+# untrustworthy (e.g. a new correctness field is added). _load_cache drops any
+# accepted entry written under an older version, forcing next-run re-verification.
+CACHE_SCHEMA_VERSION = 3
+
+
+VALID_DRAW_RULES = frozenset({"none", "draw_is_no", "double_chance"})
 
 
 @dataclass
@@ -92,6 +162,20 @@ class _AcceptedEntry:
     similarity: float
     reasoning: str
     verified_at: str
+    # When True, PM-YES ≡ LM-YES (standard alignment). When False, PM-YES ≡ LM-NO
+    # (inverted polarity — questions phrased as negations of each other). The
+    # solver must swap YES↔NO tokens during cross-exchange injection when this
+    # is False. Entries loaded from pre-v2 cache get polarity_aligned=None and
+    # are dropped on load so the LLM re-verifies under the new schema.
+    polarity_aligned: bool = True
+    # Sports moneyline projection metadata. "none" means this is a standard
+    # binary-vs-binary pair; "draw_is_no" / "double_chance" describe how a
+    # 3-way Polymarket moneyline projects onto a 2-way Limitless binary. The
+    # injection path consumes these to synthesise the correct linear relation
+    # (see map_maker._inject_threeway_moneyline_equivalencies).
+    draw_rule: str = "none"
+    home_outcome_name: str = ""
+    schema_version: int = CACHE_SCHEMA_VERSION
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -181,6 +265,26 @@ class ExchangeMatcher:
         """Backwards-compat view: {polymarket_id: limitless_id}."""
         return {pid: e.limitless_id for pid, e in self._accepted.items()}
 
+    def get_pair_polarity(self, polymarket_id: str) -> bool:
+        """Return True if PM-YES ≡ LM-YES for this pair (standard alignment),
+        False if PM-YES ≡ LM-NO (inverted). Default True so callers that don't
+        find the pair fall back to the safe-looking assumption, but callers
+        should always check that the pair exists before using this."""
+        entry = self._accepted.get(polymarket_id)
+        if entry is None:
+            return True
+        return entry.polarity_aligned
+
+    def get_pair_projection(self, polymarket_id: str) -> tuple[str, str]:
+        """Return (draw_rule, home_outcome_name) for the 3-way ↔ 2-way
+        sports moneyline projection recorded with this pair. Returns
+        ("none", "") when the pair is a standard binary-vs-binary match or
+        when no pair is cached for the given Polymarket id."""
+        entry = self._accepted.get(polymarket_id)
+        if entry is None:
+            return ("none", "")
+        return (entry.draw_rule, entry.home_outcome_name)
+
     def _load_cache(self) -> None:
         if not CACHE_FILE.exists():
             return
@@ -200,6 +304,10 @@ class ExchangeMatcher:
         # poisoned caches self-clean after the parser fix ships.
         dropped_empty_keys = 0
         dropped_empty_values = 0
+        # Pre-v2 entries predate the polarity field — treating them as aligned
+        # would silently reintroduce sign-inverted trades, so they're dropped
+        # and re-verified on next run.
+        dropped_pre_schema = 0
 
         if isinstance(data, dict) and ("accepted" in data or "rejected" in data):
             for pid, entry in (data.get("accepted") or {}).items():
@@ -215,53 +323,86 @@ class ExchangeMatcher:
                     if not isinstance(lid, str) or not lid or lid.isdigit():
                         dropped_empty_values += 1
                         continue
+                    entry_version = entry.get("schema_version", 1)
+                    if entry_version < CACHE_SCHEMA_VERSION:
+                        dropped_pre_schema += 1
+                        continue
+                    draw_rule = entry.get("draw_rule", "none")
+                    if draw_rule not in VALID_DRAW_RULES:
+                        draw_rule = "none"
                     self._accepted[pid] = _AcceptedEntry(
                         limitless_id=lid,
                         similarity=float(entry.get("similarity", 0.0)),
                         reasoning=entry.get("reasoning", ""),
                         verified_at=entry.get("verified_at", ""),
+                        polarity_aligned=bool(entry.get("polarity_aligned", True)),
+                        draw_rule=draw_rule,
+                        home_outcome_name=str(entry.get("home_outcome_name", "") or ""),
+                        schema_version=int(entry_version),
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
+            ttl_days = int(getattr(config, "rejection_cache_ttl_days", 0) or 0)
+            ttl_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=ttl_days)
+                if ttl_days > 0
+                else None
+            )
+            expired_rejections = 0
             for key, entry in (data.get("rejected") or {}).items():
                 try:
                     if not key:
                         dropped_empty_keys += 1
                         continue
+                    rejected_at_raw = entry.get("rejected_at", "") or ""
+                    if ttl_cutoff is not None and rejected_at_raw:
+                        # A malformed timestamp is itself a reason to re-verify
+                        # rather than trust indefinitely, so parse failures fall
+                        # through to expiry handling.
+                        try:
+                            rejected_at_dt = datetime.fromisoformat(rejected_at_raw)
+                        except ValueError:
+                            rejected_at_dt = None
+                        if rejected_at_dt is None or rejected_at_dt < ttl_cutoff:
+                            expired_rejections += 1
+                            continue
                     self._rejected[key] = _RejectedEntry(
                         similarity=float(entry.get("similarity", 0.0)),
                         reasoning=entry.get("reasoning", ""),
-                        rejected_at=entry.get("rejected_at", ""),
+                        rejected_at=rejected_at_raw,
                     )
                 except (TypeError, ValueError):
                     continue
-        elif isinstance(data, dict):
-            # Legacy flat format: {poly_id: limitless_id}
-            for pid, lid in data.items():
-                if not pid:
-                    dropped_empty_keys += 1
-                    continue
-                if not isinstance(lid, str) or not lid:
-                    dropped_empty_values += 1
-                    continue
-                self._accepted[pid] = _AcceptedEntry(
-                    limitless_id=lid,
-                    similarity=0.0,
-                    reasoning="legacy import",
-                    verified_at="",
+            if expired_rejections:
+                logger.info(
+                    "Re-verifying expired rejection-cache entries",
+                    expired=expired_rejections,
+                    ttl_days=ttl_days,
+                    hint="markets whose LLM rejection is older than ttl will "
+                    "be re-sent to the LLM on this run",
                 )
+        elif isinstance(data, dict):
+            # Legacy flat format {poly_id: limitless_id} predates the polarity
+            # field entirely — drop everything and let next run re-verify.
+            dropped_pre_schema = len(data)
 
-        if dropped_empty_keys or dropped_empty_values:
+        if dropped_empty_keys or dropped_empty_values or dropped_pre_schema:
             logger.warning(
-                "Dropped corrupted entries from market_pairs.json on load",
+                "Dropped entries from market_pairs.json on load",
                 dropped_empty_keys=dropped_empty_keys,
                 dropped_empty_values=dropped_empty_values,
-                hint="Caused by historical empty-market_id parser bug; "
-                     "entries will be re-verified on next run",
+                dropped_pre_schema=dropped_pre_schema,
+                hint=(
+                    "empty-key/value from historical parser bug; pre-schema "
+                    f"entries (<v{CACHE_SCHEMA_VERSION}) lack polarity_aligned "
+                    "and will be re-verified next run"
+                ),
             )
 
         logger.info(
-            f"Loaded matcher cache: {len(self._accepted)} accepted, {len(self._rejected)} rejected"
+            f"Loaded matcher cache: {len(self._accepted)} accepted, {len(self._rejected)} rejected "
+            "(pre-schema-v2 entries retained; delete manually to force re-verify under the hardened "
+            "same_real_world_event + timeframes_match gate)."
         )
 
     def _save_cache(self) -> None:
@@ -348,6 +489,22 @@ class ExchangeMatcher:
         if SentenceTransformer is None:
             logger.error("sentence-transformers is not installed. Run `pip install sentence-transformers`")
             return self.mapped_pairs, {"error": "sentence-transformers not installed"}
+
+        # ---------- Layer 0: floor-alignment audit (Gap 5a) ----------
+        # The matcher fetches every Polymarket market above its own floor,
+        # independent of Discovery's clustering. If the matcher floor is
+        # *higher* than the Discovery floor, we silently miss pairs for
+        # markets Discovery saw. Warn loudly so operators can align floors.
+        matcher_floor = config.min_liquidity_matcher_polymarket
+        discovery_floor = config.min_liquidity
+        if matcher_floor > discovery_floor:
+            logger.warning(
+                "Matcher Polymarket floor is STRICTER than Discovery floor — cross-exchange "
+                "matching will miss markets Discovery sees. Consider aligning the two.",
+                matcher_floor=matcher_floor,
+                discovery_floor=discovery_floor,
+                gap=matcher_floor - discovery_floor,
+            )
 
         # ---------- Layer 0: fetch + harmonized liquidity filter ----------
         logger.info("Layer 0: Fetching markets from both exchanges...")
@@ -515,8 +672,18 @@ class ExchangeMatcher:
             if f"{p_market.market_id}|{l_id}" in self._rejected:
                 pipeline_stats["rejection_cache_hits"] += 1
                 continue
-            # Prefilter
-            if not compatible(poly_fps[p_idx], limit_fps[l_idx]):
+            # Prefilter — expiry tolerance is config-driven (default 24h; was a
+            # far-too-loose 1-week bucket before Gap 2 hardening). Crypto pairs
+            # get a tighter tolerance because same-day BTC/ETH snapshot markets
+            # can diverge meaningfully at even minute-scale offsets.
+            if not compatible(
+                poly_fps[p_idx],
+                limit_fps[l_idx],
+                expiry_tolerance_hours=config.cross_exchange_expiry_tolerance_hours,
+                crypto_expiry_tolerance_hours=getattr(
+                    config, "crypto_expiry_tolerance_hours", None
+                ),
+            ):
                 pipeline_stats["prefilter_dropped"] += 1
                 continue
             survivors.append((p_idx, l_idx, sim))
@@ -616,21 +783,95 @@ class ExchangeMatcher:
 
             is_match = resp.get("is_match") is True
             reasoning = resp.get("reasoning", "")
+            # Gap-2 hardening: require both same-real-world-event and timeframe
+            # agreement. Missing fields default to False (conservative) so a
+            # model that ignores the new schema can never produce an accept.
+            same_event = resp.get("same_real_world_event") is True
+            timeframes_match = resp.get("timeframes_match") is True
+            # Polarity: prompt asks the model to return false when the pair
+            # is inverted (e.g. "Will X happen" vs "Will X fail to happen").
+            # An inverted pair is still usable — we just flip YES↔NO at
+            # injection time. Presence of this field is required; absence
+            # means the model ignored the schema, which is treated as a reject
+            # downstream (schema version bump forces re-verify).
+            polarity_field = resp.get("yes_polarity_aligned")
+            polarity_seen = isinstance(polarity_field, bool)
+            polarity_aligned = polarity_field is True if polarity_seen else True
 
-            if is_match:
+            # Sports moneyline projection: 3-way PM ↔ 2-way Limitless only
+            # traded when the model can state how the draw leg resolves. The
+            # prefilter lets these pairs through; downstream injection synthesises
+            # the appropriate linear relation. We refuse "unclear" outright.
+            raw_draw = resp.get("draw_rule")
+            draw_rule = raw_draw if isinstance(raw_draw, str) else ""
+            draw_rule_valid = draw_rule in VALID_DRAW_RULES
+            draw_rule_explicit = draw_rule_valid or draw_rule == "unclear"
+            home_outcome_name_raw = resp.get("home_outcome_name")
+            home_outcome_name = (
+                home_outcome_name_raw.strip()
+                if isinstance(home_outcome_name_raw, str)
+                else ""
+            )
+
+            # 3-way projection requires a non-"none" draw_rule AND a home name;
+            # binary-vs-binary requires "none" (anything else indicates model
+            # confusion about the pair shape).
+            pm_is_3way = len(p_market.outcomes) == 3
+            lm_outcome_count = _limitless_outcome_count(l_market)
+            # lm_outcome_count is None when the raw market didn't ship an
+            # outcomes list; treat that as "binary or unknown" so a 3-way PM
+            # pair can still land if the LLM identifies a valid projection.
+            lm_compatible_with_binary = lm_outcome_count in (2, None)
+            is_threeway_pair = pm_is_3way and lm_compatible_with_binary
+            if is_threeway_pair:
+                projection_ok = (
+                    draw_rule in ("draw_is_no", "double_chance")
+                    and bool(home_outcome_name)
+                )
+            else:
+                projection_ok = draw_rule == "none"
+
+            # Accept when match semantics hold AND the model explicitly
+            # returned both a polarity verdict and a draw-rule verdict
+            # appropriate to the pair shape.
+            accept = (
+                is_match
+                and same_event
+                and timeframes_match
+                and polarity_seen
+                and draw_rule_explicit
+                and projection_ok
+            )
+
+            if accept:
+                stored_draw_rule = draw_rule if draw_rule_valid else "none"
                 self._accepted[p_market.market_id] = _AcceptedEntry(
                     limitless_id=l_id,
                     similarity=round(sim, 4),
                     reasoning=reasoning,
                     verified_at=_now_iso(),
+                    polarity_aligned=polarity_aligned,
+                    draw_rule=stored_draw_rule,
+                    home_outcome_name=home_outcome_name,
                 )
                 pipeline_stats["llm_matches_confirmed"] += 1
                 pipeline_stats["new_pairs_found"] += 1
+                # Log Polymarket resolution-source string so operators can grep
+                # for suspicious oracle mismatches post-hoc (see §2.3 downgrade).
                 pipeline_stats["matched_pairs_detail"].append({
                     "polymarket": p_market.question[:80],
                     "limitless": (l_market.get("title", "") or "")[:80],
                     "similarity": round(sim, 3),
                     "method": "LLM Verified",
+                    "polarity_aligned": polarity_aligned,
+                    "draw_rule": stored_draw_rule,
+                    "home_outcome_name": home_outcome_name,
+                    "polymarket_resolution_source": p_market.resolution_source or "",
+                    "limitless_resolution_source": (
+                        l_market.get("resolutionSource")
+                        or l_market.get("rules", "")[:120]
+                        or ""
+                    ),
                 })
                 await _notify_mapped_pair({
                     "polymarket_question": p_market.question,
@@ -638,15 +879,40 @@ class ExchangeMatcher:
                     "polymarket_id": p_market.market_id,
                     "limitless_id": l_id,
                     "similarity": round(sim, 2),
+                    "polarity_aligned": polarity_aligned,
+                    "draw_rule": stored_draw_rule,
                 })
+                polarity_tag = "" if polarity_aligned else " [INVERTED]"
+                draw_tag = (
+                    "" if stored_draw_rule == "none" else f" [draw={stored_draw_rule}]"
+                )
                 logger.info(
-                    f"MATCH [{sim:.2f}]: {p_market.question[:40]} == {l_market.get('title', '')[:40]}"
+                    f"MATCH [{sim:.2f}]{polarity_tag}{draw_tag}: "
+                    f"{p_market.question[:40]} == {l_market.get('title', '')[:40]}"
                 )
             else:
                 key = f"{p_market.market_id}|{l_id}"
+                # Compose a diagnostic reason that makes the schema-gate visible
+                # in the cache. Helps operators spot cases where is_match=true
+                # was overridden by a failing sub-flag.
+                if is_match and not same_event:
+                    gate = "gated: same_real_world_event=false"
+                elif is_match and not timeframes_match:
+                    gate = "gated: timeframes_match=false"
+                elif is_match and not polarity_seen:
+                    gate = "gated: yes_polarity_aligned missing from response"
+                elif is_match and draw_rule == "unclear":
+                    gate = "gated: draw_rule=unclear (ambiguous rules)"
+                elif is_match and is_threeway_pair and not projection_ok:
+                    gate = "gated: 3-way pair missing draw_rule/home_outcome_name"
+                elif is_match and not is_threeway_pair and draw_rule not in ("none", ""):
+                    gate = f"gated: unexpected draw_rule={draw_rule!r} for binary pair"
+                else:
+                    gate = ""
+                merged_reason = f"{gate} | {reasoning}" if gate else reasoning
                 self._rejected[key] = _RejectedEntry(
                     similarity=round(sim, 4),
-                    reasoning=reasoning,
+                    reasoning=merged_reason,
                     rejected_at=_now_iso(),
                 )
                 pipeline_stats["llm_matches_rejected"] += 1

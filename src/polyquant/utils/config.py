@@ -35,7 +35,6 @@ class PolyQuantConfig(BaseSettings):
     
     Attributes:
         gemini_api_key: API key for Google Gemini (Discovery, Validator)
-        deepseek_api_key: API key for DeepSeek (Logic Architect)
         alchemy_api_key: API key for Alchemy (blockchain data)
         extraction_alpha: Target arbitrage extraction efficiency (0-1)
         max_drawdown: Maximum drawdown before kill switch (0-1)
@@ -217,20 +216,6 @@ class PolyQuantConfig(BaseSettings):
         description="Maximum number of outcomes in a partition for dutching (prevents O(N²) blowup)"
     )
 
-    orderbook_depth_cap_liquid: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Depth cap for liquid markets (>$10k total depth)"
-    )
-
-    orderbook_depth_cap_illiquid: float = Field(
-        default=0.3,
-        ge=0.0,
-        le=1.0,
-        description="Depth cap for illiquid markets (<$1k total depth)"
-    )
-
     partial_fill_probability: float = Field(
         default=0.05,
         ge=0.0,
@@ -292,12 +277,6 @@ class PolyQuantConfig(BaseSettings):
         description="Initial contraction parameter for Barrier Frank-Wolfe (Part 2)"
     )
     
-    min_profit_threshold: float = Field(
-        default=0.05,
-        ge=0.0,
-        description="Minimum profit in USD to consider trading (filter noise)"
-    )
-
     fw_min_profit: float = Field(
         default=0.05,
         ge=0.0,
@@ -415,6 +394,105 @@ class PolyQuantConfig(BaseSettings):
         description="ExchangeMatcher: minimum Limitless market liquidity to consider for cross-exchange matching. "
                     "Lower than Polymarket because the Limitless universe is ~20x smaller; a $2500 floor "
                     "left only 129/976 markets visible to the matcher."
+    )
+
+    cross_exchange_expiry_tolerance_hours: float = Field(
+        default=24.0,
+        ge=0.0,
+        description="ExchangeMatcher: maximum allowed drift between Polymarket and Limitless resolution "
+                    "deadlines (hours). 24h is appropriate for daily-resolution markets; tighten to ~1h "
+                    "for minute-resolution or crypto-snapshot markets. The old 1-week slack was far too loose."
+    )
+
+    crypto_expiry_tolerance_hours: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="ExchangeMatcher: tighter expiry tolerance (hours) applied when either side of a "
+                    "candidate pair has domain=='crypto'. BTC/ETH price snapshot markets resolve on "
+                    "point-in-time prices that can diverge meaningfully inside the 24h default window, "
+                    "so crypto pairs need minute-to-hour precision. Set equal to the default if you "
+                    "want the old flat behaviour."
+    )
+
+    rejection_cache_ttl_days: int = Field(
+        default=14,
+        ge=0,
+        description="ExchangeMatcher: days to honor a cached LLM rejection before re-verifying the pair. "
+                    "0 disables TTL (permanent rejection — the legacy behaviour). Default 14 days trades "
+                    "LLM cost against the risk that market wording/liquidity evolves and unlocks a real "
+                    "match that was previously unverifiable."
+    )
+
+    excluded_tags: list[str] = Field(
+        default_factory=list,
+        description="Discovery: event tag labels to skip during clustering. Case-insensitive exact "
+                    "match on the event's tag labels. Use to cut whole domains (e.g. ['Sports']) on "
+                    "low-resource hosts without code changes."
+    )
+
+    enable_limitless_discovery: bool = Field(
+        default=True,
+        description="Discovery: after cross-exchange matching, emit native_partition clusters for "
+                    "standalone Limitless binary markets that have NO Polymarket counterpart. "
+                    "Closes the pure-Limitless intra-market arb hole. Disable on rate-limited hosts."
+    )
+
+    min_liquidity_limitless_discovery: float = Field(
+        default=500.0,
+        ge=0.0,
+        description="Discovery: minimum Limitless market liquidity to consider for standalone "
+                    "Limitless-first discovery (Gap 5b). Matches min_liquidity_matcher_limitless "
+                    "by default so the same universe is searched."
+    )
+
+    cross_event_similarity_threshold: float = Field(
+        default=0.40,
+        ge=0.0, le=1.0,
+        description="Gap 1: cosine-similarity threshold (MiniLM) for grouping mechanical-cluster "
+                    "representatives into cross_event_logical candidates. 0.40 is an initial guess; "
+                    "raise to cut LLM cost if cross-event cluster volume explodes, lower to "
+                    "surface more inter-event implications."
+    )
+
+    cross_event_representatives_per_cluster: int = Field(
+        default=3,
+        ge=1, le=10,
+        description="Gap 1: top-K YES tokens by liquidity to pull from each mechanical cluster as "
+                    "cross-event representatives. 3 balances coverage against LLM cost."
+    )
+
+    cross_event_confidence_floor: float = Field(
+        default=0.7,
+        ge=0.0, le=1.0,
+        description="Gap 1: minimum LLM confidence to persist a cross_event_logical constraint. "
+                    "Floor keeps LLM noise out of the solver without requiring a second validator pass."
+    )
+
+    cross_event_pool_strategy: str = Field(
+        default="all_pairs_ann",
+        description="Gap 1 coverage strategy for cross-event logical clustering. "
+                    "'representative_top_k' (legacy): draw top-K markets from each "
+                    "mechanical cluster by liquidity and semantic-cluster those. "
+                    "'all_pairs_ann' (new default): embed EVERY polar market and "
+                    "find neighbours across cluster boundaries — ~6-8x more "
+                    "candidate pairs evaluated without the top-K coverage ceiling."
+    )
+
+    cross_event_all_pairs_top_k: int = Field(
+        default=10,
+        ge=1, le=50,
+        description="When cross_event_pool_strategy='all_pairs_ann', number of "
+                    "nearest neighbours to retain per market before connected-"
+                    "component grouping. Higher values catch weaker links at the "
+                    "cost of LLM budget. 10 is a reasonable default for 500 markets."
+    )
+
+    cross_event_max_cluster_size: int = Field(
+        default=6,
+        ge=2, le=20,
+        description="Upper bound on cross-event cluster size. Larger groups "
+                    "blow up the LLM prompt and rarely yield more useful "
+                    "constraints than the pairwise links that spawned them."
     )
 
     # =========================================================================
