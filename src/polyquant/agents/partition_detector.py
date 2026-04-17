@@ -698,7 +698,7 @@ async def detect_cross_market_partitions(
             layer4_rejected += 1
             logger.info(
                 "Layer 4: rejected — not a mutually exclusive partition",
-                event=verification.underlying_event[:80],
+                underlying_event=verification.underlying_event[:80],
                 reasoning=verification.reasoning[:120],
             )
             continue
@@ -709,7 +709,7 @@ async def detect_cross_market_partitions(
                 "Layer 4: rejected — confidence below threshold",
                 confidence=verification.confidence,
                 threshold=conf_threshold,
-                event=verification.underlying_event[:80],
+                underlying_event=verification.underlying_event[:80],
             )
             continue
 
@@ -717,7 +717,7 @@ async def detect_cross_market_partitions(
             layer4_rejected += 1
             logger.info(
                 "Layer 4: dropped non-exhaustive partition (v1 scope)",
-                event=verification.underlying_event[:80],
+                underlying_event=verification.underlying_event[:80],
                 uncovered=verification.uncovered_outcomes,
             )
             continue
