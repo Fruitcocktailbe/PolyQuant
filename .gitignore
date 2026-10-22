@@ -122,3 +122,8 @@ oms-sidecar/check.json
 oms-sidecar/check_out.txt
 oms-sidecar/error.txt
 oms_crash_journal.jsonl
+
+# Local run logs, build output and archived notes: not for the public tree
+src/run_log_*.txt
+web/*.txt
+docs/archive/
