@@ -102,3 +102,8 @@ Desktop.ini
 # Generated files
 convert_to_docx.py
 PolyQuant_Walkthrough.docx
+
+# Local run logs, build output and archived notes: not for the public tree
+src/run_log_*.txt
+web/*.txt
+docs/archive/
